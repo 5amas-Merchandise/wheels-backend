@@ -15,7 +15,7 @@ module.exports = {
   env: process.env.NODE_ENV || 'development',
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 8000,
   // prefer explicit env var; default to IPv4 localhost to avoid IPv6 (::1) resolution issues
-  mongoUri: process.env.MONGO_URI,
+  mongoUri: 'mongodb+srv://tezzertech:1914@cluster0.pzkucdw.mongodb.net/wheeladev',
   jwtSecret: process.env.JWT_SECRET,
   paystackSecretKey: process.env.PAYSTACK_SECRET_KEY || '',
   platformCommissionPercent: process.env.PLATFORM_COMMISSION_PERCENT ? Number(process.env.PLATFORM_COMMISSION_PERCENT) : 10,
