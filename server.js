@@ -1,4 +1,4 @@
-// server.js - Production-ready with Socket.IO (REAL DATA ONLY)
+// server.js - Production-ready with Socket.IO
 const http = require('http');
 const socketIO = require('socket.io');
 const jwt = require('jsonwebtoken');
@@ -19,16 +19,16 @@ async function startServer() {
   const server = http.createServer(app);
 
   // ============================================
-  // Socket.IO Setup - UPDATED CORS CONFIGURATION
+  // Socket.IO Setup with CORS
   // ============================================
   const io = socketIO(server, {
     cors: {
-      origin: "*", // Allow ALL origins for development
+      origin: "*",
       methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization"],
       credentials: true
     },
     transports: ['websocket', 'polling'],
+    allowEIO3: true,
     pingTimeout: 60000,
     pingInterval: 25000
   });
@@ -38,7 +38,8 @@ async function startServer() {
 
   // Socket.IO Authentication Middleware
   io.use((socket, next) => {
-    const token = socket.handshake.auth.token || socket.handshake.headers.authorization?.replace('Bearer ', '');
+    const token = socket.handshake.auth.token || 
+                  socket.handshake.headers.authorization?.replace('Bearer ', '');
     
     if (!token) {
       console.log('❌ Socket connection rejected: No token');
@@ -80,7 +81,7 @@ async function startServer() {
       console.log(`👑 Admin ${userId} joined admins room`);
     }
 
-    // Handle driver location updates (REAL-TIME TRACKING)
+    // Handle driver location updates
     socket.on('driver:location', async (data) => {
       try {
         const { latitude, longitude, heading } = data;
@@ -111,9 +112,10 @@ async function startServer() {
         console.log(`📍 Driver ${userId} location updated: [${latitude}, ${longitude}]`);
         
         // Broadcast location to relevant passengers if driver is on trip
-        const trip = await require('./src/models/trip.model').findOne({
+        const Trip = require('./src/models/trip.model');
+        const trip = await Trip.findOne({
           driverId: userId,
-          status: { $in: ['started', 'in_progress'] }
+          status: { $in: ['assigned', 'started', 'in_progress'] }
         });
 
         if (trip) {
@@ -130,7 +132,7 @@ async function startServer() {
       }
     });
 
-    // Handle real-time trip request from passenger
+    // Handle passenger requesting trip status
     socket.on('passenger:request_trip', async (data) => {
       try {
         const { requestId } = data;
@@ -156,7 +158,7 @@ async function startServer() {
           return;
         }
 
-        // Emit real-time update about trip request to the passenger
+        // Emit real-time update
         socket.emit('trip:request_update', {
           requestId,
           status: tripRequest.status,
@@ -164,24 +166,50 @@ async function startServer() {
           candidates: tripRequest.candidates
         });
 
-        // If assigned to driver, notify driver in real-time
-        if (tripRequest.assignedDriverId) {
-          io.to(`user:${tripRequest.assignedDriverId}`).emit('trip:assigned', {
-            requestId: tripRequest._id,
-            passenger: tripRequest.passengerId,
-            pickup: tripRequest.pickup,
-            serviceType: tripRequest.serviceType,
-            timestamp: new Date()
-          });
-        }
-
       } catch (err) {
         console.error('❌ Trip request status error:', err.message);
         socket.emit('error', { message: 'Failed to fetch trip request' });
       }
     });
 
-    // Handle trip updates from driver (REAL-TIME TRIP UPDATES)
+    // Handle passenger requesting current trip status
+    socket.on('passenger:request_status', async (data) => {
+      try {
+        const { tripId } = data;
+        
+        if (!tripId) {
+          socket.emit('error', { message: 'Trip ID required' });
+          return;
+        }
+
+        const Trip = require('./src/models/trip.model');
+        const trip = await Trip.findById(tripId).lean();
+
+        if (!trip) {
+          socket.emit('error', { message: 'Trip not found' });
+          return;
+        }
+
+        // Verify user is the passenger
+        if (trip.passengerId.toString() !== userId) {
+          socket.emit('error', { message: 'Unauthorized' });
+          return;
+        }
+
+        // Emit current trip status
+        socket.emit('trip:driver_update', {
+          tripId,
+          status: trip.status,
+          timestamp: new Date()
+        });
+
+      } catch (err) {
+        console.error('❌ Trip status request error:', err.message);
+        socket.emit('error', { message: 'Failed to fetch trip status' });
+      }
+    });
+
+    // Handle trip updates from driver
     socket.on('trip:update', async (data) => {
       try {
         const { tripId, status, location, distanceKm, durationMinutes } = data;
@@ -223,7 +251,7 @@ async function startServer() {
         
         await trip.save();
 
-        // Broadcast to passenger in real-time
+        // Broadcast to passenger
         io.to(`user:${trip.passengerId}`).emit('trip:driver_update', {
           tripId,
           status: trip.status,
@@ -248,9 +276,8 @@ async function startServer() {
       if (socket.userRoles?.isDriver) {
         const User = require('./src/models/user.model');
         User.findByIdAndUpdate(userId, {
-          'driverProfile.isAvailable': false,
           'driverProfile.lastSeen': new Date()
-        }).catch(err => console.error('Failed to update driver status:', err));
+        }).catch(err => console.error('Failed to update driver lastSeen:', err));
       }
     });
 
@@ -263,11 +290,11 @@ async function startServer() {
   });
 
   // ============================================
-  // Connect Event Emitter to Socket.IO (REAL DATA FLOW)
+  // Connect Event Emitter to Socket.IO
   // ============================================
   const emitter = require('./src/utils/eventEmitter');
 
-  // Listen to REAL app events and broadcast via Socket.IO
+  // Listen to app events and broadcast via Socket.IO
   emitter.on('notification', (data) => {
     const { userId, type, title, body, data: metadata } = data;
     
@@ -276,7 +303,7 @@ async function startServer() {
       return;
     }
 
-    console.log(`📢 Sending REAL notification to user ${userId}:`, { type, title });
+    console.log(`📢 Sending notification to user ${userId}:`, { type, title });
     
     // Send to specific user room
     io.to(`user:${userId}`).emit('notification', {
@@ -287,9 +314,9 @@ async function startServer() {
       timestamp: new Date()
     });
 
-    // Special handling for REAL trip offers to drivers
+    // Special handling for trip offers to drivers
     if (type === 'trip_offered') {
-      console.log(`🚗 Sending REAL trip offer to driver ${userId}:`, metadata);
+      console.log(`🚗 Sending trip offer to driver ${userId}:`, metadata);
       io.to(`user:${userId}`).emit('trip:offered', {
         requestId: metadata?.requestId,
         serviceType: metadata?.serviceType,
@@ -299,8 +326,9 @@ async function startServer() {
       });
     }
 
-    // REAL trip accepted notification
+    // Trip accepted notification
     if (type === 'trip_accepted') {
+      console.log(`✅ Trip accepted - notifying ${userId}:`, metadata);
       io.to(`user:${userId}`).emit('trip:accepted', {
         requestId: metadata?.requestId,
         tripId: metadata?.tripId,
@@ -311,7 +339,7 @@ async function startServer() {
       });
     }
 
-    // REAL trip started notification
+    // Trip started notification
     if (type === 'trip_started') {
       io.to(`user:${userId}`).emit('trip:started', {
         tripId: metadata?.tripId,
@@ -321,7 +349,7 @@ async function startServer() {
       });
     }
 
-    // REAL trip cancelled notification
+    // Trip cancelled notification
     if (type === 'trip_cancelled') {
       io.to(`user:${userId}`).emit('trip:cancelled', {
         tripId: metadata?.tripId,
@@ -330,7 +358,7 @@ async function startServer() {
       });
     }
 
-    // REAL trip completed notification
+    // Trip completed notification
     if (type === 'trip_completed') {
       io.to(`user:${userId}`).emit('trip:completed', {
         tripId: metadata?.tripId,
@@ -340,7 +368,7 @@ async function startServer() {
       });
     }
 
-    // REAL no driver found notification
+    // No driver found notification
     if (type === 'no_driver_found') {
       io.to(`user:${userId}`).emit('trip:no_drivers', {
         requestId: metadata?.requestId,
@@ -351,7 +379,7 @@ async function startServer() {
     }
   });
 
-  // Broadcast to all drivers (REAL announcements from admin)
+  // Broadcast to all drivers
   emitter.on('broadcast:drivers', (data) => {
     console.log('📢 Broadcasting to all drivers:', data);
     io.to('drivers').emit('broadcast', {
@@ -360,7 +388,7 @@ async function startServer() {
     });
   });
 
-  // Broadcast to all admins (REAL system alerts)
+  // Broadcast to all admins
   emitter.on('broadcast:admins', (data) => {
     console.log('📢 Broadcasting to all admins:', data);
     io.to('admins').emit('broadcast', {
@@ -369,7 +397,7 @@ async function startServer() {
     });
   });
 
-  // Make io globally accessible for direct use in routes if needed
+  // Make io globally accessible
   global.io = io;
   app.set('io', io);
 
@@ -378,14 +406,13 @@ async function startServer() {
   // ============================================
   server.listen(port, () => {
     console.log(`🚀 Server listening on http://localhost:${port}`);
-    console.log(`🔌 Socket.IO ready for REAL-TIME connections`);
+    console.log(`🔌 Socket.IO ready for real-time connections`);
     console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
   });
 
   // Graceful shutdown
   process.on('SIGINT', () => {
     console.log('\n⏳ Shutting down gracefully...');
-    // Close all socket connections
     io.close(() => {
       console.log('🔌 Socket.IO connections closed');
     });
