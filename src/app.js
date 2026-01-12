@@ -1,5 +1,6 @@
+// src/app.js - Fixed for Vercel
 const express = require('express');
-const cors = require('cors'); // ← Added for CORS
+const cors = require('cors');
 const requestLogger = require('./middleware/requestLogger');
 const errorHandler = require('./middleware/errorHandler');
 const { optionalAuth } = require('./middleware/auth');
@@ -7,8 +8,13 @@ const { authLimiter, paymentLimiter, defaultLimiter } = require('./middleware/ra
 
 const app = express();
 
-// === CORS: Allow requests from ANY origin (all URLs and networks) ===
-app.use(cors()); // Default: allows all origins, all methods, all headers
+// ============================================
+// CRITICAL: Trust proxy for Vercel
+// ============================================
+app.set('trust proxy', 1); // Trust first proxy (Vercel)
+
+// CORS: Allow requests from ANY origin
+app.use(cors());
 
 // Parse JSON bodies
 app.use(express.json());
@@ -53,7 +59,6 @@ app.use('/pricing', pricingRoutes);
 app.use('/trips', tripsRoutes);
 
 // === 404 Handler ===
-// Catch all unmatched routes
 app.use((req, res, next) => {
   const err = new Error('Not Found');
   err.status = 404;

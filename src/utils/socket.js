@@ -1,66 +1,35 @@
-// src/utils/socket.js
-import { io } from 'socket.io-client';
-import { getAuthToken } from './auth';
-
-let socket = null;
+// src/utils/socket.js - DISABLED (Polling only for Vercel)
+// Socket.IO doesn't work on Vercel serverless - use polling instead
 
 export const initSocket = async () => {
-  if (socket?.connected) return socket;
-
-  const token = await getAuthToken();
-  if (!token) {
-    console.error('No auth token available for Socket.IO');
-    return null;
-  }
-
-  socket = io('https://wheels-backend.vercel.app', {
-    auth: { token },
-    transports: ['websocket', 'polling'],
-    reconnection: true,
-    reconnectionAttempts: 5,
-    reconnectionDelay: 1000,
-  });
-
-  socket.on('connect', () => {
-    console.log('✅ Socket.IO connected:', socket.id);
-  });
-
-  socket.on('disconnect', (reason) => {
-    console.log('❌ Socket.IO disconnected:', reason);
-  });
-
-  socket.on('error', (error) => {
-    console.error('Socket.IO error:', error);
-  });
-
-  return socket;
+  console.log('⚠️ Socket.IO disabled - Vercel uses serverless functions');
+  console.log('📡 Using HTTP polling for real-time updates');
+  return null;
 };
 
-export const getSocket = () => socket;
+export const getSocket = () => null;
 
 export const disconnectSocket = () => {
-  if (socket) {
-    socket.disconnect();
-    socket = null;
-  }
+  console.log('✅ Socket disconnected (no-op)');
 };
 
 export const emitEvent = (event, data) => {
-  if (socket?.connected) {
-    socket.emit(event, data);
-  } else {
-    console.warn('Socket not connected, cannot emit:', event);
-  }
+  console.log(`⚠️ Socket emit ignored (${event}):`, data);
 };
 
 export const onEvent = (event, callback) => {
-  if (socket) {
-    socket.on(event, callback);
-  }
+  console.log(`⚠️ Socket event listener ignored: ${event}`);
 };
 
 export const offEvent = (event, callback) => {
-  if (socket) {
-    socket.off(event, callback);
-  }
+  // No-op
+};
+
+export const isSocketConnected = () => false;
+
+export const getSocketId = () => null;
+
+export const reconnectSocket = async () => {
+  console.log('⚠️ Socket reconnect ignored - using polling');
+  return null;
 };
