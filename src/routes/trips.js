@@ -1,5 +1,4 @@
-// routes/trips.routes.js
-// Unified router: trip requests, driver matching, acceptance, and full trip lifecycle
+// routes/trips.routes.js - Complete with Socket.IO integration
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -22,10 +21,11 @@ router.post('/request', requireAuth, async (req, res, next) => {
   try {
     const passengerId = req.user.sub;
     const { pickup, serviceType, paymentMethod = 'wallet', radiusMeters = 5000, limit = 10 } = req.body;
-    
+
     if (!pickup || !validateCoordinates(pickup.coordinates)) {
       return res.status(400).json({ error: { message: 'Invalid pickup coordinates' } });
     }
+
     if (!validateServiceType(serviceType)) {
       return res.status(400).json({ error: { message: 'Invalid serviceType' } });
     }
@@ -95,6 +95,23 @@ router.post('/request', requireAuth, async (req, res, next) => {
 
     console.log(`✅ Trip request created: ${tripRequest._id} with ${candidates.length} candidates`);
 
+    // NEW: Notify all nearby drivers via Socket.IO
+    nearbyDrivers.forEach(driver => {
+      emitter.emit('notification', {
+        userId: driver._id.toString(),
+        type: 'trip:new_request',
+        title: 'New Trip Request',
+        body: `New ${serviceType} ride nearby`,
+        data: {
+          tripId: tripRequest._id,
+          requestId: tripRequest._id,
+          passengerId: passengerId,
+          pickup: pickup,
+          serviceType: serviceType
+        }
+      });
+    });
+
     // Start sequential offering
     if (candidates.length > 0) {
       await offerToNext(tripRequest._id);
@@ -113,12 +130,12 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { requestId } = req.params;
-    
+
     const tripRequest = await TripRequest.findById(requestId)
       .populate('passengerId', 'name phone')
       .populate('assignedDriverId', 'name phone driverProfile')
       .lean();
-    
+
     if (!tripRequest) {
       return res.status(404).json({ error: { message: 'Trip request not found' } });
     }
@@ -131,12 +148,12 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
     // If assigned, also fetch the actual Trip record
     let trip = null;
     if (tripRequest.status === 'assigned' && tripRequest.assignedDriverId) {
-      trip = await Trip.findOne({ 
-        tripRequestId: tripRequest._id 
+      trip = await Trip.findOne({
+        tripRequestId: tripRequest._id
       }).lean();
     }
 
-    res.json({ 
+    res.json({
       trip: {
         ...tripRequest,
         _id: trip?._id || tripRequest._id,
@@ -160,7 +177,7 @@ async function offerToNext(requestId) {
   if (nextIdx === -1) {
     tripRequest.status = 'no_drivers';
     await tripRequest.save();
-    
+
     emitter.emit('notification', {
       userId: tripRequest.passengerId,
       type: 'no_driver_found',
@@ -176,17 +193,16 @@ async function offerToNext(requestId) {
   await tripRequest.save();
 
   const driverId = tripRequest.candidates[nextIdx].driverId;
-  
   console.log(`📤 Offering trip ${requestId} to driver ${driverId}`);
-  
+
   emitter.emit('notification', {
     userId: driverId,
     type: 'trip_offered',
     title: 'New Trip Request',
     body: `New ${tripRequest.serviceType} ride nearby`,
-    data: { 
+    data: {
       requestId: tripRequest._id,
-      serviceType: tripRequest.serviceType 
+      serviceType: tripRequest.serviceType
     }
   });
 
@@ -194,7 +210,7 @@ async function offerToNext(requestId) {
   setTimeout(async () => {
     const fresh = await TripRequest.findById(requestId);
     if (!fresh || fresh.status !== 'searching') return;
-    
+
     const cand = fresh.candidates.find(c => c.driverId.toString() === driverId.toString());
     if (cand && cand.status === 'offered') {
       cand.status = 'rejected';
@@ -221,23 +237,24 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     const candidate = tripRequest.candidates.find(
       c => c.driverId.toString() === driverId && c.status === 'offered'
     );
+
     if (!candidate) {
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
     const session = await mongoose.startSession();
     let newTrip;
-    
+
     await session.withTransaction(async () => {
       tripRequest.assignedDriverId = driverId;
       tripRequest.status = 'assigned';
       candidate.status = 'accepted';
       await tripRequest.save({ session });
 
-      const fareData = await calculateFare({ 
-        serviceType: tripRequest.serviceType, 
-        distanceKm: 0, 
-        durationMinutes: 0 
+      const fareData = await calculateFare({
+        serviceType: tripRequest.serviceType,
+        distanceKm: 0,
+        durationMinutes: 0
       });
 
       const tripDoc = await Trip.create([{
@@ -247,7 +264,7 @@ router.post('/accept', requireAuth, async (req, res, next) => {
         serviceType: tripRequest.serviceType,
         paymentMethod: tripRequest.paymentMethod,
         pickupLocation: tripRequest.pickup,
-        status: 'assigned', // Changed from 'pending' to 'assigned'
+        status: 'assigned',
         estimatedFare: fareData.baseAmount,
         requestedAt: new Date()
       }], { session });
@@ -264,13 +281,13 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.log(`✅ Driver ${driverId} accepted trip ${tripRequest._id}, created Trip ${newTrip._id}`);
 
-    // Emit trip_accepted event to PASSENGER with correct data structure
+    // NEW: Emit trip_accepted event to PASSENGER via Socket.IO
     emitter.emit('notification', {
       userId: tripRequest.passengerId,
       type: 'trip_accepted',
       title: 'Driver Accepted!',
       body: 'Your driver is on the way',
-      data: { 
+      data: {
         requestId: tripRequest._id.toString(),
         tripId: newTrip._id.toString(),
         driverId: driverId.toString()
@@ -283,14 +300,14 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       type: 'trip_accepted',
       title: 'Trip Accepted',
       body: 'Go to pickup location',
-      data: { 
+      data: {
         requestId: tripRequest._id.toString(),
         tripId: newTrip._id.toString()
       }
     });
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       message: 'Trip accepted and created',
       tripId: newTrip._id,
       requestId: tripRequest._id
@@ -316,6 +333,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     const candidate = tripRequest.candidates.find(
       c => c.driverId.toString() === driverId && c.status === 'offered'
     );
+
     if (!candidate) {
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
@@ -342,7 +360,7 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId);
-    
+
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
     if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Unauthorized' } });
     if (!['assigned', 'pending'].includes(trip.status)) {
@@ -374,7 +392,7 @@ router.patch('/:tripId/progress', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const { status, distanceKm, durationMinutes, dropoffLocation } = req.body;
-    
+
     const trip = await Trip.findById(req.params.tripId);
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
     if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Only driver can update' } });
@@ -390,7 +408,6 @@ router.patch('/:tripId/progress', requireAuth, async (req, res, next) => {
     }
 
     await trip.save();
-
     res.json({ trip });
   } catch (err) {
     next(err);
@@ -402,7 +419,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId);
-    
+
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
     if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Only driver can complete' } });
     if (['completed', 'cancelled'].includes(trip.status)) {
@@ -412,7 +429,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
     // Calculate final fare
     const pickupCoords = trip.pickupLocation?.coordinates || null;
     const dropoffCoords = trip.dropoffLocation?.coordinates || null;
-    
+
     const fareData = await calculateFare({
       serviceType: trip.serviceType,
       distanceKm: trip.distanceKm,
@@ -454,18 +471,18 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
         $unset: { 'driverProfile.currentTripId': '' }
       });
 
-      emitter.emit('notification', { 
-        userId: trip.passengerId, 
-        type: 'trip_completed', 
-        title: 'Trip completed (cash)', 
+      emitter.emit('notification', {
+        userId: trip.passengerId,
+        type: 'trip_completed',
+        title: 'Trip completed (cash)',
         body: `Pay driver ₦${Math.floor(trip.finalFare / 100)}`,
         data: { tripId: trip._id }
       });
-      
-      emitter.emit('notification', { 
-        userId: driverId, 
-        type: 'trip_completed', 
-        title: 'Confirm cash', 
+
+      emitter.emit('notification', {
+        userId: driverId,
+        type: 'trip_completed',
+        title: 'Confirm cash',
         body: 'Confirm collection via /confirm-cash',
         data: { tripId: trip._id }
       });
@@ -492,12 +509,12 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
     });
 
     if (commission > 0) {
-      await Transaction.create({ 
-        userId: null, 
-        type: 'commission', 
-        amount: commission, 
-        reference: trip._id, 
-        status: 'success' 
+      await Transaction.create({
+        userId: null,
+        type: 'commission',
+        amount: commission,
+        reference: trip._id,
+        status: 'success'
       });
     }
 
@@ -512,18 +529,18 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
     console.log(`✅ Trip ${trip._id} completed`);
 
-    emitter.emit('notification', { 
-      userId: trip.passengerId, 
-      type: 'trip_completed', 
-      title: 'Trip completed', 
+    emitter.emit('notification', {
+      userId: trip.passengerId,
+      type: 'trip_completed',
+      title: 'Trip completed',
       body: `Charged ₦${Math.floor(trip.finalFare / 100)}`,
       data: { tripId: trip._id }
     });
-    
-    emitter.emit('notification', { 
-      userId: driverId, 
-      type: 'trip_completed', 
-      title: 'Earnings', 
+
+    emitter.emit('notification', {
+      userId: driverId,
+      type: 'trip_completed',
+      title: 'Earnings',
       body: `You earned ₦${Math.floor(trip.driverEarnings / 100)}`,
       data: { tripId: trip._id }
     });
@@ -539,10 +556,10 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { reason } = req.body;
-    
+
     const trip = await Trip.findById(req.params.tripId);
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-    
+
     if (![trip.passengerId.toString(), trip.driverId?.toString()].includes(userId)) {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
@@ -587,12 +604,12 @@ router.get('/:tripId', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId).lean();
-    
+
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-    
+
     const isParticipant = [trip.passengerId.toString(), trip.driverId?.toString()].includes(userId);
     const isAdmin = (await User.findById(userId).lean())?.roles?.isAdmin;
-    
+
     if (!isParticipant && !isAdmin) {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
@@ -608,7 +625,7 @@ router.get('/', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { role = 'passenger', status, limit = 50, offset = 0 } = req.query;
-    
+
     const filter = role === 'driver' ? { driverId: userId } : { passengerId: userId };
     if (status) filter.status = status;
 
@@ -631,20 +648,21 @@ router.post('/:tripId/confirm-cash', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId);
-    
+
     if (!trip || trip.driverId.toString() !== driverId) {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
+
     if (trip.paymentMethod !== 'cash') {
       return res.status(400).json({ error: { message: 'Not a cash trip' } });
     }
 
-    const pendingTx = await Transaction.findOne({ 
-      reference: trip._id, 
-      type: 'trip_payment', 
-      status: 'pending' 
+    const pendingTx = await Transaction.findOne({
+      reference: trip._id,
+      type: 'trip_payment',
+      status: 'pending'
     });
-    
+
     if (!pendingTx) {
       return res.status(404).json({ error: { message: 'No pending cash transaction' } });
     }
@@ -655,18 +673,18 @@ router.post('/:tripId/confirm-cash', requireAuth, async (req, res, next) => {
     await pendingTx.save();
 
     await Wallet.findOneAndUpdate(
-      { owner: driverId }, 
-      { $inc: { balance: trip.driverEarnings } }, 
+      { owner: driverId },
+      { $inc: { balance: trip.driverEarnings } },
       { upsert: true }
     );
 
     if (trip.commission > 0) {
-      await Transaction.create({ 
-        userId: null, 
-        type: 'commission', 
-        amount: trip.commission, 
-        reference: trip._id, 
-        status: 'success' 
+      await Transaction.create({
+        userId: null,
+        type: 'commission',
+        amount: trip.commission,
+        reference: trip._id,
+        status: 'success'
       });
     }
 
