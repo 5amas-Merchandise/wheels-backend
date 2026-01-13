@@ -1,35 +1,66 @@
-// src/utils/socket.js - DISABLED (Polling only for Vercel)
-// Socket.IO doesn't work on Vercel serverless - use polling instead
+// src/utils/socket.js
+import { io } from 'socket.io-client';
+import { getAuthToken } from './auth';
+
+let socket = null;
 
 export const initSocket = async () => {
-  console.log('⚠️ Socket.IO disabled - Vercel uses serverless functions');
-  console.log('📡 Using HTTP polling for real-time updates');
-  return null;
+  if (socket?.connected) return socket;
+
+  const token = await getAuthToken();
+  if (!token) {
+    console.error('No auth token available for Socket.IO');
+    return null;
+  }
+
+  socket = io('https://wheels-backend-7ydc.onrender.com', {
+    auth: { token },
+    transports: ['websocket', 'polling'],
+    reconnection: true,
+    reconnectionAttempts: 5,
+    reconnectionDelay: 1000,
+  });
+
+  socket.on('connect', () => {
+    console.log('✅ Socket.IO connected:', socket.id);
+  });
+
+  socket.on('disconnect', (reason) => {
+    console.log('❌ Socket.IO disconnected:', reason);
+  });
+
+  socket.on('error', (error) => {
+    console.error('Socket.IO error:', error);
+  });
+
+  return socket;
 };
 
-export const getSocket = () => null;
+export const getSocket = () => socket;
 
 export const disconnectSocket = () => {
-  console.log('✅ Socket disconnected (no-op)');
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
 };
 
 export const emitEvent = (event, data) => {
-  console.log(`⚠️ Socket emit ignored (${event}):`, data);
+  if (socket?.connected) {
+    socket.emit(event, data);
+  } else {
+    console.warn('Socket not connected, cannot emit:', event);
+  }
 };
 
 export const onEvent = (event, callback) => {
-  console.log(`⚠️ Socket event listener ignored: ${event}`);
+  if (socket) {
+    socket.on(event, callback);
+  }
 };
 
 export const offEvent = (event, callback) => {
-  // No-op
-};
-
-export const isSocketConnected = () => false;
-
-export const getSocketId = () => null;
-
-export const reconnectSocket = async () => {
-  console.log('⚠️ Socket reconnect ignored - using polling');
-  return null;
+  if (socket) {
+    socket.off(event, callback);
+  }
 };
