@@ -1,539 +1,277 @@
-// server.js - Production-ready with Socket.IO - Complete Implementation with Fixed Notifications
-const http = require('http');
-const socketIO = require('socket.io');
-const jwt = require('jsonwebtoken');
-const app = require('./src/app');
-const config = require('./src/config');
-const db = require('./src/db/mongoose');
+// server.js
+// Minimal but complete WebSocket-based backend for ride-hailing (no Socket.IO)
+// Copy-paste ready — requires: express, ws, jsonwebtoken, mongoose
 
-async function startServer() {
-  try {
-    await db.connect();
-    console.log('✅ Connected to MongoDB');
-  } catch (err) {
-    console.error('❌ Failed to connect to MongoDB', err);
-    process.exit(1);
+require('dotenv').config();
+
+const http = require('http');
+const express = require('express');
+const WebSocket = require('ws');
+const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
+
+const app = express();
+const server = http.createServer(app);
+
+// ────────────────────────────────────────────────
+//  WebSocket + Room Management
+// ────────────────────────────────────────────────
+
+const wss = new WebSocket.Server({ server });
+
+const connectedUsers = new Map();   // userId → ws
+const rooms = new Map();            // roomName → Set<ws>
+
+function joinRoom(ws, roomName) {
+  if (!rooms.has(roomName)) rooms.set(roomName, new Set());
+  rooms.get(roomName).add(ws);
+}
+
+function leaveAllRooms(ws) {
+  for (const clients of rooms.values()) {
+    clients.delete(ws);
+  }
+}
+
+function sendToUser(userId, data) {
+  const ws = connectedUsers.get(userId?.toString());
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+function broadcastToRoom(roomName, data, excludeWs = null) {
+  const clients = rooms.get(roomName);
+  if (!clients) return;
+
+  const payload = JSON.stringify(data);
+  for (const client of clients) {
+    if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+// ────────────────────────────────────────────────
+//  WebSocket Connection Handler
+// ────────────────────────────────────────────────
+
+wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+
+  // Heartbeat
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  // Extract token from query string:  ws://.../?token=xyz
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost:3000'}`);
+  const token = url.searchParams.get('token');
+
+  if (!token) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Authentication required: token missing' }));
+    ws.close(1008, 'No token');
+    return;
   }
 
-  const port = config.port || 3000;
-  const server = http.createServer(app);
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-me');
+    ws.userId = (payload.sub || payload.userId || payload._id)?.toString();
+    ws.isDriver = !!payload.isDriver; // or payload.roles?.driver etc.
 
-  // ============================================
-  // Socket.IO Setup with CORS
-  // ============================================
-  const io = socketIO(server, {
-    cors: {
-      origin: "*",
-      methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-      credentials: true
-    },
-    transports: ['websocket', 'polling'],
-    allowEIO3: true,
-    pingTimeout: 60000,
-    pingInterval: 25000
-  });
+    if (!ws.userId) throw new Error('No valid userId in token');
 
-  // Store connected users: { userId: socketId }
-  const connectedUsers = new Map();
-  // Store trip rooms for real-time location sharing
-  const tripRooms = new Map();
+    console.log(`🔗 Connected → user ${ws.userId} (${ws.isDriver ? 'driver' : 'passenger'})`);
 
-  // Socket.IO Authentication Middleware
-  io.use((socket, next) => {
-    const token = socket.handshake.auth.token ||
-      socket.handshake.headers.authorization?.replace('Bearer ', '');
+    connectedUsers.set(ws.userId, ws);
+    joinRoom(ws, `user:${ws.userId}`);
 
-    if (!token) {
-      console.log('❌ Socket connection rejected: No token');
-      return next(new Error('Authentication error: No token provided'));
+    if (ws.isDriver) {
+      joinRoom(ws, 'drivers');
     }
 
+    ws.send(JSON.stringify({
+      type: 'connected',
+      userId: ws.userId,
+      isDriver: ws.isDriver,
+      timestamp: new Date().toISOString()
+    }));
+  } catch (err) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Invalid or expired token' }));
+    ws.close(1008, 'Invalid token');
+    return;
+  }
+
+  // ─── Message handler ───────────────────────────────────────
+  ws.on('message', async (raw) => {
+    let msg;
     try {
-      const payload = jwt.verify(token, config.jwtSecret);
-      socket.userId = payload.userId || payload.sub || payload._id;
-      socket.userRoles = payload.roles || {};
-      console.log(`🔐 Socket authenticated for user: ${socket.userId}`);
-      next();
-    } catch (err) {
-      console.log('❌ Socket auth failed:', err.message);
-      next(new Error('Authentication error: Invalid token'));
-    }
-  });
-
-  // Socket.IO Connection Handler
-  io.on('connection', (socket) => {
-    const userId = socket.userId;
-    console.log(`✅ User connected: ${userId} (Socket: ${socket.id})`);
-
-    // Store connection
-    connectedUsers.set(userId, socket.id);
-
-    // Join user-specific room
-    socket.join(`user:${userId}`);
-
-    // If driver, join driver room
-    if (socket.userRoles?.isDriver) {
-      socket.join('drivers');
-      console.log(`🚗 Driver ${userId} joined drivers room`);
-    }
-
-    // If admin, join admin room
-    if (socket.userRoles?.isAdmin) {
-      socket.join('admins');
-      console.log(`👑 Admin ${userId} joined admins room`);
-    }
-
-    // ========================================
-    // NEW: Driver accepts trip (real-time)
-    // ========================================
-    socket.on('driver:accept_trip', async (data) => {
-      try {
-        const { tripId, requestId, passengerId } = data;
-        const driverId = userId;
-
-        console.log(`✅ Driver ${driverId} accepting trip ${tripId || requestId} via Socket.IO`);
-
-        // 1. Create a unique room for this specific trip
-        const tripRoom = `trip:${tripId || requestId}`;
-        socket.join(tripRoom);
-        tripRooms.set(tripId || requestId, { driverId, passengerId });
-
-        // 2. Notify the passenger that driver accepted (real-time)
-        io.to(`user:${passengerId}`).emit('trip:accepted', {
-          tripId: tripId || requestId,
-          requestId: requestId || tripId,
-          driverId: driverId,
-          message: 'Driver is on the way!'
-        });
-
-        console.log(`📢 Notified passenger ${passengerId} of trip acceptance`);
-
-        // Join passenger to trip room as well for location updates
-        const passengerSocketId = connectedUsers.get(passengerId);
-        if (passengerSocketId) {
-          io.sockets.sockets.get(passengerSocketId)?.join(tripRoom);
-        }
-      } catch (err) {
-        console.error('❌ Error in driver:accept_trip:', err);
-        socket.emit('error', { message: 'Failed to accept trip' });
-      }
-    });
-
-    // ========================================
-    // Real-time location updates from driver
-    // ========================================
-    socket.on('driver:location', async (data) => {
-      try {
-        const { latitude, longitude, heading } = data;
-
-        if (!latitude || !longitude) {
-          console.log('⚠️ Invalid location data from driver:', userId);
-          return;
-        }
-
-        // Validate latitude and longitude ranges
-        if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
-          console.log('⚠️ Location out of range from driver:', userId);
-          return;
-        }
-
-        const User = require('./src/models/user.model');
-
-        // Update driver location in database
-        await User.findByIdAndUpdate(userId, {
-          'driverProfile.location': {
-            type: 'Point',
-            coordinates: [longitude, latitude]
-          },
-          'driverProfile.heading': heading || 0,
-          'driverProfile.lastSeen': new Date()
-        });
-
-        console.log(`📍 Driver ${userId} location updated: [${latitude}, ${longitude}]`);
-
-        // Broadcast location to relevant passengers if driver is on trip
-        const Trip = require('./src/models/trip.model');
-        const trip = await Trip.findOne({
-          driverId: userId,
-          status: { $in: ['assigned', 'started', 'in_progress'] }
-        });
-
-        if (trip) {
-          const tripRoom = `trip:${trip._id}`;
-
-          // NEW: Send to trip room (real-time location sharing)
-          io.to(tripRoom).emit('trip:driver_location', {
-            tripId: trip._id,
-            driverLocation: { latitude, longitude, heading },
-            timestamp: new Date()
-          });
-
-          // Also send to passenger's user room (fallback)
-          io.to(`user:${trip.passengerId}`).emit('trip:driver_location', {
-            tripId: trip._id,
-            driverLocation: { latitude, longitude, heading },
-            timestamp: new Date()
-          });
-        }
-      } catch (err) {
-        console.error('❌ Location update error:', err.message);
-      }
-    });
-
-    // ========================================
-    // NEW: Real-time location updates to trip room
-    // ========================================
-    socket.on('driver:location_update', (data) => {
-      try {
-        const { tripId, location } = data;
-
-        if (!tripId || !location) {
-          console.log('⚠️ Invalid location update data');
-          return;
-        }
-
-        const tripRoom = `trip:${tripId}`;
-        console.log(`📍 Broadcasting location to trip room: ${tripRoom}`);
-
-        // Broadcast to everyone in the trip room (passenger)
-        io.to(tripRoom).emit('trip:driver_location', {
-          tripId,
-          driverLocation: location,
-          timestamp: new Date()
-        });
-      } catch (err) {
-        console.error('❌ Location broadcast error:', err.message);
-      }
-    });
-
-    // Handle passenger requesting trip status
-    socket.on('passenger:request_trip', async (data) => {
-      try {
-        const { requestId } = data;
-
-        if (!requestId) {
-          socket.emit('error', { message: 'Request ID required' });
-          return;
-        }
-
-        const TripRequest = require('./src/models/tripRequest.model');
-        const tripRequest = await TripRequest.findById(requestId)
-          .populate('passengerId', 'name phone')
-          .lean();
-
-        if (!tripRequest) {
-          socket.emit('error', { message: 'Trip request not found' });
-          return;
-        }
-
-        // Verify user is the passenger
-        if (tripRequest.passengerId._id.toString() !== userId) {
-          socket.emit('error', { message: 'Unauthorized' });
-          return;
-        }
-
-        // Emit real-time update
-        socket.emit('trip:request_update', {
-          requestId,
-          status: tripRequest.status,
-          assignedDriverId: tripRequest.assignedDriverId,
-          candidates: tripRequest.candidates
-        });
-      } catch (err) {
-        console.error('❌ Trip request status error:', err.message);
-        socket.emit('error', { message: 'Failed to fetch trip request' });
-      }
-    });
-
-    // Handle passenger requesting current trip status
-    socket.on('passenger:request_status', async (data) => {
-      try {
-        const { tripId } = data;
-
-        if (!tripId) {
-          socket.emit('error', { message: 'Trip ID required' });
-          return;
-        }
-
-        const Trip = require('./src/models/trip.model');
-        const trip = await Trip.findById(tripId).lean();
-
-        if (!trip) {
-          socket.emit('error', { message: 'Trip not found' });
-          return;
-        }
-
-        // Verify user is the passenger
-        if (trip.passengerId.toString() !== userId) {
-          socket.emit('error', { message: 'Unauthorized' });
-          return;
-        }
-
-        // Emit current trip status
-        socket.emit('trip:driver_update', {
-          tripId,
-          status: trip.status,
-          timestamp: new Date()
-        });
-      } catch (err) {
-        console.error('❌ Trip status request error:', err.message);
-        socket.emit('error', { message: 'Failed to fetch trip status' });
-      }
-    });
-
-    // Handle trip updates from driver
-    socket.on('trip:update', async (data) => {
-      try {
-        const { tripId, status, location, distanceKm, durationMinutes } = data;
-
-        if (!tripId) {
-          socket.emit('error', { message: 'Trip ID required' });
-          return;
-        }
-
-        const Trip = require('./src/models/trip.model');
-        const trip = await Trip.findById(tripId);
-
-        if (!trip) {
-          socket.emit('error', { message: 'Trip not found' });
-          return;
-        }
-
-        // Verify driver owns this trip
-        if (trip.driverId.toString() !== userId) {
-          socket.emit('error', { message: 'Unauthorized' });
-          return;
-        }
-
-        console.log(`🚗 Trip update from driver ${userId}:`, { tripId, status });
-
-        // Update trip status
-        if (status && ['started', 'in_progress', 'completed'].includes(status)) {
-          trip.status = status;
-          if (status === 'started') {
-            trip.startedAt = new Date();
-          } else if (status === 'completed') {
-            trip.completedAt = new Date();
-          }
-        }
-
-        if (distanceKm !== undefined) trip.distanceKm = distanceKm;
-        if (durationMinutes !== undefined) trip.durationMinutes = durationMinutes;
-
-        await trip.save();
-
-        // Broadcast to passenger and trip room
-        const updateData = {
-          tripId,
-          status: trip.status,
-          driverLocation: location,
-          distanceKm,
-          durationMinutes,
-          timestamp: new Date()
-        };
-
-        io.to(`user:${trip.passengerId}`).emit('trip:driver_update', updateData);
-        io.to(`trip:${tripId}`).emit('trip:driver_update', updateData);
-      } catch (err) {
-        console.error('❌ Trip update error:', err.message);
-        socket.emit('error', { message: 'Failed to update trip' });
-      }
-    });
-
-    // Handle disconnection
-    socket.on('disconnect', (reason) => {
-      console.log(`❌ User disconnected: ${userId} (Reason: ${reason})`);
-      connectedUsers.delete(userId);
-
-      // Mark driver as unavailable if they disconnect
-      if (socket.userRoles?.isDriver) {
-        const User = require('./src/models/user.model');
-        User.findByIdAndUpdate(userId, {
-          'driverProfile.lastSeen': new Date()
-        }).catch(err => console.error('Failed to update driver lastSeen:', err));
-      }
-    });
-
-    // Acknowledge connection
-    socket.emit('connected', {
-      userId,
-      socketId: socket.id,
-      timestamp: new Date()
-    });
-  });
-
-  // ============================================
-  // Connect Event Emitter to Socket.IO (UPDATED)
-  // ============================================
-  const emitter = require('./src/utils/eventEmitter');
-
-  // Listen to app events and broadcast via Socket.IO
-  emitter.on('notification', (data) => {
-    const { userId, type, title, body, data: metadata } = data;
-
-    if (!userId) {
-      console.log('⚠️ Notification without userId:', { type, title });
+      msg = JSON.parse(raw);
+    } catch {
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
       return;
     }
 
-    console.log(`📢 Sending notification to user ${userId}:`, { type, title });
+    const { type, ...data } = msg;
 
-    // Send to specific user room
-    io.to(`user:${userId}`).emit('notification', {
-      type,
-      title,
-      body,
-      data: metadata,
-      timestamp: new Date()
-    });
+    switch (type) {
+      // Driver sends location
+      case 'driver:location': {
+        if (!ws.isDriver) return;
 
-    // NEW: Proper handling for trip:new_request to drivers
-    if (type === 'trip:new_request') {
-      console.log(`🚗 Sending NEW trip request to driver ${userId}:`, metadata);
-      
-      // Send multiple events for compatibility
-      io.to(`user:${userId}`).emit('trip:new_request', {
-        tripId: metadata?.tripId,
-        requestId: metadata?.requestId,
-        passengerId: metadata?.passengerId,
-        pickup: metadata?.pickup,
-        serviceType: metadata?.serviceType,
-        candidateIndex: metadata?.candidateIndex,
-        title,
-        body,
-        timestamp: new Date()
-      });
+        const { latitude, longitude, heading = 0 } = data;
 
-      // Also send trip:offered for backward compatibility
-      io.to(`user:${userId}`).emit('trip:offered', {
-        requestId: metadata?.requestId,
-        tripId: metadata?.tripId,
-        serviceType: metadata?.serviceType,
-        pickup: metadata?.pickup,
-        timestamp: new Date()
-      });
+        if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+          return;
+        }
 
-      console.log(`✅ Trip request sent to driver ${userId}`);
-    }
+        // You should save to DB here in real app
+        console.log(`📍 ${ws.userId} → [${latitude.toFixed(5)}, ${longitude.toFixed(5)}]`);
 
-    // Special handling for trip offers to drivers
-    if (type === 'trip_offered') {
-      console.log(`🚗 Sending trip offer to driver ${userId}:`, metadata);
-      io.to(`user:${userId}`).emit('trip:offered', {
-        requestId: metadata?.requestId,
-        serviceType: metadata?.serviceType,
-        immediateOffer: metadata?.immediateOffer,
-        candidateIndex: metadata?.candidateIndex,
-        title,
-        body,
-        timestamp: new Date()
-      });
-    }
+        // Broadcast to everyone in the same trip room (if any)
+        // In real app → find active trip → get trip:${tripId} room
+        // For demo: broadcast to all drivers & connected passengers (simple)
+        broadcastToRoom('drivers', {
+          type: 'driver:location',
+          driverId: ws.userId,
+          latitude,
+          longitude,
+          heading,
+          timestamp: new Date().toISOString()
+        });
 
-    // Trip accepted notification
-    if (type === 'trip_accepted') {
-      console.log(`✅ Trip accepted - notifying ${userId}:`, metadata);
-      io.to(`user:${userId}`).emit('trip:accepted', {
-        requestId: metadata?.requestId,
-        tripId: metadata?.tripId,
-        driverId: metadata?.driverId,
-        title,
-        body,
-        timestamp: new Date()
-      });
-    }
+        break;
+      }
 
-    // Trip started notification
-    if (type === 'trip_started') {
-      io.to(`user:${userId}`).emit('trip:started', {
-        tripId: metadata?.tripId,
-        title,
-        body,
-        timestamp: new Date()
-      });
-    }
+      // Passenger / driver joins a trip room
+      case 'join:trip': {
+        const { tripId } = data;
+        if (!tripId) return;
 
-    // Trip cancelled notification
-    if (type === 'trip_cancelled') {
-      io.to(`user:${userId}`).emit('trip:cancelled', {
-        tripId: metadata?.tripId,
-        reason: body,
-        timestamp: new Date()
-      });
-    }
+        const room = `trip:${tripId}`;
+        joinRoom(ws, room);
 
-    // Trip completed notification
-    if (type === 'trip_completed') {
-      io.to(`user:${userId}`).emit('trip:completed', {
-        tripId: metadata?.tripId,
-        title,
-        body,
-        timestamp: new Date()
-      });
-    }
+        ws.send(JSON.stringify({
+          type: 'joined',
+          room,
+          timestamp: new Date().toISOString()
+        }));
 
-    // No driver found notification
-    if (type === 'no_driver_found') {
-      io.to(`user:${userId}`).emit('trip:no_drivers', {
-        requestId: metadata?.requestId,
-        title,
-        body,
-        timestamp: new Date()
-      });
+        console.log(`${ws.userId} joined ${room}`);
+        break;
+      }
+
+      // Driver accepts trip → notify passenger & create room
+      case 'driver:accept_trip': {
+        if (!ws.isDriver) return;
+
+        const { tripId, passengerId } = data;
+        if (!tripId || !passengerId) return;
+
+        const room = `trip:${tripId}`;
+
+        joinRoom(ws, room);
+
+        // Notify passenger
+        sendToUser(passengerId, {
+          type: 'trip:accepted',
+          tripId,
+          driverId: ws.userId,
+          message: 'Driver accepted your ride!',
+          timestamp: new Date().toISOString()
+        });
+
+        // Try to add passenger to room
+        const pWs = connectedUsers.get(passengerId.toString());
+        if (pWs) joinRoom(pWs, room);
+
+        // Notify everyone in trip room (including driver & passenger)
+        broadcastToRoom(room, {
+          type: 'trip:status',
+          status: 'accepted',
+          driverId: ws.userId,
+          tripId,
+          timestamp: new Date().toISOString()
+        }, ws); // exclude sender if you want
+
+        break;
+      }
+
+      default:
+        console.log(`Unhandled message type: ${type}`);
+        break;
     }
   });
 
-  // Broadcast to all drivers
-  emitter.on('broadcast:drivers', (data) => {
-    console.log('📢 Broadcasting to all drivers:', data);
-    io.to('drivers').emit('broadcast', {
-      ...data,
-      timestamp: new Date()
-    });
+  ws.on('close', () => {
+    console.log(`Disconnected → ${ws.userId || 'unknown'}`);
+    connectedUsers.delete(ws.userId);
+    leaveAllRooms(ws);
   });
+});
 
-  // Broadcast to all admins
-  emitter.on('broadcast:admins', (data) => {
-    console.log('📢 Broadcasting to all admins:', data);
-    io.to('admins').emit('broadcast', {
-      ...data,
-      timestamp: new Date()
-    });
+// Heartbeat — clean dead connections
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
   });
+}, 30000);
 
-  // Make io globally accessible
-  global.io = io;
-  app.set('io', io);
+// ────────────────────────────────────────────────
+//  Basic HTTP routes (for testing)
+// ────────────────────────────────────────────────
 
-  // ============================================
-  // Start Server
-  // ============================================
-  server.listen(port, () => {
-    console.log(`🚀 Server listening on http://localhost:${port}`);
-    console.log(`🔌 Socket.IO ready for real-time connections`);
-    console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    connectedClients: wss.clients.size,
+    timestamp: new Date().toISOString()
   });
+});
 
-  // Graceful shutdown
-  process.on('SIGINT', () => {
-    console.log('\n⏳ Shutting down gracefully...');
-    io.close(() => {
-      console.log('🔌 Socket.IO connections closed');
-    });
+app.get('/', (req, res) => {
+  res.send(`
+    <h1>Ride-hailing WebSocket server</h1>
+    <p>Connect via: <code>ws://your-domain/?token=your-jwt-token</code></p>
+    <p>Health check: <a href="/health">/health</a></p>
+  `);
+});
+
+// ────────────────────────────────────────────────
+//  MongoDB connection (minimal)
+// ────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGO_URI;
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// ────────────────────────────────────────────────
+//  Start server
+// ────────────────────────────────────────────────
+
+server.listen(PORT, () => {
+  console.log(`
+  ╔════════════════════════════════════════════╗
+  ║   Ride-hailing WebSocket server running    ║
+  ║                                            ║
+  ║   HTTP:  http://localhost:${PORT}           ║
+  ║   WS:    ws://localhost:${PORT}             ║
+  ║                                            ║
+  ║   Connect with ?token=your-jwt-token       ║
+  ╚════════════════════════════════════════════╝
+  `);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Closing server...');
+  wss.close(() => {
     server.close(() => {
-      console.log('✅ Server closed');
+      console.log('Server closed.');
       process.exit(0);
     });
   });
-
-  process.on('SIGTERM', () => {
-    console.log('\n⏳ SIGTERM received, shutting down...');
-    io.close();
-    server.close(() => {
-      console.log('✅ Server closed');
-      process.exit(0);
-    });
-  });
-}
-
-startServer();
+});
