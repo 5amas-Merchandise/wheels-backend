@@ -1,4 +1,4 @@
-// routes/drivers.js - FIXED VERSION with proper location updates
+// routes/drivers.js - COMPLETE INTEGRATED VERSION
 const express = require("express");
 const router = express.Router();
 const User = require("../models/user.model");
@@ -10,142 +10,6 @@ const DURATION_DAYS = {
   weekly: 7,
   monthly: 30,
 };
-
-// Subscribe or renew subscription (driver action)
-router.post("/subscribe", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    const { type } = req.body;
-    if (!type || !DURATION_DAYS[type])
-      return res
-        .status(400)
-        .json({ error: { message: "Invalid subscription type" } });
-    const user = await User.findById(userId);
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    const now = new Date();
-    const days = DURATION_DAYS[type];
-    const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-    user.subscription = { type, startedAt: now, expiresAt };
-    user.roles = user.roles || {};
-    user.roles.isDriver = true;
-    await user.save();
-    res.json({ ok: true, subscription: user.subscription });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Get subscription status
-router.get("/subscription", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    const user = await User.findById(userId).lean();
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    res.json({ subscription: user.subscription || null });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Get driver profile
-router.get("/me", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    const user = await User.findById(userId).lean();
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    res.json({ driverProfile: user.driverProfile, roles: user.roles });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Update basic driver profile
-router.post("/profile", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-
-    const {
-      vehicleMake,
-      vehicleModel,
-      vehicleNumber,
-      name,
-      profilePicUrl,
-      carPicUrl,
-      nin,
-      ninImageUrl,
-      licenseNumber,
-      licenseImageUrl,
-    } = req.body;
-
-    const update = {};
-    if (vehicleMake !== undefined)
-      update["driverProfile.vehicleMake"] = vehicleMake;
-    if (vehicleModel !== undefined)
-      update["driverProfile.vehicleModel"] = vehicleModel;
-    if (vehicleNumber !== undefined)
-      update["driverProfile.vehicleNumber"] = vehicleNumber;
-    if (name !== undefined) update["name"] = name;
-    if (profilePicUrl !== undefined)
-      update["driverProfile.profilePicUrl"] = profilePicUrl;
-    if (carPicUrl !== undefined) update["driverProfile.carPicUrl"] = carPicUrl;
-    if (nin !== undefined) update["driverProfile.nin"] = nin;
-    if (ninImageUrl !== undefined)
-      update["driverProfile.ninImageUrl"] = ninImageUrl;
-    if (licenseNumber !== undefined)
-      update["driverProfile.licenseNumber"] = licenseNumber;
-    if (licenseImageUrl !== undefined)
-      update["driverProfile.licenseImageUrl"] = licenseImageUrl;
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: update },
-      { new: true }
-    ).lean();
-    res.json({ driverProfile: user.driverProfile });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Add or remove service categories
-router.post("/service-categories", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    const { add = [], remove = [] } = req.body;
-    if (!Array.isArray(add) || !Array.isArray(remove))
-      return res
-        .status(400)
-        .json({ error: { message: "add and remove must be arrays" } });
-    const user = await User.findById(userId);
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    user.driverProfile.serviceCategories =
-      user.driverProfile.serviceCategories || [];
-    for (const s of add) {
-      if (!user.driverProfile.serviceCategories.includes(s))
-        user.driverProfile.serviceCategories.push(s);
-    }
-    user.driverProfile.serviceCategories =
-      user.driverProfile.serviceCategories.filter((s) => !remove.includes(s));
-    await user.save();
-    res.json({ serviceCategories: user.driverProfile.serviceCategories });
-  } catch (err) {
-    next(err);
-  }
-});
 
 // ⚠️ CRITICAL FIX: Update availability and location
 router.post("/availability", requireAuth, async (req, res, next) => {
@@ -321,6 +185,142 @@ router.get('/location', requireAuth, async (req, res, next) => {
         isAvailable: driver.driverProfile.isAvailable
       }
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Subscribe or renew subscription (driver action)
+router.post("/subscribe", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    const { type } = req.body;
+    if (!type || !DURATION_DAYS[type])
+      return res
+        .status(400)
+        .json({ error: { message: "Invalid subscription type" } });
+    const user = await User.findById(userId);
+    if (!user)
+      return res.status(404).json({ error: { message: "User not found" } });
+    const now = new Date();
+    const days = DURATION_DAYS[type];
+    const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+    user.subscription = { type, startedAt: now, expiresAt };
+    user.roles = user.roles || {};
+    user.roles.isDriver = true;
+    await user.save();
+    res.json({ ok: true, subscription: user.subscription });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Get subscription status
+router.get("/subscription", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    const user = await User.findById(userId).lean();
+    if (!user)
+      return res.status(404).json({ error: { message: "User not found" } });
+    res.json({ subscription: user.subscription || null });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Get driver profile
+router.get("/me", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    const user = await User.findById(userId).lean();
+    if (!user)
+      return res.status(404).json({ error: { message: "User not found" } });
+    res.json({ driverProfile: user.driverProfile, roles: user.roles });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Update basic driver profile
+router.post("/profile", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+
+    const {
+      vehicleMake,
+      vehicleModel,
+      vehicleNumber,
+      name,
+      profilePicUrl,
+      carPicUrl,
+      nin,
+      ninImageUrl,
+      licenseNumber,
+      licenseImageUrl,
+    } = req.body;
+
+    const update = {};
+    if (vehicleMake !== undefined)
+      update["driverProfile.vehicleMake"] = vehicleMake;
+    if (vehicleModel !== undefined)
+      update["driverProfile.vehicleModel"] = vehicleModel;
+    if (vehicleNumber !== undefined)
+      update["driverProfile.vehicleNumber"] = vehicleNumber;
+    if (name !== undefined) update["name"] = name;
+    if (profilePicUrl !== undefined)
+      update["driverProfile.profilePicUrl"] = profilePicUrl;
+    if (carPicUrl !== undefined) update["driverProfile.carPicUrl"] = carPicUrl;
+    if (nin !== undefined) update["driverProfile.nin"] = nin;
+    if (ninImageUrl !== undefined)
+      update["driverProfile.ninImageUrl"] = ninImageUrl;
+    if (licenseNumber !== undefined)
+      update["driverProfile.licenseNumber"] = licenseNumber;
+    if (licenseImageUrl !== undefined)
+      update["driverProfile.licenseImageUrl"] = licenseImageUrl;
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: update },
+      { new: true }
+    ).lean();
+    res.json({ driverProfile: user.driverProfile });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Add or remove service categories
+router.post("/service-categories", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    const { add = [], remove = [] } = req.body;
+    if (!Array.isArray(add) || !Array.isArray(remove))
+      return res
+        .status(400)
+        .json({ error: { message: "add and remove must be arrays" } });
+    const user = await User.findById(userId);
+    if (!user)
+      return res.status(404).json({ error: { message: "User not found" } });
+    user.driverProfile.serviceCategories =
+      user.driverProfile.serviceCategories || [];
+    for (const s of add) {
+      if (!user.driverProfile.serviceCategories.includes(s))
+        user.driverProfile.serviceCategories.push(s);
+    }
+    user.driverProfile.serviceCategories =
+      user.driverProfile.serviceCategories.filter((s) => !remove.includes(s));
+    await user.save();
+    res.json({ serviceCategories: user.driverProfile.serviceCategories });
   } catch (err) {
     next(err);
   }

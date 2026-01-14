@@ -1,4 +1,4 @@
-// routes/trips.js - FIXED VERSION with improved driver search
+// routes/trips.js - COMPLETE INTEGRATED VERSION
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -14,7 +14,7 @@ const { isLuxury } = require('../constants/serviceTypes');
 const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 
-// ⚠️ CRITICAL FIX: Improved driver search with better logging
+// POST /trips/request - Improved driver search with better logging
 router.post('/request', requireAuth, async (req, res, next) => {
   try {
     const passengerId = req.user.sub;
@@ -525,7 +525,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
 });
 
 // ========================
-// 4. TRIP LIFECYCLE ENDPOINTS
+// TRIP LIFECYCLE ENDPOINTS
 // ========================
 
 // Start trip (driver)
