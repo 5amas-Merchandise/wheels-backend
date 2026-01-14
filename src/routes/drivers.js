@@ -1,4 +1,4 @@
-// routes/drivers.js - COMPLETE INTEGRATED VERSION
+// routes/drivers.js - COMPLETE INTEGRATED VERSION (FIXED)
 const express = require("express");
 const router = express.Router();
 const User = require("../models/user.model");
@@ -473,10 +473,14 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
   }
 });
 
-// GET currently offered trip request for the driver (for polling)
+// ✅ FIXED: GET currently offered trip request for the driver (for polling)
 router.get("/offered-request", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
+    console.log(`🔍 Driver ${driverId} checking for offered requests at ${new Date().toISOString()}`);
+    
+    // ✅ CRITICAL FIX: Check both 'searching' and 'assigned' statuses
+    // A trip might be assigned but driver hasn't accepted yet in Trip collection
     const activeRequest = await TripRequest.findOne({
       candidates: {
         $elemMatch: {
@@ -484,13 +488,25 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
           status: "offered",
         },
       },
-      status: "searching",
+      // ✅ FIX: Check for 'searching' OR recent 'assigned' trips
+      $or: [
+        { status: "searching" },
+        { 
+          status: "assigned",
+          assignedDriverId: driverId, // Make sure it's assigned to THIS driver
+          createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) } // Within last 5 minutes
+        }
+      ]
     })
-      .populate("passengerId", "name")
+      .populate("passengerId", "name phone")
       .lean();
 
     if (!activeRequest) {
-      return res.status(404).json({ message: "No active offer" });
+      console.log(`❌ No active offer found for driver ${driverId}`);
+      return res.status(404).json({ 
+        message: "No active offer",
+        debug: { driverId, timestamp: new Date().toISOString() }
+      });
     }
 
     const candidate = activeRequest.candidates.find(
@@ -498,22 +514,114 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
-      return res.status(404).json({ message: "No active offer" });
+      console.log(`❌ Driver ${driverId} not offered this trip`);
+      return res.status(404).json({ 
+        message: "No active offer",
+        debug: { 
+          driverId, 
+          availableStatuses: activeRequest.candidates.map(c => ({
+            driverId: c.driverId,
+            status: c.status
+          })),
+          tripStatus: activeRequest.status
+        }
+      });
     }
+
+    console.log(`✅ Found active offer for driver ${driverId}:`, {
+      requestId: activeRequest._id,
+      status: activeRequest.status,
+      offeredAt: candidate.offeredAt,
+      passengerName: activeRequest.passengerId?.name
+    });
 
     const response = {
       request: {
         requestId: activeRequest._id,
         passengerName: activeRequest.passengerId?.name || "Passenger",
+        passengerPhone: activeRequest.passengerId?.phone || "",
         rating: 4.8,
+        pickup: activeRequest.pickup,
         pickupAddress: "Pickup location near you",
-        fare: 2500,
+        fare: 2500, // This should be calculated
         serviceType: activeRequest.serviceType,
+        offeredAt: candidate.offeredAt,
+        expiresIn: 20, // 20 seconds timeout
+        // ✅ ADDED: Candidate info for debugging
+        candidateInfo: {
+          status: candidate.status,
+          offeredAt: candidate.offeredAt,
+          driverName: candidate.driverName
+        }
       },
     };
 
     res.json(response);
   } catch (err) {
+    console.error('❌ Error in /offered-request:', err);
+    next(err);
+  }
+});
+
+// ✅ NEW: Get driver's current trip status (if any)
+router.get("/current-trip", requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const user = await User.findById(driverId)
+      .select('driverProfile.currentTripId')
+      .lean();
+    
+    if (!user || !user.driverProfile?.currentTripId) {
+      return res.json({ hasCurrentTrip: false });
+    }
+    
+    // You might want to populate trip details here
+    res.json({
+      hasCurrentTrip: true,
+      tripId: user.driverProfile.currentTripId
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ✅ NEW: Endpoint for driver to check if they have any pending/offered trips
+router.get("/pending-offers", requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const offeredTrips = await TripRequest.find({
+      candidates: {
+        $elemMatch: {
+          driverId: driverId,
+          status: { $in: ['offered', 'pending'] }
+        }
+      },
+      status: { $in: ['searching', 'assigned'] },
+      createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) } // Last 10 minutes
+    })
+    .select('_id status serviceType pickup candidates')
+    .lean();
+    
+    const formatted = offeredTrips.map(trip => {
+      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
+      return {
+        requestId: trip._id,
+        status: trip.status,
+        candidateStatus: candidate?.status,
+        serviceType: trip.serviceType,
+        pickup: trip.pickup,
+        offeredAt: candidate?.offeredAt
+      };
+    });
+    
+    res.json({
+      count: formatted.length,
+      offers: formatted
+    });
+  } catch (err) {
+    console.error('Error in /pending-offers:', err);
     next(err);
   }
 });
@@ -579,6 +687,67 @@ router.get('/debug/online', async (req, res) => {
       error: 'Failed to fetch online drivers',
       message: err.message
     });
+  }
+});
+
+// ✅ NEW DEBUG: Check what trips a specific driver can see
+router.get('/debug/driver-offers/:driverId', async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    
+    console.log(`🔍 [DEBUG] Checking offers for driver: ${driverId}`);
+    
+    const driver = await User.findById(driverId)
+      .select('name driverProfile.isAvailable driverProfile.lastSeen')
+      .lean();
+    
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+    
+    // Check trip requests where driver is a candidate
+    const tripRequests = await TripRequest.find({
+      candidates: {
+        $elemMatch: { driverId: driverId }
+      },
+      createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) } // Last 30 minutes
+    })
+    .select('_id status serviceType candidates pickup createdAt')
+    .sort({ createdAt: -1 })
+    .lean();
+    
+    const driverCandidates = tripRequests.map(trip => {
+      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
+      return {
+        requestId: trip._id,
+        tripStatus: trip.status,
+        candidateStatus: candidate?.status,
+        serviceType: trip.serviceType,
+        offeredAt: candidate?.offeredAt,
+        createdAt: trip.createdAt,
+        pickup: trip.pickup,
+        allCandidates: trip.candidates.map(c => ({
+          driverId: c.driverId,
+          status: c.status,
+          offeredAt: c.offeredAt
+        }))
+      };
+    });
+    
+    res.json({
+      driver: {
+        id: driverId,
+        name: driver.name,
+        isAvailable: driver.driverProfile?.isAvailable,
+        lastSeen: driver.driverProfile?.lastSeen
+      },
+      tripCount: driverCandidates.length,
+      trips: driverCandidates,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Error in /debug/driver-offers:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
