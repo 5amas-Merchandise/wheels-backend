@@ -555,4 +555,67 @@ router.get('/location', requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+// DEBUG ONLY: Get all currently online drivers + their locations (NO AUTH)
+// URL: GET /drivers/debug/online
+// WARNING: Remove or protect this endpoint in production!
+router.get('/debug/online', async (req, res) => {
+  try {
+    console.log('📡 [DEBUG] Requested online drivers list');
+
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+    const onlineDrivers = await User.find({
+      'roles.isDriver': true,
+      'driverProfile.isAvailable': true,
+      'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
+    })
+      .select(
+        'name phone driverProfile.location driverProfile.heading driverProfile.lastSeen driverProfile.vehicleModel driverProfile.vehicleNumber'
+      )
+      .lean();
+
+    if (!onlineDrivers?.length) {
+      return res.json({
+        success: true,
+        message: 'No drivers are currently online',
+        count: 0,
+        drivers: [],
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    const formatted = onlineDrivers.map(driver => ({
+      driverId: driver._id.toString(),
+      name: driver.name || 'Unknown Driver',
+      phone: driver.phone || 'Not set',
+      vehicle: driver.driverProfile?.vehicleModel
+        ? `${driver.driverProfile.vehicleModel} (${driver.driverProfile.vehicleNumber || 'N/A'})`
+        : 'No vehicle info',
+      location: driver.driverProfile?.location?.coordinates
+        ? {
+            latitude: driver.driverProfile.location.coordinates[1],
+            longitude: driver.driverProfile.location.coordinates[0]
+          }
+        : null,
+      heading: driver.driverProfile?.heading || 0,
+      lastSeen: driver.driverProfile?.lastSeen?.toISOString() || null,
+      isOnline: true
+    }));
+
+    res.json({
+      success: true,
+      count: formatted.length,
+      drivers: formatted,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Error in /debug/online:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch online drivers',
+      message: err.message
+    });
+  }
+});
 module.exports = router;

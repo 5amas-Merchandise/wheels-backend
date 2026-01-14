@@ -26,7 +26,7 @@ app.get('/health', (req, res) => {
 // === Routes ===
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
-const driverRoutes = require('./routes/drivers');
+const driverRoutes = require('../src/routes/drivers');
 const matchingRoutes = require('./routes/matching');
 const paymentsRoutes = require('./routes/payments');
 const walletRoutes = require('./routes/wallet');
