@@ -1,4 +1,4 @@
-// server.js - Production-ready with Socket.IO - Complete Implementation
+// server.js - Production-ready with Socket.IO - Complete Implementation with Fixed Notifications
 const http = require('http');
 const socketIO = require('socket.io');
 const jwt = require('jsonwebtoken');
@@ -363,7 +363,7 @@ async function startServer() {
   });
 
   // ============================================
-  // Connect Event Emitter to Socket.IO
+  // Connect Event Emitter to Socket.IO (UPDATED)
   // ============================================
   const emitter = require('./src/utils/eventEmitter');
 
@@ -387,19 +387,33 @@ async function startServer() {
       timestamp: new Date()
     });
 
-    // NEW: Special handling for trip:new_request to drivers
+    // NEW: Proper handling for trip:new_request to drivers
     if (type === 'trip:new_request') {
       console.log(`🚗 Sending NEW trip request to driver ${userId}:`, metadata);
+      
+      // Send multiple events for compatibility
       io.to(`user:${userId}`).emit('trip:new_request', {
         tripId: metadata?.tripId,
         requestId: metadata?.requestId,
         passengerId: metadata?.passengerId,
         pickup: metadata?.pickup,
         serviceType: metadata?.serviceType,
+        candidateIndex: metadata?.candidateIndex,
         title,
         body,
         timestamp: new Date()
       });
+
+      // Also send trip:offered for backward compatibility
+      io.to(`user:${userId}`).emit('trip:offered', {
+        requestId: metadata?.requestId,
+        tripId: metadata?.tripId,
+        serviceType: metadata?.serviceType,
+        pickup: metadata?.pickup,
+        timestamp: new Date()
+      });
+
+      console.log(`✅ Trip request sent to driver ${userId}`);
     }
 
     // Special handling for trip offers to drivers
@@ -408,6 +422,8 @@ async function startServer() {
       io.to(`user:${userId}`).emit('trip:offered', {
         requestId: metadata?.requestId,
         serviceType: metadata?.serviceType,
+        immediateOffer: metadata?.immediateOffer,
+        candidateIndex: metadata?.candidateIndex,
         title,
         body,
         timestamp: new Date()

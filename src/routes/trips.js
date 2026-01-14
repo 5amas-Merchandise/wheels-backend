@@ -1,4 +1,4 @@
-// routes/trips.routes.js - Complete with Socket.IO integration
+// routes/trips.routes.js - Complete with Socket.IO integration and Fixed offerToNext
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -33,6 +33,11 @@ router.post('/request', requireAuth, async (req, res, next) => {
     const [lng, lat] = pickup.coordinates;
     const now = new Date();
 
+    // ============================================
+    // FIXED: Better driver query with proper debugging
+    // ============================================
+    console.log(`🔍 Searching drivers for pickup: [${lat}, ${lng}], service: ${serviceType}`);
+    
     const nearbyDrivers = await User.find({
       'roles.isDriver': true,
       'driverProfile.isAvailable': true,
@@ -40,24 +45,56 @@ router.post('/request', requireAuth, async (req, res, next) => {
       'driverProfile.verificationState': 'approved',
       'driverProfile.location': {
         $near: {
-          $geometry: { type: 'Point', coordinates: [lng, lat] },
-          $maxDistance: radiusMeters
+          $geometry: { 
+            type: 'Point', 
+            coordinates: [lng, lat] 
+          },
+          $maxDistance: radiusMeters || 5000
         }
-      }
-    }).limit(limit).lean();
+      },
+      'driverProfile.serviceCategories': serviceType // Make sure driver supports this service
+    })
+    .select('_id name driverProfile subscription')
+    .limit(limit || 10)
+    .lean();
+
+    console.log(`📊 Found ${nearbyDrivers.length} nearby drivers`);
+
+    // Debug: Log each driver found
+    nearbyDrivers.forEach(driver => {
+      console.log(`   • Driver ${driver._id}: ${driver.name}`);
+      console.log(`     Service Categories: ${driver.driverProfile?.serviceCategories?.join(', ') || 'none'}`);
+      console.log(`     Verified: ${driver.driverProfile?.verified}`);
+      console.log(`     Available: ${driver.driverProfile?.isAvailable}`);
+      console.log(`     Subscription valid: ${driver.subscription?.expiresAt && new Date(driver.subscription.expiresAt) > now}`);
+    });
 
     const candidates = [];
     for (const driver of nearbyDrivers) {
-      const supportsService = driver.driverProfile.serviceCategories?.includes(serviceType);
-      if (!supportsService && !isLuxury(serviceType)) continue;
-
-      if (!isLuxury(serviceType)) {
-        const sub = driver.subscription;
-        if (!sub?.expiresAt || new Date(sub.expiresAt) <= now) continue;
+      // Check if driver supports this service type
+      const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
+      if (!supportsService) {
+        console.log(`   ❌ Driver ${driver._id} doesn't support ${serviceType}`);
+        continue;
       }
 
-      candidates.push({ driverId: driver._id, status: 'pending' });
+      // Check subscription (except for luxury)
+      if (!isLuxury(serviceType)) {
+        const sub = driver.subscription;
+        if (!sub?.expiresAt || new Date(sub.expiresAt) <= now) {
+          console.log(`   ❌ Driver ${driver._id} has expired subscription`);
+          continue;
+        }
+      }
+
+      candidates.push({ 
+        driverId: driver._id, 
+        status: 'pending',
+        driverName: driver.name
+      });
     }
+
+    console.log(`✅ ${candidates.length} drivers qualified as candidates`);
 
     let tripRequest;
     if (candidates.length === 0) {
@@ -80,6 +117,7 @@ router.post('/request', requireAuth, async (req, res, next) => {
         data: { requestId: tripRequest._id }
       });
 
+      console.log(`❌ No qualified drivers found for ${serviceType} ride`);
       return res.json({ requestId: tripRequest._id, message: 'No drivers available' });
     }
 
@@ -93,12 +131,16 @@ router.post('/request', requireAuth, async (req, res, next) => {
       expiresAt: new Date(now.getTime() + 5 * 60 * 1000) // 5 minutes
     });
 
-    console.log(`✅ Trip request created: ${tripRequest._id} with ${candidates.length} candidates`);
+    console.log(`✅ Trip request ${tripRequest._id} created with ${candidates.length} candidates`);
 
-    // NEW: Notify all nearby drivers via Socket.IO
-    nearbyDrivers.forEach(driver => {
+    // ============================================
+    // FIXED: Send trip request to ALL qualified drivers via Socket.IO
+    // ============================================
+    candidates.forEach(candidate => {
+      console.log(`📤 Sending trip offer to driver ${candidate.driverId} (${candidate.driverName})`);
+      
       emitter.emit('notification', {
-        userId: driver._id.toString(),
+        userId: candidate.driverId.toString(),
         type: 'trip:new_request',
         title: 'New Trip Request',
         body: `New ${serviceType} ride nearby`,
@@ -107,6 +149,19 @@ router.post('/request', requireAuth, async (req, res, next) => {
           requestId: tripRequest._id,
           passengerId: passengerId,
           pickup: pickup,
+          serviceType: serviceType,
+          candidateIndex: candidates.findIndex(c => c.driverId.toString() === candidate.driverId.toString())
+        }
+      });
+
+      // ALSO send the trip_offered event for backward compatibility
+      emitter.emit('notification', {
+        userId: candidate.driverId.toString(),
+        type: 'trip_offered',
+        title: 'New Trip Request',
+        body: `New ${serviceType} ride nearby`,
+        data: {
+          requestId: tripRequest._id,
           serviceType: serviceType
         }
       });
@@ -117,8 +172,13 @@ router.post('/request', requireAuth, async (req, res, next) => {
       await offerToNext(tripRequest._id);
     }
 
-    res.json({ requestId: tripRequest._id, candidatesCount: candidates.length });
+    res.json({ 
+      requestId: tripRequest._id, 
+      candidatesCount: candidates.length,
+      message: `Searching ${candidates.length} drivers`
+    });
   } catch (err) {
+    console.error('❌ Trip request creation error:', err);
     next(err);
   }
 });
@@ -167,58 +227,87 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 });
 
 // ========================
-// INTERNAL: Offer to next pending driver + 20s timeout
+// INTERNAL: Offer to next pending driver + 20s timeout (FIXED)
 // ========================
 async function offerToNext(requestId) {
-  const tripRequest = await TripRequest.findById(requestId);
-  if (!tripRequest || tripRequest.status !== 'searching') return;
+  try {
+    const tripRequest = await TripRequest.findById(requestId);
+    if (!tripRequest || tripRequest.status !== 'searching') {
+      console.log(`⚠️ Trip request ${requestId} not in searching state`);
+      return;
+    }
 
-  const nextIdx = tripRequest.candidates.findIndex(c => c.status === 'pending');
-  if (nextIdx === -1) {
-    tripRequest.status = 'no_drivers';
+    // Find the first pending candidate
+    const nextCandidate = tripRequest.candidates.find(c => c.status === 'pending');
+    
+    if (!nextCandidate) {
+      console.log(`⚠️ No pending candidates for ${requestId}`);
+      
+      tripRequest.status = 'no_drivers';
+      await tripRequest.save();
+
+      emitter.emit('notification', {
+        userId: tripRequest.passengerId,
+        type: 'no_driver_found',
+        title: 'No drivers available',
+        body: 'Please try again later',
+        data: { requestId: tripRequest._id }
+      });
+
+      console.log(`❌ No more drivers for ${requestId}`);
+      return;
+    }
+
+    // Mark as offered
+    nextCandidate.status = 'offered';
+    nextCandidate.offeredAt = new Date();
     await tripRequest.save();
 
+    const driverId = nextCandidate.driverId;
+    console.log(`📤 Offering trip ${requestId} to driver ${driverId}`);
+
+    // Send immediate offer notification
     emitter.emit('notification', {
-      userId: tripRequest.passengerId,
-      type: 'no_driver_found',
-      title: 'No drivers available',
-      body: 'Please try again later',
-      data: { requestId: tripRequest._id }
+      userId: driverId.toString(),
+      type: 'trip_offered',
+      title: 'Trip Offer Available',
+      body: `New ${tripRequest.serviceType} ride - Accept within 20 seconds`,
+      data: {
+        requestId: tripRequest._id,
+        serviceType: tripRequest.serviceType,
+        immediateOffer: true,
+        candidateIndex: tripRequest.candidates.findIndex(c => c.driverId.toString() === driverId.toString())
+      }
     });
-    return;
+
+    // Timeout: 20 seconds → auto-reject and try next
+    setTimeout(async () => {
+      try {
+        const fresh = await TripRequest.findById(requestId);
+        if (!fresh || fresh.status !== 'searching') {
+          console.log(`⏱️ Trip ${requestId} no longer searching, skipping timeout`);
+          return;
+        }
+
+        const cand = fresh.candidates.find(c => c.driverId.toString() === driverId.toString());
+        if (cand && cand.status === 'offered') {
+          cand.status = 'rejected';
+          cand.rejectedAt = new Date();
+          cand.rejectionReason = 'timeout';
+          await fresh.save();
+          
+          console.log(`⏱️ Driver ${driverId} timeout, moving to next candidate`);
+          
+          // Try next driver
+          await offerToNext(requestId);
+        }
+      } catch (timeoutErr) {
+        console.error('❌ Error in timeout handler:', timeoutErr);
+      }
+    }, 20000);
+  } catch (err) {
+    console.error('❌ Error in offerToNext:', err);
   }
-
-  tripRequest.candidates[nextIdx].status = 'offered';
-  tripRequest.candidates[nextIdx].offeredAt = new Date();
-  await tripRequest.save();
-
-  const driverId = tripRequest.candidates[nextIdx].driverId;
-  console.log(`📤 Offering trip ${requestId} to driver ${driverId}`);
-
-  emitter.emit('notification', {
-    userId: driverId,
-    type: 'trip_offered',
-    title: 'New Trip Request',
-    body: `New ${tripRequest.serviceType} ride nearby`,
-    data: {
-      requestId: tripRequest._id,
-      serviceType: tripRequest.serviceType
-    }
-  });
-
-  // Timeout: 20 seconds → auto-reject and try next
-  setTimeout(async () => {
-    const fresh = await TripRequest.findById(requestId);
-    if (!fresh || fresh.status !== 'searching') return;
-
-    const cand = fresh.candidates.find(c => c.driverId.toString() === driverId.toString());
-    if (cand && cand.status === 'offered') {
-      cand.status = 'rejected';
-      await fresh.save();
-      console.log(`⏱️ Driver ${driverId} timeout, moving to next candidate`);
-      await offerToNext(requestId); // recursive next
-    }
-  }, 20000);
 }
 
 // ========================
@@ -283,7 +372,7 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     // NEW: Emit trip_accepted event to PASSENGER via Socket.IO
     emitter.emit('notification', {
-      userId: tripRequest.passengerId,
+      userId: tripRequest.passengerId.toString(),
       type: 'trip_accepted',
       title: 'Driver Accepted!',
       body: 'Your driver is on the way',
@@ -339,6 +428,8 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     }
 
     candidate.status = 'rejected';
+    candidate.rejectedAt = new Date();
+    candidate.rejectionReason = 'manual_rejection';
     await tripRequest.save();
 
     console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
@@ -374,7 +465,7 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
     console.log(`🚗 Trip ${trip._id} started by driver ${driverId}`);
 
     emitter.emit('notification', {
-      userId: trip.passengerId,
+      userId: trip.passengerId.toString(),
       type: 'trip_started',
       title: 'Trip Started',
       body: 'Your driver has started the trip',
@@ -472,7 +563,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
       });
 
       emitter.emit('notification', {
-        userId: trip.passengerId,
+        userId: trip.passengerId.toString(),
         type: 'trip_completed',
         title: 'Trip completed (cash)',
         body: `Pay driver ₦${Math.floor(trip.finalFare / 100)}`,
@@ -530,7 +621,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
     console.log(`✅ Trip ${trip._id} completed`);
 
     emitter.emit('notification', {
-      userId: trip.passengerId,
+      userId: trip.passengerId.toString(),
       type: 'trip_completed',
       title: 'Trip completed',
       body: `Charged ₦${Math.floor(trip.finalFare / 100)}`,
@@ -586,7 +677,7 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
     console.log(`❌ Trip ${trip._id} cancelled by ${role}`);
 
     emitter.emit('notification', {
-      userId: otherId,
+      userId: otherId?.toString(),
       type: 'trip_cancelled',
       title: 'Trip Cancelled',
       body: `Cancelled by ${role}. Reason: ${trip.cancellationReason}`,
