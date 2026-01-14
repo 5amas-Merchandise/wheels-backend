@@ -1,4 +1,4 @@
-// routes/trips.js - COMPLETE INTEGRATED VERSION
+// routes/trips.js - COMPLETE INTEGRATED VERSION (FIXED)
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -14,7 +14,7 @@ const { isLuxury } = require('../constants/serviceTypes');
 const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 
-// POST /trips/request - Improved driver search with better logging
+// POST /trips/request - Improved driver search with immediate offering
 router.post('/request', requireAuth, async (req, res, next) => {
   try {
     const passengerId = req.user.sub;
@@ -163,8 +163,9 @@ router.post('/request', requireAuth, async (req, res, next) => {
 
       candidates.push({ 
         driverId: driver._id, 
-        status: 'pending',
-        driverName: driver.name
+        status: 'pending',  // Will be updated to 'offered' for first driver before saving
+        driverName: driver.name,
+        offeredAt: null  // ✅ FIX 1: Add offeredAt field
       });
     }
 
@@ -205,6 +206,13 @@ router.post('/request', requireAuth, async (req, res, next) => {
       });
     }
 
+    // ✅ FIX 2: Immediately promote first candidate BEFORE saving
+    if (candidates.length > 0) {
+      candidates[0].status = 'offered';
+      candidates[0].offeredAt = new Date();
+      console.log(`✅ Immediately offered trip to first driver: ${candidates[0].driverId} (${candidates[0].driverName})`);
+    }
+
     tripRequest = await TripRequest.create({
       passengerId,
       pickup,
@@ -216,10 +224,11 @@ router.post('/request', requireAuth, async (req, res, next) => {
     });
 
     console.log(`✅ Trip request ${tripRequest._id} created with ${candidates.length} candidates`);
+    console.log(`   First driver ${candidates[0]?.driverId} already has status: ${candidates[0]?.status}`);
 
     // Send trip request to ALL qualified drivers
     candidates.forEach(candidate => {
-      console.log(`📤 Sending trip offer to driver ${candidate.driverId} (${candidate.driverName})`);
+      console.log(`📤 Sending trip offer to driver ${candidate.driverId} (${candidate.driverName}) - Status: ${candidate.status}`);
       
       emitter.emit('notification', {
         userId: candidate.driverId.toString(),
@@ -236,27 +245,55 @@ router.post('/request', requireAuth, async (req, res, next) => {
         }
       });
 
-      emitter.emit('notification', {
-        userId: candidate.driverId.toString(),
-        type: 'trip_offered',
-        title: 'New Trip Request',
-        body: `New ${serviceType} ride nearby`,
-        data: {
-          requestId: tripRequest._id,
-          serviceType: serviceType
-        }
-      });
+      // Only send immediate offer notification to the first driver
+      if (candidate.status === 'offered') {
+        emitter.emit('notification', {
+          userId: candidate.driverId.toString(),
+          type: 'trip_offered',
+          title: 'New Trip Request',
+          body: `New ${serviceType} ride nearby - Accept within 20 seconds`,
+          data: {
+            requestId: tripRequest._id,
+            serviceType: serviceType,
+            immediateOffer: true
+          }
+        });
+      }
     });
 
-    // Start sequential offering
-    if (candidates.length > 0) {
-      await offerToNext(tripRequest._id);
+    // ✅ FIX 3: DO NOT call offerToNext() immediately - First driver is already offered
+    // Only schedule the timeout for the first driver
+    if (candidates.length > 0 && candidates[0].status === 'offered') {
+      const firstDriverId = candidates[0].driverId;
+      setTimeout(async () => {
+        try {
+          const fresh = await TripRequest.findById(tripRequest._id);
+          if (!fresh || fresh.status !== 'searching') {
+            console.log(`⏱️ Trip ${tripRequest._id} no longer searching, skipping timeout`);
+            return;
+          }
+
+          const cand = fresh.candidates.find(c => c.driverId.toString() === firstDriverId.toString());
+          if (cand && cand.status === 'offered') {
+            cand.status = 'rejected';
+            cand.rejectedAt = new Date();
+            cand.rejectionReason = 'timeout';
+            await fresh.save();
+            
+            console.log(`⏱️ First driver ${firstDriverId} timeout, moving to next candidate`);
+            await offerToNext(tripRequest._id); // Now we call offerToNext for next driver
+          }
+        } catch (timeoutErr) {
+          console.error('❌ Error in timeout handler:', timeoutErr);
+        }
+      }, 20000);
     }
 
     res.json({ 
       requestId: tripRequest._id, 
       candidatesCount: candidates.length,
-      message: `Searching ${candidates.length} drivers`
+      message: `Searching ${candidates.length} drivers`,
+      immediateOffer: candidates.length > 0
     });
   } catch (err) {
     console.error('❌ Trip request creation error:', err);
@@ -323,7 +360,7 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
   }
 });
 
-// Offer to next pending driver
+// Offer to next pending driver (used after rejection/timeout)
 async function offerToNext(requestId) {
   try {
     const tripRequest = await TripRequest.findById(requestId);
@@ -516,7 +553,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     await tripRequest.save();
 
     console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
-    await offerToNext(requestId);
+    await offerToNext(requestId); // Now offer to next driver
 
     res.json({ success: true });
   } catch (err) {
