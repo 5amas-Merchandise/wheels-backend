@@ -1,4 +1,4 @@
-// routes/trips.js - COMPLETE INTEGRATED VERSION (FIXED)
+// routes/trips.js - COMPLETE INTEGRATED VERSION (FIXED with DIAGNOSTICS)
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -132,33 +132,57 @@ router.post('/request', requireAuth, async (req, res, next) => {
 
     console.log(`📊 Found ${nearbyDrivers?.length || 0} nearby drivers`);
 
-    // Debug: Log each driver found
+    // ✅ EMERGENCY DIAGNOSTICS: Log ALL driver details
+    console.log("=== DEBUG DRIVER QUALIFICATION ===");
     if (nearbyDrivers) {
       nearbyDrivers.forEach((driver, index) => {
-        console.log(`   ${index + 1}. Driver ${driver._id}: ${driver.name}`);
-        console.log(`      Service Categories: ${driver.driverProfile?.serviceCategories?.join(', ') || 'none'}`);
-        console.log(`      Location: ${driver.driverProfile?.location?.coordinates}`);
-        console.log(`      Last Seen: ${driver.driverProfile?.lastSeen}`);
+        console.log(`Driver ${index + 1}:`, {
+          driverId: driver._id,
+          name: driver.name,
+          categories: driver.driverProfile?.serviceCategories || "NOT SET",
+          subscriptionExpires: driver.subscription?.expiresAt || "NO_SUBSCRIPTION",
+          isLuxuryRide: isLuxury(serviceType),
+          isAvailable: driver.driverProfile?.isAvailable,
+          lastSeen: driver.driverProfile?.lastSeen,
+          location: driver.driverProfile?.location?.coordinates
+        });
       });
+    } else {
+      console.log("No nearby drivers found at all!");
     }
 
-    // Filter by service type and subscription
+    // Filter by service type and subscription - TEMPORARILY DISABLED FOR DIAGNOSTICS
     const candidates = [];
     for (const driver of (nearbyDrivers || [])) {
-      // Check if driver supports this service type
+      // ✅ TEMPORARILY DISABLED: Check if driver supports this service type
       const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
       if (!supportsService) {
         console.log(`   ❌ Driver ${driver._id} doesn't support ${serviceType}`);
-        continue;
+        console.log(`   ❌ Driver categories: ${driver.driverProfile?.serviceCategories?.join(', ') || 'none'}`);
+        console.log(`   ❌ Requested service: ${serviceType}`);
+        
+        // ⚠️ TEMPORARY: Comment out this continue to include ALL drivers for testing
+        // continue;
+        console.log(`   ⚠️ INCLUDING ANYWAY FOR DIAGNOSTICS`);
       }
 
-      // Check subscription (except for luxury)
+      // ✅ TEMPORARILY DISABLED: Check subscription (except for luxury)
       if (!isLuxury(serviceType)) {
         const sub = driver.subscription;
         if (!sub?.expiresAt || new Date(sub.expiresAt) <= now) {
           console.log(`   ❌ Driver ${driver._id} has expired subscription`);
-          continue;
+          console.log(`   ❌ Subscription: ${JSON.stringify(sub)}`);
+          console.log(`   ❌ Current time: ${now}`);
+          console.log(`   ❌ Expires at: ${sub?.expiresAt}`);
+          
+          // ⚠️ TEMPORARY: Comment out this continue to include ALL drivers for testing
+          // continue;
+          console.log(`   ⚠️ INCLUDING ANYWAY FOR DIAGNOSTICS`);
+        } else {
+          console.log(`   ✅ Driver ${driver._id} has valid subscription until ${sub.expiresAt}`);
         }
+      } else {
+        console.log(`   ✅ Luxury ride, skipping subscription check for driver ${driver._id}`);
       }
 
       candidates.push({ 
@@ -167,9 +191,19 @@ router.post('/request', requireAuth, async (req, res, next) => {
         driverName: driver.name,
         offeredAt: null  // ✅ FIX 1: Add offeredAt field
       });
+      console.log(`   ✅ Added driver ${driver._id} to candidates`);
     }
 
     console.log(`✅ ${candidates.length} drivers qualified as candidates`);
+
+    // ✅ DIAGNOSTIC: If no candidates but we found nearby drivers, something is wrong
+    if (candidates.length === 0 && nearbyDrivers && nearbyDrivers.length > 0) {
+      console.log(`❌ CRITICAL: Found ${nearbyDrivers.length} nearby drivers but 0 candidates!`);
+      console.log(`❌ Possible issues:`);
+      console.log(`   - Service type mismatch? Requested: ${serviceType}`);
+      console.log(`   - Subscription issues?`);
+      console.log(`   - Filtering too strict?`);
+    }
 
     let tripRequest;
     if (candidates.length === 0) {
@@ -201,7 +235,9 @@ router.post('/request', requireAuth, async (req, res, next) => {
           availableDrivers,
           recentDrivers,
           nearbyFound: nearbyDrivers?.length || 0,
-          qualifiedCandidates: 0
+          qualifiedCandidates: 0,
+          timestamp: now.toISOString(),
+          serviceType: serviceType
         }
       });
     }
@@ -258,6 +294,7 @@ router.post('/request', requireAuth, async (req, res, next) => {
             immediateOffer: true
           }
         });
+        console.log(`   📨 Sent immediate offer notification to driver ${candidate.driverId}`);
       }
     });
 
@@ -265,6 +302,8 @@ router.post('/request', requireAuth, async (req, res, next) => {
     // Only schedule the timeout for the first driver
     if (candidates.length > 0 && candidates[0].status === 'offered') {
       const firstDriverId = candidates[0].driverId;
+      console.log(`⏱️ Scheduling 20-second timeout for driver ${firstDriverId}`);
+      
       setTimeout(async () => {
         try {
           const fresh = await TripRequest.findById(tripRequest._id);
@@ -293,7 +332,16 @@ router.post('/request', requireAuth, async (req, res, next) => {
       requestId: tripRequest._id, 
       candidatesCount: candidates.length,
       message: `Searching ${candidates.length} drivers`,
-      immediateOffer: candidates.length > 0
+      immediateOffer: candidates.length > 0,
+      debug: {
+        nearbyDriversCount: nearbyDrivers?.length || 0,
+        candidates: candidates.map(c => ({
+          driverId: c.driverId,
+          status: c.status,
+          driverName: c.driverName
+        })),
+        firstDriverOffered: candidates.length > 0 ? candidates[0].driverId : null
+      }
     });
   } catch (err) {
     console.error('❌ Trip request creation error:', err);
@@ -327,16 +375,20 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
     const userId = req.user.sub;
     const { requestId } = req.params;
 
+    console.log(`🔍 Polling trip request ${requestId} for user ${userId}`);
+
     const tripRequest = await TripRequest.findById(requestId)
       .populate('passengerId', 'name phone')
       .populate('assignedDriverId', 'name phone driverProfile')
       .lean();
 
     if (!tripRequest) {
+      console.log(`❌ Trip request ${requestId} not found`);
       return res.status(404).json({ error: { message: 'Trip request not found' } });
     }
 
     if (tripRequest.passengerId._id.toString() !== userId) {
+      console.log(`❌ Unauthorized access to trip request ${requestId}`);
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
 
@@ -347,6 +399,8 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
       }).lean();
     }
 
+    console.log(`✅ Trip request ${requestId} status: ${tripRequest.status}`);
+
     res.json({
       trip: {
         ...tripRequest,
@@ -356,6 +410,7 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
       }
     });
   } catch (err) {
+    console.error('❌ Error fetching trip request:', err);
     next(err);
   }
 });
@@ -363,6 +418,8 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 // Offer to next pending driver (used after rejection/timeout)
 async function offerToNext(requestId) {
   try {
+    console.log(`🔄 offerToNext called for request ${requestId}`);
+    
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
       console.log(`⚠️ Trip request ${requestId} not in searching state`);
@@ -442,8 +499,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     const driverId = req.user.sub;
     const { requestId } = req.body;
 
+    console.log(`🤝 Driver ${driverId} attempting to accept trip ${requestId}`);
+
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
+      console.log(`❌ Trip ${requestId} no longer available or not in searching state`);
       return res.status(400).json({ error: { message: 'Trip no longer available' } });
     }
 
@@ -452,6 +512,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
+      console.log(`❌ Driver ${driverId} was not offered trip ${requestId}`);
+      console.log(`   Available candidates:`, tripRequest.candidates.map(c => ({
+        driverId: c.driverId,
+        status: c.status
+      })));
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
@@ -524,6 +589,7 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       requestId: tripRequest._id
     });
   } catch (err) {
+    console.error('❌ Error accepting trip:', err);
     next(err);
   }
 });
@@ -534,8 +600,11 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     const driverId = req.user.sub;
     const { requestId } = req.body;
 
+    console.log(`🚫 Driver ${driverId} attempting to reject trip ${requestId}`);
+
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
+      console.log(`❌ Trip ${requestId} no longer searching`);
       return res.status(400).json({ error: { message: 'Trip no longer searching' } });
     }
 
@@ -544,6 +613,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
+      console.log(`❌ Driver ${driverId} was not offered trip ${requestId}`);
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
@@ -557,6 +627,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
 
     res.json({ success: true });
   } catch (err) {
+    console.error('❌ Error rejecting trip:', err);
     next(err);
   }
 });
