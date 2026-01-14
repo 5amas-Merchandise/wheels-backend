@@ -1,13 +1,16 @@
-// routes/drivers.routes.js
+// routes/drivers.js - FIXED VERSION with proper location updates
 const express = require("express");
 const router = express.Router();
 const User = require("../models/user.model");
+const TripRequest = require("../models/tripRequest.model");
 const { requireAuth } = require("../middleware/auth");
+
 const DURATION_DAYS = {
   daily: 1,
   weekly: 7,
   monthly: 30,
 };
+
 // Subscribe or renew subscription (driver action)
 router.post("/subscribe", requireAuth, async (req, res, next) => {
   try {
@@ -26,7 +29,6 @@ router.post("/subscribe", requireAuth, async (req, res, next) => {
     const days = DURATION_DAYS[type];
     const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
     user.subscription = { type, startedAt: now, expiresAt };
-    // mark as driver if not already
     user.roles = user.roles || {};
     user.roles.isDriver = true;
     await user.save();
@@ -35,6 +37,7 @@ router.post("/subscribe", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
 // Get subscription status
 router.get("/subscription", requireAuth, async (req, res, next) => {
   try {
@@ -49,7 +52,7 @@ router.get("/subscription", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
-// --- Driver profile management ---
+
 // Get driver profile
 router.get("/me", requireAuth, async (req, res, next) => {
   try {
@@ -64,13 +67,14 @@ router.get("/me", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
-// Update basic driver profile (vehicle info, name)
+
+// Update basic driver profile
 router.post("/profile", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user && req.user.sub;
     if (!userId)
       return res.status(401).json({ error: { message: "Unauthorized" } });
-    // Onboarding fields
+
     const {
       vehicleMake,
       vehicleModel,
@@ -83,6 +87,7 @@ router.post("/profile", requireAuth, async (req, res, next) => {
       licenseNumber,
       licenseImageUrl,
     } = req.body;
+
     const update = {};
     if (vehicleMake !== undefined)
       update["driverProfile.vehicleMake"] = vehicleMake;
@@ -101,6 +106,7 @@ router.post("/profile", requireAuth, async (req, res, next) => {
       update["driverProfile.licenseNumber"] = licenseNumber;
     if (licenseImageUrl !== undefined)
       update["driverProfile.licenseImageUrl"] = licenseImageUrl;
+
     const user = await User.findByIdAndUpdate(
       userId,
       { $set: update },
@@ -111,6 +117,7 @@ router.post("/profile", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
 // Add or remove service categories
 router.post("/service-categories", requireAuth, async (req, res, next) => {
   try {
@@ -118,7 +125,6 @@ router.post("/service-categories", requireAuth, async (req, res, next) => {
     if (!userId)
       return res.status(401).json({ error: { message: "Unauthorized" } });
     const { add = [], remove = [] } = req.body;
-    // ensure arrays
     if (!Array.isArray(add) || !Array.isArray(remove))
       return res
         .status(400)
@@ -128,12 +134,10 @@ router.post("/service-categories", requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: { message: "User not found" } });
     user.driverProfile.serviceCategories =
       user.driverProfile.serviceCategories || [];
-    // add unique
     for (const s of add) {
       if (!user.driverProfile.serviceCategories.includes(s))
         user.driverProfile.serviceCategories.push(s);
     }
-    // remove
     user.driverProfile.serviceCategories =
       user.driverProfile.serviceCategories.filter((s) => !remove.includes(s));
     await user.save();
@@ -142,61 +146,204 @@ router.post("/service-categories", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
-// Update availability and location
+
+// ⚠️ CRITICAL FIX: Update availability and location
 router.post("/availability", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user && req.user.sub;
     if (!userId)
       return res.status(401).json({ error: { message: "Unauthorized" } });
+
     const { isAvailable, location } = req.body;
+
+    console.log('📍 Availability update received:', {
+      userId,
+      isAvailable,
+      location,
+      timestamp: new Date().toISOString()
+    });
+
     const update = { "driverProfile.lastSeen": new Date() };
-    if (typeof isAvailable === "boolean")
+
+    if (typeof isAvailable === "boolean") {
       update["driverProfile.isAvailable"] = isAvailable;
-    if (
-      location &&
-      Array.isArray(location.coordinates) &&
-      location.coordinates.length === 2
-    ) {
-      update["driverProfile.location"] = {
-        type: "Point",
-        coordinates: location.coordinates,
-      };
+      console.log(`🔄 Setting driver ${userId} availability to: ${isAvailable}`);
     }
+
+    // ⚠️ FIX: Accept BOTH formats (coordinates array OR location object)
+    if (location) {
+      let coords = null;
+      
+      // Format 1: { type: 'Point', coordinates: [lng, lat] }
+      if (location.type === 'Point' && Array.isArray(location.coordinates)) {
+        coords = location.coordinates;
+      }
+      // Format 2: Direct coordinates array [lng, lat]
+      else if (Array.isArray(location.coordinates) && location.coordinates.length === 2) {
+        coords = location.coordinates;
+      }
+      // Format 3: Just coordinates array [lng, lat]
+      else if (Array.isArray(location) && location.length === 2) {
+        coords = location;
+      }
+
+      if (coords && coords.length === 2) {
+        const [lng, lat] = coords;
+        
+        // Validate coordinate ranges
+        if (lng >= -180 && lng <= 180 && lat >= -90 && lat <= 90) {
+          update["driverProfile.location"] = {
+            type: "Point",
+            coordinates: [lng, lat],
+          };
+          console.log(`📍 Updated driver ${userId} location to: [${lat}, ${lng}]`);
+        } else {
+          console.error(`❌ Invalid coordinates: [${lat}, ${lng}]`);
+          return res.status(400).json({
+            error: { message: 'Invalid coordinate values' }
+          });
+        }
+      }
+    }
+
     const user = await User.findByIdAndUpdate(
       userId,
       { $set: update },
       { new: true }
     ).lean();
-    res.json({ driverProfile: user.driverProfile });
+
+    if (!user) {
+      return res.status(404).json({ error: { message: 'User not found' } });
+    }
+
+    console.log('✅ Driver availability updated successfully:', {
+      userId,
+      isAvailable: user.driverProfile?.isAvailable,
+      hasLocation: !!user.driverProfile?.location,
+      coordinates: user.driverProfile?.location?.coordinates
+    });
+
+    res.json({ 
+      success: true,
+      driverProfile: user.driverProfile 
+    });
+  } catch (err) {
+    console.error('❌ Availability update error:', err);
+    next(err);
+  }
+});
+
+// ⚠️ CRITICAL FIX: Driver location update endpoint (for REST fallback)
+router.post('/location', requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    const { latitude, longitude, heading } = req.body;
+
+    console.log('📍 Location update received:', {
+      driverId,
+      latitude,
+      longitude,
+      heading,
+      timestamp: new Date().toISOString()
+    });
+
+    if (!latitude || !longitude) {
+      return res.status(400).json({ 
+        error: { message: 'Latitude and longitude are required' } 
+      });
+    }
+
+    // Validate ranges
+    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+      return res.status(400).json({ 
+        error: { message: 'Invalid latitude or longitude values' } 
+      });
+    }
+
+    // Update driver location in database
+    const updated = await User.findByIdAndUpdate(
+      driverId,
+      {
+        $set: {
+          'driverProfile.location': {
+            type: 'Point',
+            coordinates: [longitude, latitude] // GeoJSON: [lng, lat]
+          },
+          'driverProfile.heading': heading || 0,
+          'driverProfile.lastSeen': new Date()
+        }
+      },
+      { new: true }
+    ).select('driverProfile.location driverProfile.isAvailable');
+
+    if (!updated) {
+      return res.status(404).json({ error: { message: 'Driver not found' } });
+    }
+
+    console.log(`✅ Driver ${driverId} location updated via REST:`, {
+      coordinates: [latitude, longitude],
+      isAvailable: updated.driverProfile?.isAvailable
+    });
+
+    res.json({ 
+      success: true,
+      location: {
+        latitude,
+        longitude,
+        heading: heading || 0
+      }
+    });
+  } catch (err) {
+    console.error('❌ Location update error:', err);
+    next(err);
+  }
+});
+
+// Get driver location
+router.get('/location', requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const driver = await User.findById(driverId)
+      .select('driverProfile.location driverProfile.heading driverProfile.lastSeen driverProfile.isAvailable')
+      .lean();
+
+    if (!driver || !driver.driverProfile?.location) {
+      return res.json({ location: null });
+    }
+
+    res.json({
+      location: {
+        latitude: driver.driverProfile.location.coordinates[1],
+        longitude: driver.driverProfile.location.coordinates[0],
+        heading: driver.driverProfile.heading || 0,
+        lastSeen: driver.driverProfile.lastSeen,
+        isAvailable: driver.driverProfile.isAvailable
+      }
+    });
   } catch (err) {
     next(err);
   }
 });
-// Driver requests verification (moves state to pending)
+
+// Driver requests verification
 router.put("/request-verification", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user?.sub;
     console.log("🚀 === VERIFICATION REQUEST START ===");
     console.log("User ID:", userId);
-    console.log("Request Body:", JSON.stringify(req.body, null, 2));
+
     if (!userId) {
       console.log("❌ No user ID found in token");
       return res.status(401).json({ error: { message: "Unauthorized" } });
     }
-    // First, check if user exists
+
     const existingUser = await User.findById(userId);
     if (!existingUser) {
       console.log("❌ User not found");
       return res.status(404).json({ error: { message: "User not found" } });
     }
-    console.log("\n📊 === EXISTING USER ===");
-    console.log("Name:", existingUser.name);
-    console.log("Roles:", existingUser.roles);
-    console.log("Has driverProfile?:", !!existingUser.driverProfile);
-    console.log(
-      "Driver Profile:",
-      JSON.stringify(existingUser.driverProfile, null, 2)
-    );
+
     const {
       name,
       vehicleMake,
@@ -211,6 +358,7 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
       licenseImageUrl,
       vehicleRegistrationUrl,
     } = req.body;
+
     // Validate required fields
     if (
       !name ||
@@ -224,6 +372,7 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         error: { message: "Missing required fields" },
       });
     }
+
     if (
       !serviceCategories ||
       !Array.isArray(serviceCategories) ||
@@ -233,11 +382,13 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         error: { message: "Service category is required" },
       });
     }
+
     if (nin.length !== 11) {
       return res.status(400).json({
         error: { message: "NIN must be exactly 11 digits" },
       });
     }
+
     if (
       !profilePicUrl ||
       !carPicUrl ||
@@ -249,17 +400,13 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         error: { message: "All document images are required" },
       });
     }
-    console.log("\n✅ === VALIDATION PASSED ===");
-    // Use findOneAndUpdate with dot notation to ensure nested update
+
     const updateData = {
       $set: {
-        // Update user name
         name: name.trim(),
-        // Ensure driver role is set
         "roles.isDriver": true,
         "roles.isUser": true,
         "roles.isAdmin": existingUser.roles?.isAdmin || false,
-        // Update ALL driverProfile fields with dot notation
         "driverProfile.vehicleMake": vehicleMake.trim(),
         "driverProfile.vehicleModel": vehicleModel.trim(),
         "driverProfile.vehicleNumber": vehicleNumber.trim().toUpperCase(),
@@ -276,7 +423,6 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         "driverProfile.verified": false,
         "driverProfile.verificationState": "pending",
         "driverProfile.submittedAt": new Date(),
-        // Set default values if not present
         "driverProfile.isAvailable":
           existingUser.driverProfile?.isAvailable !== undefined
             ? existingUser.driverProfile.isAvailable
@@ -289,58 +435,27 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
           : new Date(),
       },
     };
-    console.log("\n🔄 === UPDATE DATA ===");
-    console.log(JSON.stringify(updateData, null, 2));
-    // Perform the update
+
     const updatedUser = await User.findOneAndUpdate(
       { _id: userId },
       updateData,
       {
-        new: true, // Return the updated document
-        runValidators: true, // Run schema validators
-        upsert: false, // Don't create if doesn't exist
-        setDefaultsOnInsert: true, // Set default values
+        new: true,
+        runValidators: true,
+        upsert: false,
+        setDefaultsOnInsert: true,
       }
     ).select("name phone roles driverProfile");
+
     if (!updatedUser) {
       console.log("❌ Failed to update user");
       return res.status(500).json({
         error: { message: "Failed to update user profile" },
       });
     }
-    console.log("\n✅ === USER UPDATED SUCCESSFULLY ===");
-    console.log("Updated User ID:", updatedUser._id);
-    console.log("Name:", updatedUser.name);
-    console.log("Roles:", updatedUser.roles);
-    console.log("Has driverProfile?:", !!updatedUser.driverProfile);
-    console.log(
-      "Driver Profile verificationState:",
-      updatedUser.driverProfile?.verificationState
-    );
-    console.log(
-      "Driver Profile vehicleMake:",
-      updatedUser.driverProfile?.vehicleMake
-    );
-    console.log(
-      "Driver Profile serviceCategories:",
-      updatedUser.driverProfile?.serviceCategories
-    );
-    console.log(
-      "Driver Profile submittedAt:",
-      updatedUser.driverProfile?.submittedAt
-    );
-    console.log(
-      "Full driverProfile:",
-      JSON.stringify(updatedUser.driverProfile, null, 2)
-    );
-    // Verify the update by fetching fresh from DB
-    const verifiedUser = await User.findById(updatedUser._id);
-    console.log("\n🔍 === DATABASE VERIFICATION ===");
-    console.log("Verified - Has driverProfile?:", !!verifiedUser.driverProfile);
-    console.log(
-      "Verified - Driver Profile keys:",
-      verifiedUser.driverProfile ? Object.keys(verifiedUser.driverProfile) : []
-    );
+
+    console.log("✅ Driver verification request submitted successfully");
+
     res.json({
       success: true,
       message: "Driver verification request submitted successfully",
@@ -350,107 +465,14 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         verificationState:
           updatedUser.driverProfile?.verificationState || "pending",
         submittedAt: updatedUser.driverProfile?.submittedAt || new Date(),
-      },
-      debug: {
-        hasDriverProfile: !!updatedUser.driverProfile,
-        profileKeys: updatedUser.driverProfile
-          ? Object.keys(updatedUser.driverProfile)
-          : [],
-        vehicleMake: updatedUser.driverProfile?.vehicleMake,
-        serviceCategories: updatedUser.driverProfile?.serviceCategories,
-      },
+      }
     });
   } catch (err) {
-    console.error("\n❌ === ERROR IN VERIFICATION REQUEST ===");
-    console.error("Error:", err.message);
-    console.error("Error stack:", err.stack);
-    // Handle validation errors
-    if (err.name === "ValidationError") {
-      return res.status(400).json({
-        error: {
-          message: "Validation failed",
-          details: Object.values(err.errors).map((e) => e.message),
-        },
-      });
-    }
-    // Handle duplicate key errors
-    if (err.code === 11000) {
-      return res.status(400).json({
-        error: {
-          message: "Duplicate field value entered",
-          field: Object.keys(err.keyPattern)[0],
-        },
-      });
-    }
-    res.status(500).json({
-      error: {
-        message: "Failed to submit verification request",
-        details: err.message,
-      },
-    });
+    console.error("❌ Verification request error:", err);
+    next(err);
   }
 });
-// Add this route for debugging
-// GET /drivers/check-user/:userId
-router.get("/check-user/:userId", async (req, res, next) => {
-  try {
-    const { userId } = req.params;
-    console.log(`\n=== CHECKING USER ${userId} ===`);
-    const user = await User.findById(userId);
-    if (!user) {
-      console.log("User not found");
-      return res.status(404).json({
-        error: { message: "User not found" },
-      });
-    }
-    console.log("User found:");
-    console.log("Name:", user.name);
-    console.log("Phone:", user.phone);
-    console.log("Roles:", user.roles);
-    console.log("Has driverProfile?:", !!user.driverProfile);
-    console.log(
-      "Driver Profile keys:",
-      user.driverProfile ? Object.keys(user.driverProfile) : []
-    );
-    console.log(
-      "Driver Profile verificationState:",
-      user.driverProfile?.verificationState
-    );
-    console.log("Driver Profile vehicleMake:", user.driverProfile?.vehicleMake);
-    console.log(
-      "Driver Profile serviceCategories:",
-      user.driverProfile?.serviceCategories
-    );
-    console.log(
-      "Full driverProfile:",
-      JSON.stringify(user.driverProfile, null, 2)
-    );
-    res.json({
-      success: true,
-      user: {
-        _id: user._id,
-        name: user.name,
-        phone: user.phone,
-        roles: user.roles,
-        hasDriverProfile: !!user.driverProfile,
-        driverProfile: user.driverProfile || {},
-        driverProfileKeys: user.driverProfile
-          ? Object.keys(user.driverProfile)
-          : [],
-        createdAt: user.createdAt,
-        updatedAt: user.updatedAt,
-      },
-    });
-  } catch (err) {
-    console.error("Error checking user:", err);
-    res.status(500).json({
-      error: {
-        message: "Failed to check user",
-        details: err.message,
-      },
-    });
-  }
-});
+
 // GET currently offered trip request for the driver (for polling)
 router.get("/offered-request", requireAuth, async (req, res, next) => {
   try {
@@ -464,101 +486,39 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
       },
       status: "searching",
     })
-      .populate("passengerId", "name") // get passenger name
+      .populate("passengerId", "name")
       .lean();
+
     if (!activeRequest) {
       return res.status(404).json({ message: "No active offer" });
     }
-    // Find the specific candidate entry
+
     const candidate = activeRequest.candidates.find(
       (c) => c.driverId.toString() === driverId && c.status === "offered"
     );
+
     if (!candidate) {
       return res.status(404).json({ message: "No active offer" });
     }
-    // Build response similar to what your frontend expects
+
     const response = {
       request: {
         requestId: activeRequest._id,
         passengerName: activeRequest.passengerId?.name || "Passenger",
-        rating: 4.8, // you can store real rating later
-        pickupAddress: "Pickup location near you", // improve with reverse geocoding later
-        fare: 2500, // temporary – replace with real fare calculation
-        serviceType: activeRequest.serviceType, // Added to show service type
+        rating: 4.8,
+        pickupAddress: "Pickup location near you",
+        fare: 2500,
+        serviceType: activeRequest.serviceType,
       },
     };
+
     res.json(response);
   } catch (err) {
     next(err);
   }
 });
 
-router.post('/location', requireAuth, async (req, res, next) => {
-  try {
-    const driverId = req.user.sub;
-    const { latitude, longitude, heading } = req.body;
-
-    if (!latitude || !longitude) {
-      return res.status(400).json({ 
-        error: { message: 'Latitude and longitude are required' } 
-      });
-    }
-
-    // Validate ranges
-    if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
-      return res.status(400).json({ 
-        error: { message: 'Invalid latitude or longitude values' } 
-      });
-    }
-
-    // Update driver location in database
-    await User.findByIdAndUpdate(driverId, {
-      'driverProfile.location': {
-        type: 'Point',
-        coordinates: [longitude, latitude] // GeoJSON: [lng, lat]
-      },
-      'driverProfile.heading': heading || 0,
-      'driverProfile.lastSeen': new Date()
-    });
-
-    console.log(`📍 Driver ${driverId} location updated via REST: [${latitude}, ${longitude}]`);
-
-    res.json({ success: true });
-  } catch (err) {
-    console.error('❌ Location update error:', err);
-    next(err);
-  }
-});
-
-// Get driver location
-router.get('/location', requireAuth, async (req, res, next) => {
-  try {
-    const driverId = req.user.sub;
-    
-    const driver = await User.findById(driverId)
-      .select('driverProfile.location driverProfile.heading driverProfile.lastSeen')
-      .lean();
-
-    if (!driver || !driver.driverProfile?.location) {
-      return res.json({ location: null });
-    }
-
-    res.json({
-      location: {
-        latitude: driver.driverProfile.location.coordinates[1],
-        longitude: driver.driverProfile.location.coordinates[0],
-        heading: driver.driverProfile.heading || 0,
-        lastSeen: driver.driverProfile.lastSeen
-      }
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// DEBUG ONLY: Get all currently online drivers + their locations (NO AUTH)
-// URL: GET /drivers/debug/online
-// WARNING: Remove or protect this endpoint in production!
+// DEBUG: Get all currently online drivers (NO AUTH)
 router.get('/debug/online', async (req, res) => {
   try {
     console.log('📡 [DEBUG] Requested online drivers list');
@@ -568,10 +528,12 @@ router.get('/debug/online', async (req, res) => {
     const onlineDrivers = await User.find({
       'roles.isDriver': true,
       'driverProfile.isAvailable': true,
+      'driverProfile.verified': true,
+      'driverProfile.verificationState': 'approved',
       'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
     })
       .select(
-        'name phone driverProfile.location driverProfile.heading driverProfile.lastSeen driverProfile.vehicleModel driverProfile.vehicleNumber'
+        'name phone driverProfile.location driverProfile.heading driverProfile.lastSeen driverProfile.vehicleModel driverProfile.vehicleNumber driverProfile.serviceCategories'
       )
       .lean();
 
@@ -592,6 +554,7 @@ router.get('/debug/online', async (req, res) => {
       vehicle: driver.driverProfile?.vehicleModel
         ? `${driver.driverProfile.vehicleModel} (${driver.driverProfile.vehicleNumber || 'N/A'})`
         : 'No vehicle info',
+      serviceCategories: driver.driverProfile?.serviceCategories || [],
       location: driver.driverProfile?.location?.coordinates
         ? {
             latitude: driver.driverProfile.location.coordinates[1],
@@ -618,4 +581,5 @@ router.get('/debug/online', async (req, res) => {
     });
   }
 });
+
 module.exports = router;

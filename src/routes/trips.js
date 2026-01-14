@@ -1,4 +1,4 @@
-// routes/trips.routes.js - Complete with Socket.IO integration and Fixed offerToNext
+// routes/trips.js - FIXED VERSION with improved driver search
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -14,13 +14,16 @@ const { isLuxury } = require('../constants/serviceTypes');
 const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 
-// ========================
-// 1. PASSENGER: CREATE TRIP REQUEST & FIND DRIVERS
-// ========================
+// ⚠️ CRITICAL FIX: Improved driver search with better logging
 router.post('/request', requireAuth, async (req, res, next) => {
   try {
     const passengerId = req.user.sub;
     const { pickup, serviceType, paymentMethod = 'wallet', radiusMeters = 5000, limit = 10 } = req.body;
+
+    console.log('🚗 === NEW TRIP REQUEST ===');
+    console.log('Passenger ID:', passengerId);
+    console.log('Service Type:', serviceType);
+    console.log('Pickup:', pickup);
 
     if (!pickup || !validateCoordinates(pickup.coordinates)) {
       return res.status(400).json({ error: { message: 'Invalid pickup coordinates' } });
@@ -32,45 +35,116 @@ router.post('/request', requireAuth, async (req, res, next) => {
 
     const [lng, lat] = pickup.coordinates;
     const now = new Date();
+    const searchRadius = radiusMeters || 5000;
 
-    // ============================================
-    // FIXED: Better driver query with proper debugging
-    // ============================================
-    console.log(`🔍 Searching drivers for pickup: [${lat}, ${lng}], service: ${serviceType}`);
+    console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${searchRadius}m`);
+
+    // ⚠️ CRITICAL FIX: Better driver query with debugging
+    const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
     
-    const nearbyDrivers = await User.find({
+    // First, check how many drivers exist total
+    const totalDrivers = await User.countDocuments({
+      'roles.isDriver': true
+    });
+    console.log(`📊 Total drivers in database: ${totalDrivers}`);
+
+    const verifiedDrivers = await User.countDocuments({
       'roles.isDriver': true,
-      'driverProfile.isAvailable': true,
+      'driverProfile.verified': true,
+      'driverProfile.verificationState': 'approved'
+    });
+    console.log(`📊 Verified drivers: ${verifiedDrivers}`);
+
+    const availableDrivers = await User.countDocuments({
+      'roles.isDriver': true,
       'driverProfile.verified': true,
       'driverProfile.verificationState': 'approved',
-      'driverProfile.location': {
-        $near: {
-          $geometry: { 
-            type: 'Point', 
-            coordinates: [lng, lat] 
-          },
-          $maxDistance: radiusMeters || 5000
-        }
-      },
-      'driverProfile.serviceCategories': serviceType // Make sure driver supports this service
-    })
-    .select('_id name driverProfile subscription')
-    .limit(limit || 10)
-    .lean();
+      'driverProfile.isAvailable': true
+    });
+    console.log(`📊 Available drivers: ${availableDrivers}`);
 
-    console.log(`📊 Found ${nearbyDrivers.length} nearby drivers`);
+    const recentDrivers = await User.countDocuments({
+      'roles.isDriver': true,
+      'driverProfile.verified': true,
+      'driverProfile.verificationState': 'approved',
+      'driverProfile.isAvailable': true,
+      'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
+    });
+    console.log(`📊 Recently active drivers (last 5 min): ${recentDrivers}`);
+
+    // ⚠️ CRITICAL FIX: Find nearby drivers with proper geospatial query
+    let nearbyDrivers;
+    try {
+      nearbyDrivers = await User.find({
+        'roles.isDriver': true,
+        'driverProfile.verified': true,
+        'driverProfile.verificationState': 'approved',
+        'driverProfile.isAvailable': true,
+        'driverProfile.lastSeen': { $gte: fiveMinutesAgo },
+        'driverProfile.location': {
+          $near: {
+            $geometry: { 
+              type: 'Point', 
+              coordinates: [lng, lat]  // [longitude, latitude]
+            },
+            $maxDistance: searchRadius
+          }
+        }
+      })
+      .select('_id name driverProfile subscription')
+      .limit(limit || 10)
+      .lean();
+    } catch (geoError) {
+      console.error('❌ Geospatial query error:', geoError.message);
+      
+      // FALLBACK: Manual distance calculation if geospatial query fails
+      console.log('⚠️ Falling back to manual distance calculation');
+      
+      const allAvailableDrivers = await User.find({
+        'roles.isDriver': true,
+        'driverProfile.verified': true,
+        'driverProfile.verificationState': 'approved',
+        'driverProfile.isAvailable': true,
+        'driverProfile.lastSeen': { $gte: fiveMinutesAgo },
+        'driverProfile.location': { $exists: true }
+      })
+      .select('_id name driverProfile subscription')
+      .lean();
+
+      // Calculate distances manually
+      nearbyDrivers = allAvailableDrivers
+        .map(driver => {
+          const driverCoords = driver.driverProfile?.location?.coordinates;
+          if (!driverCoords || driverCoords.length !== 2) return null;
+          
+          const [driverLng, driverLat] = driverCoords;
+          const distance = calculateDistance(lat, lng, driverLat, driverLng);
+          
+          return {
+            ...driver,
+            _distance: distance
+          };
+        })
+        .filter(d => d && d._distance <= searchRadius)
+        .sort((a, b) => a._distance - b._distance)
+        .slice(0, limit || 10);
+    }
+
+    console.log(`📊 Found ${nearbyDrivers?.length || 0} nearby drivers`);
 
     // Debug: Log each driver found
-    nearbyDrivers.forEach(driver => {
-      console.log(`   • Driver ${driver._id}: ${driver.name}`);
-      console.log(`     Service Categories: ${driver.driverProfile?.serviceCategories?.join(', ') || 'none'}`);
-      console.log(`     Verified: ${driver.driverProfile?.verified}`);
-      console.log(`     Available: ${driver.driverProfile?.isAvailable}`);
-      console.log(`     Subscription valid: ${driver.subscription?.expiresAt && new Date(driver.subscription.expiresAt) > now}`);
-    });
+    if (nearbyDrivers) {
+      nearbyDrivers.forEach((driver, index) => {
+        console.log(`   ${index + 1}. Driver ${driver._id}: ${driver.name}`);
+        console.log(`      Service Categories: ${driver.driverProfile?.serviceCategories?.join(', ') || 'none'}`);
+        console.log(`      Location: ${driver.driverProfile?.location?.coordinates}`);
+        console.log(`      Last Seen: ${driver.driverProfile?.lastSeen}`);
+      });
+    }
 
+    // Filter by service type and subscription
     const candidates = [];
-    for (const driver of nearbyDrivers) {
+    for (const driver of (nearbyDrivers || [])) {
       // Check if driver supports this service type
       const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
       if (!supportsService) {
@@ -108,17 +182,27 @@ router.post('/request', requireAuth, async (req, res, next) => {
         expiresAt: new Date(now.getTime() + 60 * 1000)
       });
 
-      // Emit no drivers found notification
       emitter.emit('notification', {
         userId: passengerId,
         type: 'no_driver_found',
         title: 'No Drivers Available',
-        body: 'No drivers are available at this time. Please try again later.',
+        body: `No ${serviceType} drivers are available at this time. Please try again later.`,
         data: { requestId: tripRequest._id }
       });
 
       console.log(`❌ No qualified drivers found for ${serviceType} ride`);
-      return res.json({ requestId: tripRequest._id, message: 'No drivers available' });
+      return res.json({ 
+        requestId: tripRequest._id, 
+        message: 'No drivers available',
+        debug: {
+          totalDrivers,
+          verifiedDrivers,
+          availableDrivers,
+          recentDrivers,
+          nearbyFound: nearbyDrivers?.length || 0,
+          qualifiedCandidates: 0
+        }
+      });
     }
 
     tripRequest = await TripRequest.create({
@@ -128,14 +212,12 @@ router.post('/request', requireAuth, async (req, res, next) => {
       paymentMethod,
       candidates,
       status: 'searching',
-      expiresAt: new Date(now.getTime() + 5 * 60 * 1000) // 5 minutes
+      expiresAt: new Date(now.getTime() + 5 * 60 * 1000)
     });
 
     console.log(`✅ Trip request ${tripRequest._id} created with ${candidates.length} candidates`);
 
-    // ============================================
-    // FIXED: Send trip request to ALL qualified drivers via Socket.IO
-    // ============================================
+    // Send trip request to ALL qualified drivers
     candidates.forEach(candidate => {
       console.log(`📤 Sending trip offer to driver ${candidate.driverId} (${candidate.driverName})`);
       
@@ -154,7 +236,6 @@ router.post('/request', requireAuth, async (req, res, next) => {
         }
       });
 
-      // ALSO send the trip_offered event for backward compatibility
       emitter.emit('notification', {
         userId: candidate.driverId.toString(),
         type: 'trip_offered',
@@ -183,9 +264,27 @@ router.post('/request', requireAuth, async (req, res, next) => {
   }
 });
 
-// ========================
-// NEW: GET TRIP REQUEST STATUS (for polling)
-// ========================
+// Helper function for manual distance calculation (Haversine formula)
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // Earth's radius in meters
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+            Math.sin(dLon/2) * Math.sin(dLon/2);
+  
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const distance = R * c;
+  
+  return distance;
+}
+
+function toRad(degrees) {
+  return degrees * Math.PI / 180;
+}
+
+// GET TRIP REQUEST STATUS (for polling)
 router.get('/request/:requestId', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
@@ -200,12 +299,10 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: { message: 'Trip request not found' } });
     }
 
-    // Check authorization
     if (tripRequest.passengerId._id.toString() !== userId) {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
 
-    // If assigned, also fetch the actual Trip record
     let trip = null;
     if (tripRequest.status === 'assigned' && tripRequest.assignedDriverId) {
       trip = await Trip.findOne({
@@ -226,9 +323,7 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
   }
 });
 
-// ========================
-// INTERNAL: Offer to next pending driver + 20s timeout (FIXED)
-// ========================
+// Offer to next pending driver
 async function offerToNext(requestId) {
   try {
     const tripRequest = await TripRequest.findById(requestId);
@@ -237,7 +332,6 @@ async function offerToNext(requestId) {
       return;
     }
 
-    // Find the first pending candidate
     const nextCandidate = tripRequest.candidates.find(c => c.status === 'pending');
     
     if (!nextCandidate) {
@@ -258,7 +352,6 @@ async function offerToNext(requestId) {
       return;
     }
 
-    // Mark as offered
     nextCandidate.status = 'offered';
     nextCandidate.offeredAt = new Date();
     await tripRequest.save();
@@ -266,7 +359,6 @@ async function offerToNext(requestId) {
     const driverId = nextCandidate.driverId;
     console.log(`📤 Offering trip ${requestId} to driver ${driverId}`);
 
-    // Send immediate offer notification
     emitter.emit('notification', {
       userId: driverId.toString(),
       type: 'trip_offered',
@@ -280,7 +372,6 @@ async function offerToNext(requestId) {
       }
     });
 
-    // Timeout: 20 seconds → auto-reject and try next
     setTimeout(async () => {
       try {
         const fresh = await TripRequest.findById(requestId);
@@ -297,8 +388,6 @@ async function offerToNext(requestId) {
           await fresh.save();
           
           console.log(`⏱️ Driver ${driverId} timeout, moving to next candidate`);
-          
-          // Try next driver
           await offerToNext(requestId);
         }
       } catch (timeoutErr) {
@@ -310,9 +399,7 @@ async function offerToNext(requestId) {
   }
 }
 
-// ========================
-// 2. DRIVER: ACCEPT TRIP
-// ========================
+// DRIVER: ACCEPT TRIP
 router.post('/accept', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
@@ -370,7 +457,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.log(`✅ Driver ${driverId} accepted trip ${tripRequest._id}, created Trip ${newTrip._id}`);
 
-    // NEW: Emit trip_accepted event to PASSENGER via Socket.IO
     emitter.emit('notification', {
       userId: tripRequest.passengerId.toString(),
       type: 'trip_accepted',
@@ -383,7 +469,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       }
     });
 
-    // Emit to driver
     emitter.emit('notification', {
       userId: driverId,
       type: 'trip_accepted',
@@ -406,9 +491,7 @@ router.post('/accept', requireAuth, async (req, res, next) => {
   }
 });
 
-// ========================
-// 3. DRIVER: REJECT TRIP
-// ========================
+// DRIVER: REJECT TRIP
 router.post('/reject', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
@@ -433,8 +516,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     await tripRequest.save();
 
     console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
-
-    await offerToNext(requestId); // Try next driver
+    await offerToNext(requestId);
 
     res.json({ success: true });
   } catch (err) {
