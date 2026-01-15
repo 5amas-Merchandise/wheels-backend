@@ -67,16 +67,20 @@ async function cleanupFailedTripRequest(requestId) {
     await tripRequest.save();
 
     // Notify passenger
-    emitter.emit('notification', {
-      userId: tripRequest.passengerId.toString(),
-      type: 'no_driver_found',
-      title: 'No Drivers Available',
-      body: 'Unable to find a driver after multiple attempts. Please try again later.',
-      data: {
-        requestId: tripRequest._id,
-        reason: 'max_rejections_reached'
-      }
-    });
+    try {
+      emitter.emit('notification', {
+        userId: tripRequest.passengerId.toString(),
+        type: 'no_driver_found',
+        title: 'No Drivers Available',
+        body: 'Unable to find a driver after multiple attempts. Please try again later.',
+        data: {
+          requestId: tripRequest._id,
+          reason: 'max_rejections_reached'
+        }
+      });
+    } catch (emitErr) {
+      console.error('Notification emit error during cleanup:', emitErr);
+    }
 
     console.log(`✅ Trip request ${requestId} marked as no_drivers and cleaned up`);
 
@@ -144,15 +148,20 @@ function toRad(degrees) {
 }
 
 // ==========================================
-// POST /trips/request - CREATE TRIP REQUEST
+// POST /trips/request - CREATE TRIP REQUEST (FIXED)
 // ==========================================
 
 router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
   const session = await mongoose.startSession();
+  let responsePayload;
+  let createdRequestId;
+  let candidateData;
+  let passengerId;
+  let firstCandidate;
   
   try {
     await session.withTransaction(async () => {
-      const passengerId = req.user.sub;
+      passengerId = req.user.sub;
       const {
         pickup,
         dropoff,
@@ -202,7 +211,7 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
       console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${searchRadius}m`);
 
-      // Find nearby drivers - WITH ERROR HANDLING
+      // Find nearby drivers
       let nearbyDrivers = [];
       
       try {
@@ -230,8 +239,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
       } catch (geoError) {
         console.error('❌ Geospatial query error:', geoError.message);
-        // Fallback: Return empty array instead of expensive JS calculation
-        // In production, you might want to log this and alert admin about index issues
         throw new Error('Geospatial service temporarily unavailable');
       }
 
@@ -278,28 +285,25 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
           expiresAt: new Date(now.getTime() + 60 * 1000)
         }], { session });
 
-        await session.commitTransaction();
-
-        emitter.emit('notification', {
-          userId: passengerId,
-          type: 'no_driver_found',
-          title: 'No Drivers Available',
-          body: `No ${serviceType} drivers are available at this time.`,
-          data: { requestId: tripRequest[0]._id }
-        });
-
-        console.log(`❌ No qualified drivers found`);
+        createdRequestId = tripRequest[0]._id;
         
-        return res.json({
+        // Store response data
+        responsePayload = {
           requestId: tripRequest[0]._id,
           message: 'No drivers available'
-        });
+        };
+        
+        candidateData = null;
+        firstCandidate = null;
+        
+        return; // Transaction will commit
       }
 
       // Offer to first driver immediately
       if (candidates.length > 0) {
         candidates[0].status = 'offered';
         candidates[0].offeredAt = now;
+        firstCandidate = candidates[0];
         console.log(`📤 Offering to first driver: ${candidates[0].driverId}`);
       }
 
@@ -321,42 +325,70 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
       }], { session });
 
       const createdRequest = tripRequest[0];
+      createdRequestId = createdRequest._id;
 
       console.log(`✅ Trip request ${createdRequest._id} created with ${candidates.length} candidates`);
 
-      // Send notification to first driver
-      const firstCandidate = candidates.find(c => c.status === 'offered');
+      // Store response data
+      responsePayload = {
+        requestId: createdRequest._id,
+        candidatesCount: candidates.length,
+        message: `Searching ${candidates.length} drivers`,
+        estimatedFare: estimatedFare || 0
+      };
+      
+      candidateData = {
+        serviceType: serviceType,
+        estimatedFare: estimatedFare || 0,
+        distance: distance || 0,
+        duration: duration || 0,
+        pickup: pickup,
+        dropoff: dropoff,
+        pickupAddress: pickupAddress || '',
+        dropoffAddress: dropoffAddress || '',
+        immediateOffer: true
+      };
+      
+    });
+
+    // ✅ Send response AFTER transaction
+    res.json(responsePayload);
+
+    // ✅ Now safe to emit events
+    if (createdRequestId) {
       if (firstCandidate) {
-        emitter.emit('notification', {
-          userId: firstCandidate.driverId.toString(),
-          type: 'trip_offered',
-          title: 'New Trip Request',
-          body: `New ${serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
-          data: {
-            requestId: createdRequest._id,
-            serviceType: serviceType,
-            estimatedFare: estimatedFare || 0,
-            distance: distance || 0,
-            duration: duration || 0,
-            pickup: pickup,
-            dropoff: dropoff,
-            pickupAddress: pickupAddress || '',
-            dropoffAddress: dropoffAddress || '',
-            immediateOffer: true
-          }
-        });
-        console.log(`📨 Notification sent to driver ${firstCandidate.driverId}`);
+        try {
+          emitter.emit('notification', {
+            userId: firstCandidate.driverId.toString(),
+            type: 'trip_offered',
+            title: 'New Trip Request',
+            body: `New ${candidateData.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
+            data: {
+              requestId: createdRequestId,
+              serviceType: candidateData.serviceType,
+              estimatedFare: candidateData.estimatedFare,
+              distance: candidateData.distance,
+              duration: candidateData.duration,
+              pickup: candidateData.pickup,
+              dropoff: candidateData.dropoff,
+              pickupAddress: candidateData.pickupAddress,
+              dropoffAddress: candidateData.dropoffAddress,
+              immediateOffer: candidateData.immediateOffer
+            }
+          });
+          console.log(`📨 Notification sent to driver ${firstCandidate.driverId}`);
+        } catch (emitErr) {
+          console.error('Notification emit error:', emitErr);
+        }
       }
 
-      await session.commitTransaction();
-
       // Timeout for first driver (outside transaction)
-      if (candidates.length > 0 && firstCandidate) {
+      if (firstCandidate) {
         const firstDriverId = firstCandidate.driverId;
         
         setTimeout(async () => {
           try {
-            const fresh = await TripRequest.findById(createdRequest._id);
+            const fresh = await TripRequest.findById(createdRequestId);
             if (!fresh || fresh.status !== 'searching') return;
 
             const cand = fresh.candidates.find(c => c.driverId.toString() === firstDriverId.toString());
@@ -367,22 +399,28 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
               await fresh.save();
 
               console.log(`⏱️ First driver ${firstDriverId} timeout, moving to next`);
-              await offerToNext(createdRequest._id);
+              await offerToNext(createdRequestId);
             }
           } catch (err) {
             console.error('Timeout error:', err);
           }
         }, CONFIG.OFFER_TIMEOUT_MS);
       }
+    } else {
+      // No drivers case
+      try {
+        emitter.emit('notification', {
+          userId: passengerId,
+          type: 'no_driver_found',
+          title: 'No Drivers Available',
+          body: `No ${candidateData?.serviceType || 'service'} drivers are available at this time.`,
+          data: { requestId: createdRequestId }
+        });
+      } catch (emitErr) {
+        console.error('Notification emit error:', emitErr);
+      }
+    }
 
-      res.json({
-        requestId: createdRequest._id,
-        candidatesCount: candidates.length,
-        message: `Searching ${candidates.length} drivers`,
-        estimatedFare: estimatedFare || 0
-      });
-
-    });
   } catch (err) {
     await session.abortTransaction();
     console.error('❌ Trip request error:', err);
@@ -456,24 +494,28 @@ async function offerToNext(requestId) {
     console.log(`📤 Offering to driver ${driverId} (Attempt ${rejectionCount + 1}/${CONFIG.MAX_REJECTIONS})`);
 
     // SEND NOTIFICATION TO THE DRIVER
-    emitter.emit('notification', {
-      userId: driverId.toString(),
-      type: 'trip_offered',
-      title: 'New Trip Request',
-      body: `New ${tripRequest.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
-      data: {
-        requestId: tripRequest._id,
-        serviceType: tripRequest.serviceType,
-        estimatedFare: tripRequest.estimatedFare || 0,
-        distance: tripRequest.distance || 0,
-        duration: tripRequest.duration || 0,
-        pickup: tripRequest.pickup,
-        dropoff: tripRequest.dropoff,
-        pickupAddress: tripRequest.pickupAddress || '',
-        dropoffAddress: tripRequest.dropoffAddress || '',
-        immediateOffer: true
-      }
-    });
+    try {
+      emitter.emit('notification', {
+        userId: driverId.toString(),
+        type: 'trip_offered',
+        title: 'New Trip Request',
+        body: `New ${tripRequest.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
+        data: {
+          requestId: tripRequest._id,
+          serviceType: tripRequest.serviceType,
+          estimatedFare: tripRequest.estimatedFare || 0,
+          distance: tripRequest.distance || 0,
+          duration: tripRequest.duration || 0,
+          pickup: tripRequest.pickup,
+          dropoff: tripRequest.dropoff,
+          pickupAddress: tripRequest.pickupAddress || '',
+          dropoffAddress: tripRequest.dropoffAddress || '',
+          immediateOffer: true
+        }
+      });
+    } catch (emitErr) {
+      console.error('Notification emit error in offerToNext:', emitErr);
+    }
 
     // Timeout for this driver
     setTimeout(async () => {
@@ -545,17 +587,18 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/accept - DRIVER ACCEPTS (FIXED RACE CONDITION)
+// POST /trips/accept - DRIVER ACCEPTS (COMPLETELY FIXED)
 // ==========================================
 
 router.post('/accept', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
   let transactionCommitted = false;
+  let tripData;
 
   try {
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
-      const { requestId, idempotencyKey } = req.body; // Add idempotency key support
+      const { requestId, idempotencyKey } = req.body;
 
       console.log(`🤝 Driver ${driverId} attempting to accept ${requestId}`);
 
@@ -569,6 +612,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       const tripRequest = await TripRequest.findById(requestId).session(session);
       if (!tripRequest || tripRequest.status !== 'searching') {
         throw new Error('Trip no longer available');
+      }
+
+      // ✅ HARD UNIQUENESS GUARD - PREVENT RACE CONDITION
+      if (tripRequest.assignedDriverId) {
+        throw new Error('Trip already assigned to another driver');
       }
 
       // Check candidate status INSIDE transaction
@@ -626,31 +674,50 @@ router.post('/accept', requireAuth, async (req, res, next) => {
         }, { session });
       }
 
-      // Commit transaction BEFORE external actions
+      // Store data for response and events
+      tripData = {
+        requestId: tripRequest._id.toString(),
+        tripId: newTrip._id.toString(),
+        passengerId: tripRequest.passengerId.toString(),
+        driverId: driverId.toString(),
+        driverName: driver.name,
+        serviceType: tripRequest.serviceType,
+        estimatedFare: tripRequest.estimatedFare || 0
+      };
+
       await session.commitTransaction();
       transactionCommitted = true;
 
       console.log(`✅ Trip accepted, created ${newTrip._id}`);
+    });
 
-      // Send notifications AFTER transaction is committed
+    // ✅ Send response AFTER transaction is committed
+    res.json({
+      success: true,
+      tripId: tripData.tripId,
+      requestId: tripData.requestId
+    });
+
+    // ✅ Send notifications AFTER response with error handling
+    try {
       emitter.emit('notification', {
-        userId: tripRequest.passengerId.toString(),
+        userId: tripData.passengerId,
         type: 'trip_accepted',
         title: 'Driver Accepted!',
-        body: 'Your driver is on the way',
+        body: `Your driver ${tripData.driverName} is on the way`,
         data: {
-          requestId: tripRequest._id.toString(),
-          tripId: newTrip._id.toString(),
-          driverId: driverId.toString()
+          requestId: tripData.requestId,
+          tripId: tripData.tripId,
+          driverId: tripData.driverId,
+          driverName: tripData.driverName,
+          serviceType: tripData.serviceType,
+          estimatedFare: tripData.estimatedFare
         }
       });
-
-      res.json({
-        success: true,
-        tripId: newTrip._id,
-        requestId: tripRequest._id
-      });
-    });
+    } catch (emitErr) {
+      console.error('❌ Notification emit error (non-fatal):', emitErr);
+      // Don't crash the flow if emit fails
+    }
 
   } catch (err) {
     if (!transactionCommitted) {
@@ -659,7 +726,9 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.error('❌ Accept error:', err.message);
 
-    if (err.message.includes('not available') || err.message.includes('not offered')) {
+    if (err.message.includes('not available') || 
+        err.message.includes('not offered') ||
+        err.message.includes('already assigned')) {
       return res.status(400).json({ error: { message: err.message } });
     }
 
@@ -787,13 +856,17 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
     trip.startedAt = new Date();
     await trip.save();
 
-    emitter.emit('notification', {
-      userId: trip.passengerId.toString(),
-      type: 'trip_started',
-      title: 'Trip Started',
-      body: 'Your driver has started the trip',
-      data: { tripId: trip._id }
-    });
+    try {
+      emitter.emit('notification', {
+        userId: trip.passengerId.toString(),
+        type: 'trip_started',
+        title: 'Trip Started',
+        body: 'Your driver has started the trip',
+        data: { tripId: trip._id }
+      });
+    } catch (emitErr) {
+      console.error('Notification emit error:', emitErr);
+    }
 
     res.json({ trip });
   } catch (err) {
@@ -803,11 +876,12 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
 
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
+  let tripData;
   
   try {
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
-      const { actualDistanceKm, actualDurationMinutes } = req.body; // Allow actual metrics
+      const { actualDistanceKm, actualDurationMinutes } = req.body;
 
       const trip = await Trip.findById(req.params.tripId).session(session);
       if (!trip) throw new Error('Trip not found');
@@ -884,18 +958,31 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
         { session }
       );
 
-      await session.commitTransaction();
+      // Store trip data for notification
+      tripData = {
+        tripId: trip._id.toString(),
+        passengerId: trip.passengerId.toString(),
+        finalFare: trip.finalFare
+      };
 
-      emitter.emit('notification', {
-        userId: trip.passengerId.toString(),
-        type: 'trip_completed',
-        title: 'Trip Completed',
-        body: `Your trip has been completed. Amount: ₦${(trip.finalFare / 100).toFixed(2)}`,
-        data: { tripId: trip._id, fare: trip.finalFare }
-      });
+      await session.commitTransaction();
     });
 
-    res.json({ trip });
+    // Send response
+    res.json({ trip: tripData });
+
+    // Emit notification AFTER response
+    try {
+      emitter.emit('notification', {
+        userId: tripData.passengerId,
+        type: 'trip_completed',
+        title: 'Trip Completed',
+        body: `Your trip has been completed. Amount: ₦${(tripData.finalFare / 100).toFixed(2)}`,
+        data: { tripId: tripData.tripId, fare: tripData.finalFare }
+      });
+    } catch (emitErr) {
+      console.error('Notification emit error:', emitErr);
+    }
 
   } catch (err) {
     await session.abortTransaction();
@@ -942,13 +1029,17 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
     // Notify the other party
     const notifyUserId = isPassenger ? trip.driverId : trip.passengerId;
     if (notifyUserId) {
-      emitter.emit('notification', {
-        userId: notifyUserId.toString(),
-        type: 'trip_cancelled',
-        title: 'Trip Cancelled',
-        body: `Trip was cancelled: ${trip.cancellationReason}`,
-        data: { tripId: trip._id, reason: trip.cancellationReason }
-      });
+      try {
+        emitter.emit('notification', {
+          userId: notifyUserId.toString(),
+          type: 'trip_cancelled',
+          title: 'Trip Cancelled',
+          body: `Trip was cancelled: ${trip.cancellationReason}`,
+          data: { tripId: trip._id, reason: trip.cancellationReason }
+        });
+      } catch (emitErr) {
+        console.error('Notification emit error:', emitErr);
+      }
     }
 
     res.json({ trip });
