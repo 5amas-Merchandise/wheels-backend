@@ -869,6 +869,15 @@ function startPeriodicCleanup() {
   }, 5 * 60 * 1000); // Every 5 minutes
 }
 
+
+
 startPeriodicCleanup();
+
+router.post('/admin/flush-trips', async (req, res) => {
+  await TripRequest.deleteMany({});
+  tripRejectionCounts.clear();
+  res.json({ success: true });
+});
+
 
 module.exports = router;

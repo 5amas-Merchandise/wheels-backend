@@ -89,18 +89,23 @@ router.post("/availability", requireAuth, async (req, res, next) => {
 });
 
 // ✅✅✅ CRITICAL FIX: Get offered request with $elemMatch - FIXED VERSION
+// ✅✅✅ CRITICAL FIX: Get offered request with $elemMatch - COMPLETELY FIXED VERSION
 router.get("/offered-request", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     console.log(`🔍 Driver ${driverId} checking for offered requests`);
+    
+    const now = new Date();
 
-    // ✅✅✅ FIXED: Use $elemMatch to find trip where driver is offered
+    // ✅✅✅ FIXED: Use ALL REQUIRED FILTERS
     const activeRequest = await TripRequest.findOne({
-      status: 'searching',
+      status: 'searching', // Only searching trips
+      expiresAt: { $gt: now }, // Must not be expired
       candidates: {
         $elemMatch: {
           driverId: driverId,
-          status: "offered"
+          status: "offered",
+          rejectedAt: null // Driver hasn't rejected this offer
         }
       }
     })
@@ -108,36 +113,31 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
     .lean();
 
     if (!activeRequest) {
-      console.log(`❌ No active offer found for driver ${driverId}`);
-      
-      // ✅ Debug: Check what trips this driver is actually in
-      const debugTrips = await TripRequest.find({
-        candidates: {
-          $elemMatch: { driverId: driverId }
-        },
-        createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) }
-      })
-      .select('_id status candidates')
-      .lean();
-      
-      console.log(`🔍 Debug: Driver ${driverId} is in ${debugTrips.length} trips:`);
-      debugTrips.forEach(trip => {
-        const cand = trip.candidates.find(c => c.driverId.toString() === driverId);
-        console.log(`  - Trip ${trip._id}: status=${trip.status}, candidate_status=${cand?.status}`);
+      console.log(`❌ No active offer found for driver ${driverId}`, {
+        timestamp: now.toISOString(),
+        reason: "No trip with status='searching', driver status='offered', and not expired"
       });
       
       return res.status(404).json({ 
         message: "No active offer",
         debug: { 
           driverId, 
-          tripCount: debugTrips.length,
-          timestamp: new Date().toISOString() 
+          timestamp: now.toISOString(),
+          filters: {
+            status: 'searching',
+            expiresAt: { $gt: now },
+            driverId: driverId,
+            candidateStatus: 'offered',
+            rejectedAt: null
+          }
         }
       });
     }
 
     const candidate = activeRequest.candidates.find(
-      (c) => c.driverId.toString() === driverId && c.status === "offered"
+      (c) => c.driverId.toString() === driverId && 
+             c.status === "offered" && 
+             !c.rejectedAt
     );
 
     if (!candidate) {
@@ -147,20 +147,24 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
         debug: { 
           driverId, 
           tripStatus: activeRequest.status,
+          expiresAt: activeRequest.expiresAt,
           allCandidates: activeRequest.candidates.map(c => ({
             driverId: c.driverId,
             status: c.status,
-            offeredAt: c.offeredAt
+            offeredAt: c.offeredAt,
+            rejectedAt: c.rejectedAt
           }))
         }
       });
     }
 
-    console.log(`✅ Found active offer for driver ${driverId}:`, {
+    console.log(`✅ Found ACTIVE offer for driver ${driverId}:`, {
       requestId: activeRequest._id,
       passenger: activeRequest.passengerId?.name,
       fare: activeRequest.estimatedFare,
-      serviceType: activeRequest.serviceType
+      serviceType: activeRequest.serviceType,
+      expiresAt: activeRequest.expiresAt,
+      timeUntilExpiry: Math.max(0, activeRequest.expiresAt - now)
     });
 
     const response = {
@@ -186,7 +190,7 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
         
         // Offer timing
         offeredAt: candidate.offeredAt,
-        expiresIn: 20,
+        expiresIn: Math.floor((activeRequest.expiresAt - now) / 1000), // Seconds remaining
         
         // Candidate info
         candidateInfo: {
@@ -614,31 +618,42 @@ router.get("/current-trip", requireAuth, async (req, res, next) => {
 router.get("/pending-offers", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
+    const now = new Date();
     
     const offeredTrips = await TripRequest.find({
       candidates: {
         $elemMatch: {
           driverId: driverId,
-          status: { $in: ['offered', 'pending'] }
+          status: { $in: ['offered', 'pending'] },
+          rejectedAt: null
         }
       },
-      status: { $in: ['searching', 'assigned'] },
-      createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) }
+      status: 'searching', // ONLY searching trips!
+      expiresAt: { $gt: now }, // NOT expired
+      createdAt: { $gte: new Date(now.getTime() - 10 * 60 * 1000) }
     })
-    .select('_id status serviceType pickup candidates')
+    .select('_id status serviceType pickup dropoff estimatedFare candidates expiresAt')
     .lean();
     
     const formatted = offeredTrips.map(trip => {
-      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
+      const candidate = trip.candidates.find(c => 
+        c.driverId.toString() === driverId && 
+        ['offered', 'pending'].includes(c.status) &&
+        !c.rejectedAt
+      );
       return {
         requestId: trip._id,
         status: trip.status,
         candidateStatus: candidate?.status,
         serviceType: trip.serviceType,
         pickup: trip.pickup,
-        offeredAt: candidate?.offeredAt
+        dropoff: trip.dropoff,
+        estimatedFare: trip.estimatedFare,
+        offeredAt: candidate?.offeredAt,
+        expiresAt: trip.expiresAt,
+        timeUntilExpiry: Math.max(0, trip.expiresAt - now)
       };
-    });
+    }).filter(offer => offer.candidateStatus); // Remove if no matching candidate
     
     res.json({
       count: formatted.length,

@@ -53,7 +53,11 @@ const TripRequestSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'User' 
   },
-  expiresAt: { type: Date },
+  expiresAt: { 
+    type: Date, 
+    required: true,
+    index: { expireAfterSeconds: 0 } // 🔥 TTL INDEX - NON-NEGOTIABLE
+  },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -63,7 +67,7 @@ TripRequestSchema.index({ dropoff: '2dsphere' });
 TripRequestSchema.index({ status: 1 });
 TripRequestSchema.index({ passengerId: 1 });
 TripRequestSchema.index({ createdAt: -1 });
-TripRequestSchema.index({ expiresAt: 1 });
+TripRequestSchema.index({ expiresAt: 1 }); // Already included in TTL but good for queries
 TripRequestSchema.index({ 'candidates.driverId': 1 });
 TripRequestSchema.index({ 'candidates.status': 1 });
 
