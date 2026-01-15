@@ -15,15 +15,33 @@ const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 
 // POST /trips/request - Improved driver search with immediate offering
+// routes/trips.js - POST /trips/request - COMPLETE INTEGRATED VERSION
+
 router.post('/request', requireAuth, async (req, res, next) => {
   try {
     const passengerId = req.user.sub;
-    const { pickup, serviceType, paymentMethod = 'wallet', radiusMeters = 5000, limit = 10 } = req.body;
+    const { 
+      pickup, 
+      dropoff,  // ✅ NEW: Accept dropoff
+      serviceType, 
+      paymentMethod = 'wallet', 
+      radiusMeters = 5000, 
+      limit = 10,
+      estimatedFare,  // ✅ NEW: Accept fare from frontend
+      distance,  // ✅ NEW: Accept distance
+      duration,  // ✅ NEW: Accept duration
+      pickupAddress,  // ✅ NEW: Accept addresses
+      dropoffAddress
+    } = req.body;
 
     console.log('🚗 === NEW TRIP REQUEST ===');
     console.log('Passenger ID:', passengerId);
     console.log('Service Type:', serviceType);
     console.log('Pickup:', pickup);
+    console.log('Dropoff:', dropoff);
+    console.log('Estimated Fare:', estimatedFare);
+    console.log('Distance:', distance, 'km');
+    console.log('Duration:', duration, 'seconds');
 
     if (!pickup || !validateCoordinates(pickup.coordinates)) {
       return res.status(400).json({ error: { message: 'Invalid pickup coordinates' } });
@@ -210,8 +228,14 @@ router.post('/request', requireAuth, async (req, res, next) => {
       tripRequest = await TripRequest.create({
         passengerId,
         pickup,
+        dropoff,  // ✅ NEW: Store dropoff
         serviceType,
         paymentMethod,
+        estimatedFare: estimatedFare || 0,  // ✅ NEW: Store fare
+        distance: distance || 0,  // ✅ NEW: Store distance
+        duration: duration || 0,  // ✅ NEW: Store duration
+        pickupAddress: pickupAddress || '',  // ✅ NEW: Store addresses
+        dropoffAddress: dropoffAddress || '',
         candidates: [],
         status: 'no_drivers',
         expiresAt: new Date(now.getTime() + 60 * 1000)
@@ -252,20 +276,28 @@ router.post('/request', requireAuth, async (req, res, next) => {
     tripRequest = await TripRequest.create({
       passengerId,
       pickup,
+      dropoff,  // ✅ NEW: Store dropoff
       serviceType,
       paymentMethod,
+      estimatedFare: estimatedFare || 0,  // ✅ NEW: Store fare
+      distance: distance || 0,  // ✅ NEW: Store distance
+      duration: duration || 0,  // ✅ NEW: Store duration
+      pickupAddress: pickupAddress || '',  // ✅ NEW: Store addresses
+      dropoffAddress: dropoffAddress || '',
       candidates,
       status: 'searching',
       expiresAt: new Date(now.getTime() + 5 * 60 * 1000)
     });
 
     console.log(`✅ Trip request ${tripRequest._id} created with ${candidates.length} candidates`);
+    console.log(`   Fare: ₦${estimatedFare}, Distance: ${distance}km, Duration: ${duration}s`);
     console.log(`   First driver ${candidates[0]?.driverId} already has status: ${candidates[0]?.status}`);
 
-    // Send trip request to ALL qualified drivers
+    // Send trip request to ALL qualified drivers with COMPLETE trip details
     candidates.forEach(candidate => {
       console.log(`📤 Sending trip offer to driver ${candidate.driverId} (${candidate.driverName}) - Status: ${candidate.status}`);
       
+      // Base notification for all drivers
       emitter.emit('notification', {
         userId: candidate.driverId.toString(),
         type: 'trip:new_request',
@@ -276,7 +308,13 @@ router.post('/request', requireAuth, async (req, res, next) => {
           requestId: tripRequest._id,
           passengerId: passengerId,
           pickup: pickup,
+          dropoff: dropoff,  // ✅ NEW: Include dropoff
           serviceType: serviceType,
+          fare: estimatedFare || 0,  // ✅ NEW: Include fare
+          distance: distance || 0,  // ✅ NEW: Include distance
+          duration: duration || 0,  // ✅ NEW: Include duration
+          pickupAddress: pickupAddress || '',  // ✅ NEW: Include addresses
+          dropoffAddress: dropoffAddress || '',
           candidateIndex: candidates.findIndex(c => c.driverId.toString() === candidate.driverId.toString())
         }
       });
@@ -291,10 +329,17 @@ router.post('/request', requireAuth, async (req, res, next) => {
           data: {
             requestId: tripRequest._id,
             serviceType: serviceType,
+            fare: estimatedFare || 0,  // ✅ NEW: Include fare in offer
+            distance: distance || 0,
+            duration: duration || 0,
+            pickup: pickup,
+            dropoff: dropoff,
+            pickupAddress: pickupAddress || '',
+            dropoffAddress: dropoffAddress || '',
             immediateOffer: true
           }
         });
-        console.log(`   📨 Sent immediate offer notification to driver ${candidate.driverId}`);
+        console.log(`   📨 Sent immediate offer notification to driver ${candidate.driverId} with fare ₦${estimatedFare}`);
       }
     });
 
@@ -333,6 +378,9 @@ router.post('/request', requireAuth, async (req, res, next) => {
       candidatesCount: candidates.length,
       message: `Searching ${candidates.length} drivers`,
       immediateOffer: candidates.length > 0,
+      estimatedFare: estimatedFare || 0,  // ✅ NEW: Return fare in response
+      distance: distance || 0,
+      duration: duration || 0,
       debug: {
         nearbyDriversCount: nearbyDrivers?.length || 0,
         candidates: candidates.map(c => ({
@@ -348,6 +396,23 @@ router.post('/request', requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+// Helper function for manual distance calculation (Haversine formula)
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // Earth's radius in meters
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const distance = R * c;
+  return distance;
+}
+
+function toRad(degrees) {
+  return degrees * Math.PI / 180;
+}
 
 // Helper function for manual distance calculation (Haversine formula)
 function calculateDistance(lat1, lon1, lat2, lon2) {
