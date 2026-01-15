@@ -222,15 +222,6 @@ router.post('/request', requireAuth, async (req, res, next) => {
         continue; // Skip drivers who don't support this service
       }
 
-      // Check subscription for CITY_RIDE services
-      if (!isLuxury(serviceType)) {
-        const sub = driver.subscription;
-        if (!sub?.expiresAt || new Date(sub.expiresAt) <= now) {
-          console.log(`   ⚠️ Driver ${driver._id} subscription expired for CITY_RIDE`);
-          continue; // Skip drivers without valid subscription for CITY_RIDE
-        }
-      }
-
       // ✅✅✅ ADD DRIVER TO CANDIDATES LIST - THIS WAS MISSING!
       candidates.push({ 
         driverId: driver._id, 
