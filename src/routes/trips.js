@@ -1,4 +1,4 @@
-// routes/trips.js - COMPLETE INTEGRATED VERSION (FIXED with DIAGNOSTICS)
+// routes/trips.js - COMPLETE FINAL VERSION WITH AUTO-CLEANUP
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -14,34 +14,136 @@ const { isLuxury } = require('../constants/serviceTypes');
 const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 
-// POST /trips/request - Improved driver search with immediate offering
-// routes/trips.js - POST /trips/request - COMPLETE INTEGRATED VERSION
+// ==========================================
+// REJECTION TRACKING & AUTO-CLEANUP
+// ==========================================
+
+const tripRejectionCounts = new Map(); // Map<requestId, rejectionCount>
+
+/**
+ * Cleanup a trip request that couldn't find a driver
+ */
+async function cleanupFailedTripRequest(requestId) {
+  try {
+    console.log(`🧹 Cleaning up failed trip request: ${requestId}`);
+    
+    const tripRequest = await TripRequest.findById(requestId);
+    if (!tripRequest) {
+      console.log(`⚠️ Trip request ${requestId} not found for cleanup`);
+      tripRejectionCounts.delete(requestId.toString());
+      return;
+    }
+
+    // Mark all remaining candidates as rejected
+    tripRequest.candidates.forEach(candidate => {
+      if (candidate.status === 'offered' || candidate.status === 'pending') {
+        candidate.status = 'rejected';
+        candidate.rejectedAt = new Date();
+        candidate.rejectionReason = 'max_attempts_reached';
+      }
+    });
+
+    tripRequest.status = 'no_drivers';
+    await tripRequest.save();
+
+    // Notify passenger
+    emitter.emit('notification', {
+      userId: tripRequest.passengerId.toString(),
+      type: 'no_driver_found',
+      title: 'No Drivers Available',
+      body: 'Unable to find a driver after multiple attempts. Please try again later.',
+      data: { 
+        requestId: tripRequest._id,
+        reason: 'max_rejections_reached'
+      }
+    });
+
+    // Remove from tracking
+    tripRejectionCounts.delete(requestId.toString());
+
+    console.log(`✅ Trip request ${requestId} marked as no_drivers and cleaned up`);
+
+    // Delete after 5 minutes
+    setTimeout(async () => {
+      try {
+        await TripRequest.findByIdAndDelete(requestId);
+        console.log(`🗑️ Deleted failed trip request: ${requestId}`);
+      } catch (delErr) {
+        console.error(`❌ Error deleting trip request ${requestId}:`, delErr);
+      }
+    }, 5 * 60 * 1000); // 5 minutes
+
+  } catch (err) {
+    console.error(`❌ Error cleaning up trip request ${requestId}:`, err);
+  }
+}
+
+/**
+ * Track rejection and cleanup if threshold reached
+ */
+function trackRejection(requestId) {
+  const id = requestId.toString();
+  const currentCount = tripRejectionCounts.get(id) || 0;
+  const newCount = currentCount + 1;
+  
+  tripRejectionCounts.set(id, newCount);
+  
+  console.log(`📊 Trip ${id} rejection count: ${newCount}/5`);
+  
+  if (newCount >= 5) {
+    console.log(`🚫 Trip ${id} reached max rejections (5), initiating cleanup`);
+    cleanupFailedTripRequest(requestId);
+    return true; // Cleanup triggered
+  }
+  
+  return false; // Continue to next driver
+}
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+function toRad(degrees) {
+  return degrees * Math.PI / 180;
+}
+
+// ==========================================
+// POST /trips/request - CREATE TRIP REQUEST
+// ==========================================
 
 router.post('/request', requireAuth, async (req, res, next) => {
   try {
     const passengerId = req.user.sub;
     const { 
       pickup, 
-      dropoff,  // ✅ NEW: Accept dropoff
+      dropoff,
       serviceType, 
       paymentMethod = 'wallet', 
       radiusMeters = 5000, 
       limit = 10,
-      estimatedFare,  // ✅ NEW: Accept fare from frontend
-      distance,  // ✅ NEW: Accept distance
-      duration,  // ✅ NEW: Accept duration
-      pickupAddress,  // ✅ NEW: Accept addresses
+      estimatedFare,
+      distance,
+      duration,
+      pickupAddress,
       dropoffAddress
     } = req.body;
 
     console.log('🚗 === NEW TRIP REQUEST ===');
     console.log('Passenger ID:', passengerId);
     console.log('Service Type:', serviceType);
-    console.log('Pickup:', pickup);
-    console.log('Dropoff:', dropoff);
     console.log('Estimated Fare:', estimatedFare);
     console.log('Distance:', distance, 'km');
-    console.log('Duration:', duration, 'seconds');
 
     if (!pickup || !validateCoordinates(pickup.coordinates)) {
       return res.status(400).json({ error: { message: 'Invalid pickup coordinates' } });
@@ -54,43 +156,11 @@ router.post('/request', requireAuth, async (req, res, next) => {
     const [lng, lat] = pickup.coordinates;
     const now = new Date();
     const searchRadius = radiusMeters || 5000;
+    const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
 
     console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${searchRadius}m`);
 
-    // ⚠️ CRITICAL FIX: Better driver query with debugging
-    const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
-    
-    // First, check how many drivers exist total
-    const totalDrivers = await User.countDocuments({
-      'roles.isDriver': true
-    });
-    console.log(`📊 Total drivers in database: ${totalDrivers}`);
-
-    const verifiedDrivers = await User.countDocuments({
-      'roles.isDriver': true,
-      'driverProfile.verified': true,
-      'driverProfile.verificationState': 'approved'
-    });
-    console.log(`📊 Verified drivers: ${verifiedDrivers}`);
-
-    const availableDrivers = await User.countDocuments({
-      'roles.isDriver': true,
-      'driverProfile.verified': true,
-      'driverProfile.verificationState': 'approved',
-      'driverProfile.isAvailable': true
-    });
-    console.log(`📊 Available drivers: ${availableDrivers}`);
-
-    const recentDrivers = await User.countDocuments({
-      'roles.isDriver': true,
-      'driverProfile.verified': true,
-      'driverProfile.verificationState': 'approved',
-      'driverProfile.isAvailable': true,
-      'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
-    });
-    console.log(`📊 Recently active drivers (last 5 min): ${recentDrivers}`);
-
-    // ⚠️ CRITICAL FIX: Find nearby drivers with proper geospatial query
+    // Find nearby drivers
     let nearbyDrivers;
     try {
       nearbyDrivers = await User.find({
@@ -103,7 +173,7 @@ router.post('/request', requireAuth, async (req, res, next) => {
           $near: {
             $geometry: { 
               type: 'Point', 
-              coordinates: [lng, lat]  // [longitude, latitude]
+              coordinates: [lng, lat]
             },
             $maxDistance: searchRadius
           }
@@ -114,9 +184,6 @@ router.post('/request', requireAuth, async (req, res, next) => {
       .lean();
     } catch (geoError) {
       console.error('❌ Geospatial query error:', geoError.message);
-      
-      // FALLBACK: Manual distance calculation if geospatial query fails
-      console.log('⚠️ Falling back to manual distance calculation');
       
       const allAvailableDrivers = await User.find({
         'roles.isDriver': true,
@@ -129,19 +196,15 @@ router.post('/request', requireAuth, async (req, res, next) => {
       .select('_id name driverProfile subscription')
       .lean();
 
-      // Calculate distances manually
       nearbyDrivers = allAvailableDrivers
         .map(driver => {
           const driverCoords = driver.driverProfile?.location?.coordinates;
           if (!driverCoords || driverCoords.length !== 2) return null;
           
           const [driverLng, driverLat] = driverCoords;
-          const distance = calculateDistance(lat, lng, driverLat, driverLng);
+          const dist = calculateDistance(lat, lng, driverLat, driverLng);
           
-          return {
-            ...driver,
-            _distance: distance
-          };
+          return { ...driver, _distance: dist };
         })
         .filter(d => d && d._distance <= searchRadius)
         .sort((a, b) => a._distance - b._distance)
@@ -150,91 +213,41 @@ router.post('/request', requireAuth, async (req, res, next) => {
 
     console.log(`📊 Found ${nearbyDrivers?.length || 0} nearby drivers`);
 
-    // ✅ EMERGENCY DIAGNOSTICS: Log ALL driver details
-    console.log("=== DEBUG DRIVER QUALIFICATION ===");
-    if (nearbyDrivers) {
-      nearbyDrivers.forEach((driver, index) => {
-        console.log(`Driver ${index + 1}:`, {
-          driverId: driver._id,
-          name: driver.name,
-          categories: driver.driverProfile?.serviceCategories || "NOT SET",
-          subscriptionExpires: driver.subscription?.expiresAt || "NO_SUBSCRIPTION",
-          isLuxuryRide: isLuxury(serviceType),
-          isAvailable: driver.driverProfile?.isAvailable,
-          lastSeen: driver.driverProfile?.lastSeen,
-          location: driver.driverProfile?.location?.coordinates
-        });
-      });
-    } else {
-      console.log("No nearby drivers found at all!");
-    }
-
-    // Filter by service type and subscription - TEMPORARILY DISABLED FOR DIAGNOSTICS
+    // Filter candidates
     const candidates = [];
     for (const driver of (nearbyDrivers || [])) {
-      // ✅ TEMPORARILY DISABLED: Check if driver supports this service type
       const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
-      if (!supportsService) {
-        console.log(`   ❌ Driver ${driver._id} doesn't support ${serviceType}`);
-        console.log(`   ❌ Driver categories: ${driver.driverProfile?.serviceCategories?.join(', ') || 'none'}`);
-        console.log(`   ❌ Requested service: ${serviceType}`);
-        
-        // ⚠️ TEMPORARY: Comment out this continue to include ALL drivers for testing
-        // continue;
-        console.log(`   ⚠️ INCLUDING ANYWAY FOR DIAGNOSTICS`);
-      }
-
-      // ✅ TEMPORARILY DISABLED: Check subscription (except for luxury)
+      
       if (!isLuxury(serviceType)) {
         const sub = driver.subscription;
         if (!sub?.expiresAt || new Date(sub.expiresAt) <= now) {
-          console.log(`   ❌ Driver ${driver._id} has expired subscription`);
-          console.log(`   ❌ Subscription: ${JSON.stringify(sub)}`);
-          console.log(`   ❌ Current time: ${now}`);
-          console.log(`   ❌ Expires at: ${sub?.expiresAt}`);
-          
-          // ⚠️ TEMPORARY: Comment out this continue to include ALL drivers for testing
-          // continue;
-          console.log(`   ⚠️ INCLUDING ANYWAY FOR DIAGNOSTICS`);
-        } else {
-          console.log(`   ✅ Driver ${driver._id} has valid subscription until ${sub.expiresAt}`);
+          console.log(`   ⚠️ Driver ${driver._id} subscription expired`);
+          continue;
         }
-      } else {
-        console.log(`   ✅ Luxury ride, skipping subscription check for driver ${driver._id}`);
       }
 
       candidates.push({ 
         driverId: driver._id, 
-        status: 'pending',  // Will be updated to 'offered' for first driver before saving
+        status: 'pending',
         driverName: driver.name,
-        offeredAt: null  // ✅ FIX 1: Add offeredAt field
+        offeredAt: null
       });
-      console.log(`   ✅ Added driver ${driver._id} to candidates`);
     }
 
     console.log(`✅ ${candidates.length} drivers qualified as candidates`);
-
-    // ✅ DIAGNOSTIC: If no candidates but we found nearby drivers, something is wrong
-    if (candidates.length === 0 && nearbyDrivers && nearbyDrivers.length > 0) {
-      console.log(`❌ CRITICAL: Found ${nearbyDrivers.length} nearby drivers but 0 candidates!`);
-      console.log(`❌ Possible issues:`);
-      console.log(`   - Service type mismatch? Requested: ${serviceType}`);
-      console.log(`   - Subscription issues?`);
-      console.log(`   - Filtering too strict?`);
-    }
 
     let tripRequest;
     if (candidates.length === 0) {
       tripRequest = await TripRequest.create({
         passengerId,
         pickup,
-        dropoff,  // ✅ NEW: Store dropoff
+        dropoff,
         serviceType,
         paymentMethod,
-        estimatedFare: estimatedFare || 0,  // ✅ NEW: Store fare
-        distance: distance || 0,  // ✅ NEW: Store distance
-        duration: duration || 0,  // ✅ NEW: Store duration
-        pickupAddress: pickupAddress || '',  // ✅ NEW: Store addresses
+        estimatedFare: estimatedFare || 0,
+        distance: distance || 0,
+        duration: duration || 0,
+        pickupAddress: pickupAddress || '',
         dropoffAddress: dropoffAddress || '',
         candidates: [],
         status: 'no_drivers',
@@ -245,91 +258,53 @@ router.post('/request', requireAuth, async (req, res, next) => {
         userId: passengerId,
         type: 'no_driver_found',
         title: 'No Drivers Available',
-        body: `No ${serviceType} drivers are available at this time. Please try again later.`,
+        body: `No ${serviceType} drivers are available at this time.`,
         data: { requestId: tripRequest._id }
       });
 
-      console.log(`❌ No qualified drivers found for ${serviceType} ride`);
+      console.log(`❌ No qualified drivers found`);
       return res.json({ 
         requestId: tripRequest._id, 
-        message: 'No drivers available',
-        debug: {
-          totalDrivers,
-          verifiedDrivers,
-          availableDrivers,
-          recentDrivers,
-          nearbyFound: nearbyDrivers?.length || 0,
-          qualifiedCandidates: 0,
-          timestamp: now.toISOString(),
-          serviceType: serviceType
-        }
+        message: 'No drivers available'
       });
     }
 
-    // ✅ FIX 2: Immediately promote first candidate BEFORE saving
+    // Offer to first driver immediately
     if (candidates.length > 0) {
       candidates[0].status = 'offered';
       candidates[0].offeredAt = new Date();
-      console.log(`✅ Immediately offered trip to first driver: ${candidates[0].driverId} (${candidates[0].driverName})`);
     }
 
     tripRequest = await TripRequest.create({
       passengerId,
       pickup,
-      dropoff,  // ✅ NEW: Store dropoff
+      dropoff,
       serviceType,
       paymentMethod,
-      estimatedFare: estimatedFare || 0,  // ✅ NEW: Store fare
-      distance: distance || 0,  // ✅ NEW: Store distance
-      duration: duration || 0,  // ✅ NEW: Store duration
-      pickupAddress: pickupAddress || '',  // ✅ NEW: Store addresses
+      estimatedFare: estimatedFare || 0,
+      distance: distance || 0,
+      duration: duration || 0,
+      pickupAddress: pickupAddress || '',
       dropoffAddress: dropoffAddress || '',
       candidates,
       status: 'searching',
       expiresAt: new Date(now.getTime() + 5 * 60 * 1000)
     });
 
-    console.log(`✅ Trip request ${tripRequest._id} created with ${candidates.length} candidates`);
-    console.log(`   Fare: ₦${estimatedFare}, Distance: ${distance}km, Duration: ${duration}s`);
-    console.log(`   First driver ${candidates[0]?.driverId} already has status: ${candidates[0]?.status}`);
+    console.log(`✅ Trip request ${tripRequest._id} created`);
 
-    // Send trip request to ALL qualified drivers with COMPLETE trip details
+    // Send notifications to drivers
     candidates.forEach(candidate => {
-      console.log(`📤 Sending trip offer to driver ${candidate.driverId} (${candidate.driverName}) - Status: ${candidate.status}`);
-      
-      // Base notification for all drivers
-      emitter.emit('notification', {
-        userId: candidate.driverId.toString(),
-        type: 'trip:new_request',
-        title: 'New Trip Request',
-        body: `New ${serviceType} ride nearby`,
-        data: {
-          tripId: tripRequest._id,
-          requestId: tripRequest._id,
-          passengerId: passengerId,
-          pickup: pickup,
-          dropoff: dropoff,  // ✅ NEW: Include dropoff
-          serviceType: serviceType,
-          fare: estimatedFare || 0,  // ✅ NEW: Include fare
-          distance: distance || 0,  // ✅ NEW: Include distance
-          duration: duration || 0,  // ✅ NEW: Include duration
-          pickupAddress: pickupAddress || '',  // ✅ NEW: Include addresses
-          dropoffAddress: dropoffAddress || '',
-          candidateIndex: candidates.findIndex(c => c.driverId.toString() === candidate.driverId.toString())
-        }
-      });
-
-      // Only send immediate offer notification to the first driver
       if (candidate.status === 'offered') {
         emitter.emit('notification', {
           userId: candidate.driverId.toString(),
           type: 'trip_offered',
           title: 'New Trip Request',
-          body: `New ${serviceType} ride nearby - Accept within 20 seconds`,
+          body: `New ${serviceType} ride - Accept within 20 seconds`,
           data: {
             requestId: tripRequest._id,
             serviceType: serviceType,
-            fare: estimatedFare || 0,  // ✅ NEW: Include fare in offer
+            fare: estimatedFare || 0,
             distance: distance || 0,
             duration: duration || 0,
             pickup: pickup,
@@ -339,23 +314,17 @@ router.post('/request', requireAuth, async (req, res, next) => {
             immediateOffer: true
           }
         });
-        console.log(`   📨 Sent immediate offer notification to driver ${candidate.driverId} with fare ₦${estimatedFare}`);
       }
     });
 
-    // ✅ FIX 3: DO NOT call offerToNext() immediately - First driver is already offered
-    // Only schedule the timeout for the first driver
+    // Timeout for first driver
     if (candidates.length > 0 && candidates[0].status === 'offered') {
       const firstDriverId = candidates[0].driverId;
-      console.log(`⏱️ Scheduling 20-second timeout for driver ${firstDriverId}`);
       
       setTimeout(async () => {
         try {
           const fresh = await TripRequest.findById(tripRequest._id);
-          if (!fresh || fresh.status !== 'searching') {
-            console.log(`⏱️ Trip ${tripRequest._id} no longer searching, skipping timeout`);
-            return;
-          }
+          if (!fresh || fresh.status !== 'searching') return;
 
           const cand = fresh.candidates.find(c => c.driverId.toString() === firstDriverId.toString());
           if (cand && cand.status === 'offered') {
@@ -364,11 +333,10 @@ router.post('/request', requireAuth, async (req, res, next) => {
             cand.rejectionReason = 'timeout';
             await fresh.save();
             
-            console.log(`⏱️ First driver ${firstDriverId} timeout, moving to next candidate`);
-            await offerToNext(tripRequest._id); // Now we call offerToNext for next driver
+            await offerToNext(tripRequest._id);
           }
-        } catch (timeoutErr) {
-          console.error('❌ Error in timeout handler:', timeoutErr);
+        } catch (err) {
+          console.error('Timeout error:', err);
         }
       }, 20000);
     }
@@ -377,137 +345,39 @@ router.post('/request', requireAuth, async (req, res, next) => {
       requestId: tripRequest._id, 
       candidatesCount: candidates.length,
       message: `Searching ${candidates.length} drivers`,
-      immediateOffer: candidates.length > 0,
-      estimatedFare: estimatedFare || 0,  // ✅ NEW: Return fare in response
-      distance: distance || 0,
-      duration: duration || 0,
-      debug: {
-        nearbyDriversCount: nearbyDrivers?.length || 0,
-        candidates: candidates.map(c => ({
-          driverId: c.driverId,
-          status: c.status,
-          driverName: c.driverName
-        })),
-        firstDriverOffered: candidates.length > 0 ? candidates[0].driverId : null
-      }
+      estimatedFare: estimatedFare || 0
     });
   } catch (err) {
-    console.error('❌ Trip request creation error:', err);
+    console.error('❌ Trip request error:', err);
     next(err);
   }
 });
 
-// Helper function for manual distance calculation (Haversine formula)
-function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371000; // Earth's radius in meters
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLon/2) * Math.sin(dLon/2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  const distance = R * c;
-  return distance;
-}
+// ==========================================
+// OFFER TO NEXT DRIVER
+// ==========================================
 
-function toRad(degrees) {
-  return degrees * Math.PI / 180;
-}
-
-// Helper function for manual distance calculation (Haversine formula)
-function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371000; // Earth's radius in meters
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  
-  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-            Math.sin(dLon/2) * Math.sin(dLon/2);
-  
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  const distance = R * c;
-  
-  return distance;
-}
-
-function toRad(degrees) {
-  return degrees * Math.PI / 180;
-}
-
-// GET TRIP REQUEST STATUS (for polling)
-router.get('/request/:requestId', requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user.sub;
-    const { requestId } = req.params;
-
-    console.log(`🔍 Polling trip request ${requestId} for user ${userId}`);
-
-    const tripRequest = await TripRequest.findById(requestId)
-      .populate('passengerId', 'name phone')
-      .populate('assignedDriverId', 'name phone driverProfile')
-      .lean();
-
-    if (!tripRequest) {
-      console.log(`❌ Trip request ${requestId} not found`);
-      return res.status(404).json({ error: { message: 'Trip request not found' } });
-    }
-
-    if (tripRequest.passengerId._id.toString() !== userId) {
-      console.log(`❌ Unauthorized access to trip request ${requestId}`);
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
-    }
-
-    let trip = null;
-    if (tripRequest.status === 'assigned' && tripRequest.assignedDriverId) {
-      trip = await Trip.findOne({
-        tripRequestId: tripRequest._id
-      }).lean();
-    }
-
-    console.log(`✅ Trip request ${requestId} status: ${tripRequest.status}`);
-
-    res.json({
-      trip: {
-        ...tripRequest,
-        _id: trip?._id || tripRequest._id,
-        status: trip?.status || tripRequest.status,
-        assignedDriverId: tripRequest.assignedDriverId
-      }
-    });
-  } catch (err) {
-    console.error('❌ Error fetching trip request:', err);
-    next(err);
-  }
-});
-
-// Offer to next pending driver (used after rejection/timeout)
 async function offerToNext(requestId) {
   try {
-    console.log(`🔄 offerToNext called for request ${requestId}`);
+    console.log(`🔄 offerToNext for ${requestId}`);
     
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
-      console.log(`⚠️ Trip request ${requestId} not in searching state`);
+      tripRejectionCounts.delete(requestId.toString());
       return;
+    }
+
+    // ✅ Check rejection count BEFORE offering to next
+    const shouldCleanup = trackRejection(requestId);
+    if (shouldCleanup) {
+      return; // Cleanup already triggered, stop here
     }
 
     const nextCandidate = tripRequest.candidates.find(c => c.status === 'pending');
     
     if (!nextCandidate) {
-      console.log(`⚠️ No pending candidates for ${requestId}`);
-      
-      tripRequest.status = 'no_drivers';
-      await tripRequest.save();
-
-      emitter.emit('notification', {
-        userId: tripRequest.passengerId,
-        type: 'no_driver_found',
-        title: 'No drivers available',
-        body: 'Please try again later',
-        data: { requestId: tripRequest._id }
-      });
-
-      console.log(`❌ No more drivers for ${requestId}`);
+      console.log(`⚠️ No more candidates for ${requestId}`);
+      await cleanupFailedTripRequest(requestId);
       return;
     }
 
@@ -516,26 +386,34 @@ async function offerToNext(requestId) {
     await tripRequest.save();
 
     const driverId = nextCandidate.driverId;
-    console.log(`📤 Offering trip ${requestId} to driver ${driverId}`);
+    const attemptNum = (tripRejectionCounts.get(requestId.toString()) || 0) + 1;
+    console.log(`📤 Offering to driver ${driverId} (Attempt ${attemptNum}/5)`);
 
     emitter.emit('notification', {
       userId: driverId.toString(),
       type: 'trip_offered',
-      title: 'Trip Offer Available',
+      title: 'New Trip Request',
       body: `New ${tripRequest.serviceType} ride - Accept within 20 seconds`,
       data: {
         requestId: tripRequest._id,
         serviceType: tripRequest.serviceType,
-        immediateOffer: true,
-        candidateIndex: tripRequest.candidates.findIndex(c => c.driverId.toString() === driverId.toString())
+        fare: tripRequest.estimatedFare || 0,
+        distance: tripRequest.distance || 0,
+        duration: tripRequest.duration || 0,
+        pickup: tripRequest.pickup,
+        dropoff: tripRequest.dropoff,
+        pickupAddress: tripRequest.pickupAddress || '',
+        dropoffAddress: tripRequest.dropoffAddress || '',
+        immediateOffer: true
       }
     });
 
+    // Timeout for this driver
     setTimeout(async () => {
       try {
         const fresh = await TripRequest.findById(requestId);
         if (!fresh || fresh.status !== 'searching') {
-          console.log(`⏱️ Trip ${requestId} no longer searching, skipping timeout`);
+          tripRejectionCounts.delete(requestId.toString());
           return;
         }
 
@@ -546,29 +424,72 @@ async function offerToNext(requestId) {
           cand.rejectionReason = 'timeout';
           await fresh.save();
           
-          console.log(`⏱️ Driver ${driverId} timeout, moving to next candidate`);
           await offerToNext(requestId);
         }
-      } catch (timeoutErr) {
-        console.error('❌ Error in timeout handler:', timeoutErr);
+      } catch (err) {
+        console.error('Timeout error:', err);
       }
     }, 20000);
   } catch (err) {
-    console.error('❌ Error in offerToNext:', err);
+    console.error('❌ offerToNext error:', err);
+    tripRejectionCounts.delete(requestId.toString());
   }
 }
 
-// DRIVER: ACCEPT TRIP
+// ==========================================
+// GET /trips/request/:requestId - POLL STATUS
+// ==========================================
+
+router.get('/request/:requestId', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const { requestId } = req.params;
+
+    const tripRequest = await TripRequest.findById(requestId)
+      .populate('passengerId', 'name phone')
+      .populate('assignedDriverId', 'name phone driverProfile')
+      .lean();
+
+    if (!tripRequest) {
+      return res.status(404).json({ error: { message: 'Trip request not found' } });
+    }
+
+    if (tripRequest.passengerId._id.toString() !== userId) {
+      return res.status(403).json({ error: { message: 'Unauthorized' } });
+    }
+
+    let trip = null;
+    if (tripRequest.status === 'assigned' && tripRequest.assignedDriverId) {
+      trip = await Trip.findOne({ tripRequestId: tripRequest._id }).lean();
+    }
+
+    res.json({
+      trip: {
+        ...tripRequest,
+        _id: trip?._id || tripRequest._id,
+        status: trip?.status || tripRequest.status,
+        assignedDriverId: tripRequest.assignedDriverId
+      }
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// POST /trips/accept - DRIVER ACCEPTS
+// ==========================================
+
 router.post('/accept', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const { requestId } = req.body;
 
-    console.log(`🤝 Driver ${driverId} attempting to accept trip ${requestId}`);
+    console.log(`🤝 Driver ${driverId} accepting ${requestId}`);
 
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
-      console.log(`❌ Trip ${requestId} no longer available or not in searching state`);
+      tripRejectionCounts.delete(requestId.toString());
       return res.status(400).json({ error: { message: 'Trip no longer available' } });
     }
 
@@ -577,11 +498,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
-      console.log(`❌ Driver ${driverId} was not offered trip ${requestId}`);
-      console.log(`   Available candidates:`, tripRequest.candidates.map(c => ({
-        driverId: c.driverId,
-        status: c.status
-      })));
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
@@ -594,12 +510,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       candidate.status = 'accepted';
       await tripRequest.save({ session });
 
-      const fareData = await calculateFare({
-        serviceType: tripRequest.serviceType,
-        distanceKm: 0,
-        durationMinutes: 0
-      });
-
       const tripDoc = await Trip.create([{
         passengerId: tripRequest.passengerId,
         driverId,
@@ -607,8 +517,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
         serviceType: tripRequest.serviceType,
         paymentMethod: tripRequest.paymentMethod,
         pickupLocation: tripRequest.pickup,
+        dropoffLocation: tripRequest.dropoff,
         status: 'assigned',
-        estimatedFare: fareData.baseAmount,
+        estimatedFare: tripRequest.estimatedFare || 0,
+        distanceKm: tripRequest.distance || 0,
+        durationMinutes: Math.round((tripRequest.duration || 0) / 60),
         requestedAt: new Date()
       }], { session });
 
@@ -622,7 +535,10 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     await session.endSession();
 
-    console.log(`✅ Driver ${driverId} accepted trip ${tripRequest._id}, created Trip ${newTrip._id}`);
+    // ✅ Clear tracking - trip accepted successfully
+    tripRejectionCounts.delete(requestId.toString());
+
+    console.log(`✅ Trip accepted, created ${newTrip._id}`);
 
     emitter.emit('notification', {
       userId: tripRequest.passengerId.toString(),
@@ -636,40 +552,31 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       }
     });
 
-    emitter.emit('notification', {
-      userId: driverId,
-      type: 'trip_accepted',
-      title: 'Trip Accepted',
-      body: 'Go to pickup location',
-      data: {
-        requestId: tripRequest._id.toString(),
-        tripId: newTrip._id.toString()
-      }
-    });
-
     res.json({
       success: true,
-      message: 'Trip accepted and created',
       tripId: newTrip._id,
       requestId: tripRequest._id
     });
   } catch (err) {
-    console.error('❌ Error accepting trip:', err);
+    console.error('❌ Accept error:', err);
     next(err);
   }
 });
 
-// DRIVER: REJECT TRIP
+// ==========================================
+// POST /trips/reject - DRIVER REJECTS
+// ==========================================
+
 router.post('/reject', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const { requestId } = req.body;
 
-    console.log(`🚫 Driver ${driverId} attempting to reject trip ${requestId}`);
+    console.log(`🚫 Driver ${driverId} rejecting ${requestId}`);
 
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
-      console.log(`❌ Trip ${requestId} no longer searching`);
+      tripRejectionCounts.delete(requestId.toString());
       return res.status(400).json({ error: { message: 'Trip no longer searching' } });
     }
 
@@ -678,7 +585,6 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
-      console.log(`❌ Driver ${driverId} was not offered trip ${requestId}`);
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
@@ -687,21 +593,22 @@ router.post('/reject', requireAuth, async (req, res, next) => {
     candidate.rejectionReason = 'manual_rejection';
     await tripRequest.save();
 
-    console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
-    await offerToNext(requestId); // Now offer to next driver
+    console.log(`❌ Driver rejected, moving to next`);
+    
+    // ✅ This will track rejection and potentially cleanup
+    await offerToNext(requestId);
 
     res.json({ success: true });
   } catch (err) {
-    console.error('❌ Error rejecting trip:', err);
+    console.error('❌ Reject error:', err);
     next(err);
   }
 });
 
-// ========================
+// ==========================================
 // TRIP LIFECYCLE ENDPOINTS
-// ========================
+// ==========================================
 
-// Start trip (driver)
 router.post('/:tripId/start', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
@@ -709,15 +616,10 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
 
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
     if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Unauthorized' } });
-    if (!['assigned', 'pending'].includes(trip.status)) {
-      return res.status(400).json({ error: { message: 'Trip cannot be started from current state' } });
-    }
 
     trip.status = 'started';
     trip.startedAt = new Date();
     await trip.save();
-
-    console.log(`🚗 Trip ${trip._id} started by driver ${driverId}`);
 
     emitter.emit('notification', {
       userId: trip.passengerId.toString(),
@@ -733,60 +635,22 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
   }
 });
 
-// Update trip progress (driver only)
-router.patch('/:tripId/progress', requireAuth, async (req, res, next) => {
-  try {
-    const driverId = req.user.sub;
-    const { status, distanceKm, durationMinutes, dropoffLocation } = req.body;
-
-    const trip = await Trip.findById(req.params.tripId);
-    if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-    if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Only driver can update' } });
-    if (['completed', 'cancelled'].includes(trip.status)) {
-      return res.status(400).json({ error: { message: 'Trip already finished' } });
-    }
-
-    if (status && ['started', 'in_progress'].includes(status)) trip.status = status;
-    if (typeof distanceKm === 'number' && distanceKm >= 0) trip.distanceKm = distanceKm;
-    if (typeof durationMinutes === 'number' && durationMinutes >= 0) trip.durationMinutes = durationMinutes;
-    if (dropoffLocation && validateCoordinates(dropoffLocation.coordinates)) {
-      trip.dropoffLocation = { type: 'Point', coordinates: dropoffLocation.coordinates };
-    }
-
-    await trip.save();
-    res.json({ trip });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Complete trip (driver) — full payment processing
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId);
 
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-    if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Only driver can complete' } });
-    if (['completed', 'cancelled'].includes(trip.status)) {
-      return res.status(400).json({ error: { message: 'Trip already finished' } });
-    }
-
-    // Calculate final fare
-    const pickupCoords = trip.pickupLocation?.coordinates || null;
-    const dropoffCoords = trip.dropoffLocation?.coordinates || null;
+    if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Unauthorized' } });
 
     const fareData = await calculateFare({
       serviceType: trip.serviceType,
       distanceKm: trip.distanceKm,
-      durationMinutes: trip.durationMinutes,
-      pickupCoordinates: pickupCoords,
-      dropoffCoordinates: dropoffCoords
+      durationMinutes: trip.durationMinutes
     });
 
     trip.finalFare = fareData.baseAmount;
 
-    // Commission for luxury only
     let commission = 0;
     if (isLuxury(trip.serviceType)) {
       const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
@@ -797,71 +661,14 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
     trip.commission = commission;
     trip.driverEarnings = trip.finalFare - commission;
 
-    // Payment handling
-    if (trip.paymentMethod === 'cash') {
-      await Transaction.create({
-        userId: trip.passengerId,
-        type: 'trip_payment',
-        amount: trip.finalFare,
-        reference: trip._id,
-        status: 'pending',
-        meta: { driverId, serviceType: trip.serviceType, collectionMethod: 'cash' }
-      });
+    if (trip.paymentMethod === 'wallet') {
+      const passengerWallet = await Wallet.findOne({ owner: trip.passengerId }).lean();
+      if (!passengerWallet || passengerWallet.balance < trip.finalFare) {
+        return res.status(402).json({ error: { message: 'Insufficient balance' } });
+      }
 
-      trip.status = 'completed';
-      trip.completedAt = new Date();
-      await trip.save();
-
-      await User.findByIdAndUpdate(driverId, {
-        'driverProfile.isAvailable': true,
-        $unset: { 'driverProfile.currentTripId': '' }
-      });
-
-      emitter.emit('notification', {
-        userId: trip.passengerId.toString(),
-        type: 'trip_completed',
-        title: 'Trip completed (cash)',
-        body: `Pay driver ₦${Math.floor(trip.finalFare / 100)}`,
-        data: { tripId: trip._id }
-      });
-
-      emitter.emit('notification', {
-        userId: driverId,
-        type: 'trip_completed',
-        title: 'Confirm cash',
-        body: 'Confirm collection via /confirm-cash',
-        data: { tripId: trip._id }
-      });
-
-      return res.json({ trip, fareDetail: { finalFare: trip.finalFare, commission, driverEarnings: trip.driverEarnings } });
-    }
-
-    // Wallet payment
-    const passengerWallet = await Wallet.findOne({ owner: trip.passengerId }).lean();
-    if (!passengerWallet || passengerWallet.balance < trip.finalFare) {
-      return res.status(402).json({ error: { message: 'Insufficient wallet balance' } });
-    }
-
-    await Wallet.findOneAndUpdate({ owner: trip.passengerId }, { $inc: { balance: -trip.finalFare } });
-    await Wallet.findOneAndUpdate({ owner: driverId }, { $inc: { balance: trip.driverEarnings } }, { upsert: true });
-
-    await Transaction.create({
-      userId: trip.passengerId,
-      type: 'trip_payment',
-      amount: trip.finalFare,
-      reference: trip._id,
-      status: 'success',
-      meta: { driverId, serviceType: trip.serviceType }
-    });
-
-    if (commission > 0) {
-      await Transaction.create({
-        userId: null,
-        type: 'commission',
-        amount: commission,
-        reference: trip._id,
-        status: 'success'
-      });
+      await Wallet.findOneAndUpdate({ owner: trip.passengerId }, { $inc: { balance: -trip.finalFare } });
+      await Wallet.findOneAndUpdate({ owner: driverId }, { $inc: { balance: trip.driverEarnings } }, { upsert: true });
     }
 
     trip.status = 'completed';
@@ -873,31 +680,12 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
       $unset: { 'driverProfile.currentTripId': '' }
     });
 
-    console.log(`✅ Trip ${trip._id} completed`);
-
-    emitter.emit('notification', {
-      userId: trip.passengerId.toString(),
-      type: 'trip_completed',
-      title: 'Trip completed',
-      body: `Charged ₦${Math.floor(trip.finalFare / 100)}`,
-      data: { tripId: trip._id }
-    });
-
-    emitter.emit('notification', {
-      userId: driverId,
-      type: 'trip_completed',
-      title: 'Earnings',
-      body: `You earned ₦${Math.floor(trip.driverEarnings / 100)}`,
-      data: { tripId: trip._id }
-    });
-
-    res.json({ trip, fareDetail: { finalFare: trip.finalFare, commission, driverEarnings: trip.driverEarnings } });
+    res.json({ trip });
   } catch (err) {
     next(err);
   }
 });
 
-// Cancel trip (passenger or driver)
 router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
@@ -906,17 +694,9 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
     const trip = await Trip.findById(req.params.tripId);
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
 
-    if (![trip.passengerId.toString(), trip.driverId?.toString()].includes(userId)) {
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
-    }
-
-    if (['completed', 'cancelled'].includes(trip.status)) {
-      return res.status(400).json({ error: { message: 'Trip already finished' } });
-    }
-
     trip.status = 'cancelled';
     trip.cancelledAt = new Date();
-    trip.cancellationReason = reason || 'Cancelled by user';
+    trip.cancellationReason = reason || 'Cancelled';
     await trip.save();
 
     if (trip.driverId) {
@@ -926,118 +706,71 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
       });
     }
 
-    const otherId = trip.passengerId.toString() === userId ? trip.driverId : trip.passengerId;
-    const role = trip.passengerId.toString() === userId ? 'passenger' : 'driver';
-
-    console.log(`❌ Trip ${trip._id} cancelled by ${role}`);
-
-    emitter.emit('notification', {
-      userId: otherId?.toString(),
-      type: 'trip_cancelled',
-      title: 'Trip Cancelled',
-      body: `Cancelled by ${role}. Reason: ${trip.cancellationReason}`,
-      data: { tripId: trip._id }
-    });
-
     res.json({ trip });
   } catch (err) {
     next(err);
   }
 });
 
-// Get single trip
 router.get('/:tripId', requireAuth, async (req, res, next) => {
   try {
-    const userId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId).lean();
-
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-
-    const isParticipant = [trip.passengerId.toString(), trip.driverId?.toString()].includes(userId);
-    const isAdmin = (await User.findById(userId).lean())?.roles?.isAdmin;
-
-    if (!isParticipant && !isAdmin) {
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
-    }
-
     res.json({ trip });
   } catch (err) {
     next(err);
   }
 });
 
-// List user's trips
 router.get('/', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
-    const { role = 'passenger', status, limit = 50, offset = 0 } = req.query;
+    const { role = 'passenger', limit = 50, offset = 0 } = req.query;
 
     const filter = role === 'driver' ? { driverId: userId } : { passengerId: userId };
-    if (status) filter.status = status;
-
     const trips = await Trip.find(filter)
       .sort({ requestedAt: -1 })
       .limit(parseInt(limit))
       .skip(parseInt(offset))
       .lean();
 
-    const total = await Trip.countDocuments(filter);
-
-    res.json({ trips, total, limit: parseInt(limit), offset: parseInt(offset) });
+    res.json({ trips, total: await Trip.countDocuments(filter) });
   } catch (err) {
     next(err);
   }
 });
 
-// Driver confirms cash collection
-router.post('/:tripId/confirm-cash', requireAuth, async (req, res, next) => {
-  try {
-    const driverId = req.user.sub;
-    const trip = await Trip.findById(req.params.tripId);
+// ==========================================
+// PERIODIC CLEANUP JOB
+// ==========================================
 
-    if (!trip || trip.driverId.toString() !== driverId) {
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
-    }
+function startPeriodicCleanup() {
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      
+      // Cleanup expired searching requests
+      const expired = await TripRequest.find({
+        status: 'searching',
+        expiresAt: { $lt: now }
+      }).lean();
 
-    if (trip.paymentMethod !== 'cash') {
-      return res.status(400).json({ error: { message: 'Not a cash trip' } });
-    }
+      for (const req of expired) {
+        await cleanupFailedTripRequest(req._id);
+      }
 
-    const pendingTx = await Transaction.findOne({
-      reference: trip._id,
-      type: 'trip_payment',
-      status: 'pending'
-    });
-
-    if (!pendingTx) {
-      return res.status(404).json({ error: { message: 'No pending cash transaction' } });
-    }
-
-    pendingTx.status = 'success';
-    pendingTx.meta.collectedByDriver = true;
-    pendingTx.meta.collectedAt = new Date();
-    await pendingTx.save();
-
-    await Wallet.findOneAndUpdate(
-      { owner: driverId },
-      { $inc: { balance: trip.driverEarnings } },
-      { upsert: true }
-    );
-
-    if (trip.commission > 0) {
-      await Transaction.create({
-        userId: null,
-        type: 'commission',
-        amount: trip.commission,
-        reference: trip._id,
-        status: 'success'
+      // Delete old no_drivers requests (older than 10 minutes)
+      await TripRequest.deleteMany({
+        status: 'no_drivers',
+        createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) }
       });
-    }
 
-    res.json({ success: true, message: 'Cash confirmed and earnings credited' });
-  } catch (err) {
-    next(err);
-  }
-});
+    } catch (err) {
+      console.error('Cleanup error:', err);
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+}
+
+startPeriodicCleanup();
 
 module.exports = router;
