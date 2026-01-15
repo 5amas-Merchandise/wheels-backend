@@ -304,11 +304,11 @@ router.post('/request', requireAuth, async (req, res, next) => {
           data: {
             requestId: tripRequest._id,
             serviceType: serviceType,
-            fare: estimatedFare || 0,
+            estimatedFare: estimatedFare || 0,  // ✅ FIX: Send estimatedFare not fare
             distance: distance || 0,
             duration: duration || 0,
             pickup: pickup,
-            dropoff: dropoff,
+            dropoff: dropoff,  // ✅ FIX: Include dropoff for driver visibility
             pickupAddress: pickupAddress || '',
             dropoffAddress: dropoffAddress || '',
             immediateOffer: true
@@ -354,7 +354,7 @@ router.post('/request', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// OFFER TO NEXT DRIVER
+// OFFER TO NEXT DRIVER - WITH REJECTION CHECK
 // ==========================================
 
 async function offerToNext(requestId) {
@@ -373,12 +373,28 @@ async function offerToNext(requestId) {
       return; // Cleanup already triggered, stop here
     }
 
-    const nextCandidate = tripRequest.candidates.find(c => c.status === 'pending');
+    // ✅ FIX 1A: Strictly exclude rejected drivers
+    const nextCandidate = tripRequest.candidates.find(
+      c => c.status === 'pending' && !c.rejectedAt
+    );
     
     if (!nextCandidate) {
       console.log(`⚠️ No more candidates for ${requestId}`);
       await cleanupFailedTripRequest(requestId);
       return;
+    }
+
+    // ✅ FIX 1B: Hard block re-offer to same driver
+    if (tripRequest.candidates.some(
+      c => c.driverId.equals(nextCandidate.driverId) && c.status === 'rejected'
+    )) {
+      console.log(`🚫 Driver ${nextCandidate.driverId} was already rejected, skipping`);
+      // Move this candidate to rejected and try next
+      nextCandidate.status = 'rejected';
+      nextCandidate.rejectedAt = new Date();
+      nextCandidate.rejectionReason = 'already_rejected';
+      await tripRequest.save();
+      return await offerToNext(requestId);
     }
 
     nextCandidate.status = 'offered';
@@ -397,11 +413,11 @@ async function offerToNext(requestId) {
       data: {
         requestId: tripRequest._id,
         serviceType: tripRequest.serviceType,
-        fare: tripRequest.estimatedFare || 0,
+        estimatedFare: tripRequest.estimatedFare || 0,  // ✅ FIX: Send estimatedFare
         distance: tripRequest.distance || 0,
         duration: tripRequest.duration || 0,
         pickup: tripRequest.pickup,
-        dropoff: tripRequest.dropoff,
+        dropoff: tripRequest.dropoff,  // ✅ FIX: Include dropoff
         pickupAddress: tripRequest.pickupAddress || '',
         dropoffAddress: tripRequest.dropoffAddress || '',
         immediateOffer: true
@@ -588,6 +604,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
+    // ✅ FIX 1B: Mark as rejected with timestamp
     candidate.status = 'rejected';
     candidate.rejectedAt = new Date();
     candidate.rejectionReason = 'manual_rejection';

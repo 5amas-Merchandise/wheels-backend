@@ -473,32 +473,21 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
   }
 });
 
-// ✅ FIXED: GET currently offered trip request for the driver (for polling)
-// routes/drivers.js - GET /drivers/offered-request - COMPLETE INTEGRATED VERSION
-
+// ✅ FIX 1C: CRITICAL FIX - GET currently offered trip request for the driver with $elemMatch
 router.get("/offered-request", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     console.log(`🔍 Driver ${driverId} checking for offered requests at ${new Date().toISOString()}`);
 
-    // ✅ CRITICAL FIX: Check both 'searching' and 'assigned' statuses
-    // A trip might be assigned but driver hasn't accepted yet in Trip collection
+    // ✅ CRITICAL FIX: Use $elemMatch to filter ONLY 'offered' status
     const activeRequest = await TripRequest.findOne({
+      status: 'searching',
       candidates: {
         $elemMatch: {
           driverId: driverId,
-          status: "offered",
-        },
-      },
-      // ✅ FIX: Check for 'searching' OR recent 'assigned' trips
-      $or: [
-        { status: "searching" },
-        { 
-          status: "assigned",
-          assignedDriverId: driverId, // Make sure it's assigned to THIS driver
-          createdAt: { $gte: new Date(Date.now() - 5 * 60 * 1000) } // Within last 5 minutes
+          status: "offered"  // ✅ ONLY return if driver has 'offered' status
         }
-      ]
+      }
     })
     .populate("passengerId", "name phone")
     .lean();
@@ -516,7 +505,7 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
-      console.log(`❌ Driver ${driverId} not offered this trip`);
+      console.log(`❌ Driver ${driverId} not offered this trip (candidate mismatch)`);
       return res.status(404).json({ 
         message: "No active offer",
         debug: { 
@@ -535,37 +524,39 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
       status: activeRequest.status,
       offeredAt: candidate.offeredAt,
       passengerName: activeRequest.passengerId?.name,
-      fare: activeRequest.estimatedFare,  // ✅ Log actual fare
+      estimatedFare: activeRequest.estimatedFare,  // ✅ Use estimatedFare from database
       distance: activeRequest.distance,
-      serviceType: activeRequest.serviceType
+      serviceType: activeRequest.serviceType,
+      hasDropoff: !!activeRequest.dropoff
     });
 
-    // ✅ COMPLETE FIX: Return ALL trip details from database
+    // ✅ FIX 2B & 2D: Return complete trip details with correct field names
     const response = {
       request: {
         requestId: activeRequest._id,
         passengerId: activeRequest.passengerId?._id,
         passengerName: activeRequest.passengerId?.name || "Passenger",
         passengerPhone: activeRequest.passengerId?.phone || "",
-        rating: 4.8, // You can add real ratings later
+        rating: 4.8,
         
-        // Location data
+        // ✅ Location data
         pickup: activeRequest.pickup,
-        dropoff: activeRequest.dropoff || null,  // ✅ NEW: Include dropoff
+        dropoff: activeRequest.dropoff || null,  // ✅ Include dropoff for driver visibility
         pickupAddress: activeRequest.pickupAddress || "Pickup location near you",
-        dropoffAddress: activeRequest.dropoffAddress || "Destination will be shared after acceptance",
+        dropoffAddress: activeRequest.dropoffAddress || "Destination nearby",
         
-        // Fare and trip details - ALL FROM DATABASE
-        fare: activeRequest.estimatedFare || 0,  // ✅ FIX: Real fare from database
-        distance: activeRequest.distance || 0,  // ✅ FIX: Real distance
-        duration: activeRequest.duration || 0,  // ✅ FIX: Real duration
+        // ✅ Fare and trip details - Use database fields
+        estimatedFare: activeRequest.estimatedFare || 0,  // ✅ FIX 2B: Send estimatedFare
+        fare: activeRequest.estimatedFare || 0,  // ✅ Also include 'fare' for backward compatibility
+        distance: activeRequest.distance || 0,
+        duration: activeRequest.duration || 0,
         serviceType: activeRequest.serviceType || 'CITY_RIDE',
         
         // Offer timing
         offeredAt: candidate.offeredAt,
-        expiresIn: 20, // 20 seconds timeout
+        expiresIn: 20,
         
-        // ✅ ADDED: Candidate info for debugging
+        // Debug info
         candidateInfo: {
           status: candidate.status,
           offeredAt: candidate.offeredAt,
@@ -574,7 +565,10 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
       },
     };
 
-    console.log(`📤 Returning offer to driver with fare: ₦${response.request.fare}`);
+    console.log(`📤 Returning offer to driver with:
+      - Fare: ₦${response.request.estimatedFare}
+      - Has dropoff: ${!!response.request.dropoff}
+      - Dropoff address: ${response.request.dropoffAddress}`);
     
     res.json(response);
   } catch (err) {
