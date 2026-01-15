@@ -590,10 +590,14 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 // POST /trips/accept - DRIVER ACCEPTS (COMPLETELY FIXED)
 // ==========================================
 
+// ==========================================
+// POST /trips/accept - DRIVER ACCEPTS (COMPLETELY FIXED)
+// ==========================================
+
 router.post('/accept', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
-  let transactionCommitted = false;
-  let tripData;
+  let tripData = null;
+  let notificationData = null;
 
   try {
     await session.withTransaction(async () => {
@@ -602,40 +606,58 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
       console.log(`🤝 Driver ${driverId} attempting to accept ${requestId}`);
 
-      // Check driver availability BEFORE transaction
+      // ✅ Check idempotency FIRST (prevent duplicate accepts)
+      if (idempotencyKey) {
+        const existing = await mongoose.connection.collection('idempotency_keys')
+          .findOne({ key: idempotencyKey });
+        
+        if (existing) {
+          console.log('⚠️ Duplicate request detected via idempotency key');
+          throw new Error('Request already processed');
+        }
+      }
+
+      // ✅ Check driver availability
       const driver = await User.findById(driverId).session(session);
       if (!driver?.driverProfile?.isAvailable || driver.driverProfile.currentTripId) {
         throw new Error('Driver not available or already on a trip');
       }
 
-      // Fetch trip request INSIDE transaction
-      const tripRequest = await TripRequest.findById(requestId).session(session);
-      if (!tripRequest || tripRequest.status !== 'searching') {
+      // ✅ ATOMIC: Find and update trip request in ONE operation
+      const tripRequest = await TripRequest.findOneAndUpdate(
+        {
+          _id: requestId,
+          status: 'searching',
+          assignedDriverId: null, // ⚠️ CRITICAL: Only if not already assigned
+          'candidates': {
+            $elemMatch: {
+              driverId: driverId,
+              status: 'offered'
+            }
+          }
+        },
+        {
+          $set: {
+            assignedDriverId: driverId,
+            status: 'assigned',
+            'candidates.$[elem].status': 'accepted'
+          }
+        },
+        {
+          arrayFilters: [{ 'elem.driverId': driverId }],
+          new: true,
+          session
+        }
+      );
+
+      if (!tripRequest) {
+        console.log(`❌ Driver ${driverId} cannot accept - trip unavailable or already assigned`);
         throw new Error('Trip no longer available');
       }
 
-      // ✅ HARD UNIQUENESS GUARD - PREVENT RACE CONDITION
-      if (tripRequest.assignedDriverId) {
-        throw new Error('Trip already assigned to another driver');
-      }
+      console.log(`✅ Trip ${requestId} atomically assigned to driver ${driverId}`);
 
-      // Check candidate status INSIDE transaction
-      const candidate = tripRequest.candidates.find(
-        c => c.driverId.toString() === driverId && c.status === 'offered'
-      );
-
-      if (!candidate) {
-        console.log(`❌ Driver ${driverId} not offered trip ${requestId}`);
-        throw new Error('You were not offered this trip');
-      }
-
-      // Update trip request INSIDE transaction
-      tripRequest.assignedDriverId = driverId;
-      tripRequest.status = 'assigned';
-      candidate.status = 'accepted';
-      await tripRequest.save({ session });
-
-      // Create trip INSIDE transaction
+      // ✅ Create trip document
       const tripDoc = await Trip.create([{
         passengerId: tripRequest.passengerId,
         driverId,
@@ -653,7 +675,7 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
       const newTrip = tripDoc[0];
 
-      // Update driver availability INSIDE transaction
+      // ✅ Update driver availability
       await User.findByIdAndUpdate(
         driverId,
         {
@@ -663,73 +685,92 @@ router.post('/accept', requireAuth, async (req, res, next) => {
         { session }
       );
 
-      // Add idempotency check if key provided
+      // ✅ Store idempotency key
       if (idempotencyKey) {
-        // Store idempotency key in trip or separate collection
         await mongoose.connection.collection('idempotency_keys').insertOne({
           key: idempotencyKey,
           tripId: newTrip._id,
+          requestId: tripRequest._id,
+          driverId: driverId,
           createdAt: new Date(),
-          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
         }, { session });
       }
 
-      // Store data for response and events
+      // ✅ Prepare response data BEFORE committing
       tripData = {
-        requestId: tripRequest._id.toString(),
+        success: true,
         tripId: newTrip._id.toString(),
-        passengerId: tripRequest.passengerId.toString(),
-        driverId: driverId.toString(),
-        driverName: driver.name,
-        serviceType: tripRequest.serviceType,
-        estimatedFare: tripRequest.estimatedFare || 0
+        requestId: tripRequest._id.toString()
       };
 
-      await session.commitTransaction();
-      transactionCommitted = true;
+      // ✅ Prepare notification data
+      notificationData = {
+        passengerId: tripRequest.passengerId.toString(),
+        driverId: driverId.toString(),
+        tripId: newTrip._id.toString(),
+        requestId: tripRequest._id.toString(),
+        driverName: driver.name,
+        serviceType: tripRequest.serviceType,
+        estimatedFare: tripRequest.estimatedFare || 0,
+        pickup: tripRequest.pickup,
+        dropoff: tripRequest.dropoff,
+        pickupAddress: tripRequest.pickupAddress || '',
+        dropoffAddress: tripRequest.dropoffAddress || ''
+      };
 
-      console.log(`✅ Trip accepted, created ${newTrip._id}`);
+      console.log(`✅ Trip ${newTrip._id} created successfully`);
     });
 
-    // ✅ Send response AFTER transaction is committed
-    res.json({
-      success: true,
-      tripId: tripData.tripId,
-      requestId: tripData.requestId
-    });
+    // ✅✅✅ SEND RESPONSE ONLY AFTER TRANSACTION COMMITS
+    res.json(tripData);
 
-    // ✅ Send notifications AFTER response with error handling
-    try {
-      emitter.emit('notification', {
-        userId: tripData.passengerId,
-        type: 'trip_accepted',
-        title: 'Driver Accepted!',
-        body: `Your driver ${tripData.driverName} is on the way`,
-        data: {
-          requestId: tripData.requestId,
-          tripId: tripData.tripId,
-          driverId: tripData.driverId,
-          driverName: tripData.driverName,
-          serviceType: tripData.serviceType,
-          estimatedFare: tripData.estimatedFare
+    // ✅ Send notifications AFTER response (non-blocking)
+    if (notificationData) {
+      // Small delay to ensure transaction is fully committed
+      setTimeout(() => {
+        try {
+          // Notify passenger
+          emitter.emit('notification', {
+            userId: notificationData.passengerId,
+            type: 'trip_accepted',
+            notificationType: 'trip_accepted',
+            title: 'Driver Accepted!',
+            body: `${notificationData.driverName} is on the way`,
+            data: {
+              requestId: notificationData.requestId,
+              tripId: notificationData.tripId,
+              driverId: notificationData.driverId,
+              driverName: notificationData.driverName,
+              serviceType: notificationData.serviceType,
+              estimatedFare: notificationData.estimatedFare,
+              pickup: notificationData.pickup,
+              dropoff: notificationData.dropoff,
+              pickupAddress: notificationData.pickupAddress,
+              dropoffAddress: notificationData.dropoffAddress
+            }
+          });
+
+          console.log(`📨 Trip acceptance notification sent to passenger ${notificationData.passengerId}`);
+        } catch (emitErr) {
+          console.error('❌ Notification emit error (non-fatal):', emitErr);
         }
-      });
-    } catch (emitErr) {
-      console.error('❌ Notification emit error (non-fatal):', emitErr);
-      // Don't crash the flow if emit fails
+      }, 100);
     }
 
   } catch (err) {
-    if (!transactionCommitted) {
-      await session.abortTransaction();
-    }
-
+    await session.abortTransaction();
     console.error('❌ Accept error:', err.message);
 
     if (err.message.includes('not available') || 
-        err.message.includes('not offered') ||
-        err.message.includes('already assigned')) {
-      return res.status(400).json({ error: { message: err.message } });
+        err.message.includes('no longer available') ||
+        err.message.includes('already processed')) {
+      return res.status(400).json({ 
+        error: { 
+          message: err.message,
+          code: err.message.includes('already processed') ? 'DUPLICATE_REQUEST' : 'TRIP_UNAVAILABLE'
+        } 
+      });
     }
 
     next(err);
