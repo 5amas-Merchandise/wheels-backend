@@ -1,9 +1,11 @@
-// models/tripRequest.model.js - UPDATED WITH FARE FIELDS
-
 const mongoose = require('mongoose');
 
 const CandidateSchema = new mongoose.Schema({
-  driverId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  driverId: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User', 
+    required: true 
+  },
   driverName: { type: String },
   distanceMeters: { type: Number },
   status: { 
@@ -26,11 +28,11 @@ const TripRequestSchema = new mongoose.Schema({
     type: { type: String, enum: ['Point'], default: 'Point' },
     coordinates: { type: [Number], required: true }
   },
-  dropoff: {  // ✅ FIX: Add dropoff field
+  dropoff: {
     type: { type: String, enum: ['Point'], default: 'Point' },
     coordinates: { type: [Number] }
   },
-  pickupAddress: { type: String },  // ✅ FIX: Add address fields
+  pickupAddress: { type: String },
   dropoffAddress: { type: String },
   serviceType: { type: String, required: true },
   paymentMethod: { 
@@ -38,9 +40,9 @@ const TripRequestSchema = new mongoose.Schema({
     enum: ['wallet', 'cash'], 
     default: 'wallet' 
   },
-  estimatedFare: { type: Number, default: 0 },  // ✅ FIX: Add fare
-  distance: { type: Number, default: 0 },  // ✅ FIX: Add distance (km)
-  duration: { type: Number, default: 0 },  // ✅ FIX: Add duration (seconds)
+  estimatedFare: { type: Number, default: 0 },
+  distance: { type: Number, default: 0 },
+  duration: { type: Number, default: 0 },
   status: { 
     type: String, 
     enum: ['searching', 'assigned', 'no_drivers', 'cancelled'], 
@@ -55,10 +57,14 @@ const TripRequestSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+// ✅ Indexes for better query performance
 TripRequestSchema.index({ pickup: '2dsphere' });
 TripRequestSchema.index({ dropoff: '2dsphere' });
 TripRequestSchema.index({ status: 1 });
 TripRequestSchema.index({ passengerId: 1 });
 TripRequestSchema.index({ createdAt: -1 });
+TripRequestSchema.index({ expiresAt: 1 });
+TripRequestSchema.index({ 'candidates.driverId': 1 });
+TripRequestSchema.index({ 'candidates.status': 1 });
 
 module.exports = mongoose.model('TripRequest', TripRequestSchema);

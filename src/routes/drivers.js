@@ -1,4 +1,3 @@
-// routes/drivers.js - COMPLETE INTEGRATED VERSION (FIXED)
 const express = require("express");
 const router = express.Router();
 const User = require("../models/user.model");
@@ -11,7 +10,7 @@ const DURATION_DAYS = {
   monthly: 30,
 };
 
-// ⚠️ CRITICAL FIX: Update availability and location
+// ✅ FIX 3: CRITICAL - Update availability and always update lastSeen
 router.post("/availability", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user && req.user.sub;
@@ -20,52 +19,45 @@ router.post("/availability", requireAuth, async (req, res, next) => {
 
     const { isAvailable, location } = req.body;
 
-    console.log('📍 Availability update received:', {
+    console.log('📍 Availability update for driver:', {
       userId,
       isAvailable,
-      location,
+      hasLocation: !!location,
       timestamp: new Date().toISOString()
     });
 
-    const update = { "driverProfile.lastSeen": new Date() };
+    // ✅ ALWAYS UPDATE lastSeen - This is critical for driver visibility
+    const update = { 
+      "driverProfile.lastSeen": new Date(),
+      "driverProfile.isAvailable": isAvailable !== undefined ? isAvailable : true
+    };
 
     if (typeof isAvailable === "boolean") {
       update["driverProfile.isAvailable"] = isAvailable;
       console.log(`🔄 Setting driver ${userId} availability to: ${isAvailable}`);
     }
 
-    // ⚠️ FIX: Accept BOTH formats (coordinates array OR location object)
+    // ✅ Handle location updates
     if (location) {
       let coords = null;
       
-      // Format 1: { type: 'Point', coordinates: [lng, lat] }
       if (location.type === 'Point' && Array.isArray(location.coordinates)) {
         coords = location.coordinates;
-      }
-      // Format 2: Direct coordinates array [lng, lat]
-      else if (Array.isArray(location.coordinates) && location.coordinates.length === 2) {
+      } else if (Array.isArray(location.coordinates) && location.coordinates.length === 2) {
         coords = location.coordinates;
-      }
-      // Format 3: Just coordinates array [lng, lat]
-      else if (Array.isArray(location) && location.length === 2) {
+      } else if (Array.isArray(location) && location.length === 2) {
         coords = location;
       }
 
       if (coords && coords.length === 2) {
         const [lng, lat] = coords;
         
-        // Validate coordinate ranges
         if (lng >= -180 && lng <= 180 && lat >= -90 && lat <= 90) {
           update["driverProfile.location"] = {
             type: "Point",
             coordinates: [lng, lat],
           };
           console.log(`📍 Updated driver ${userId} location to: [${lat}, ${lng}]`);
-        } else {
-          console.error(`❌ Invalid coordinates: [${lat}, ${lng}]`);
-          return res.status(400).json({
-            error: { message: 'Invalid coordinate values' }
-          });
         }
       }
     }
@@ -80,11 +72,10 @@ router.post("/availability", requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: { message: 'User not found' } });
     }
 
-    console.log('✅ Driver availability updated successfully:', {
+    console.log('✅ Driver availability updated:', {
       userId,
       isAvailable: user.driverProfile?.isAvailable,
-      hasLocation: !!user.driverProfile?.location,
-      coordinates: user.driverProfile?.location?.coordinates
+      lastSeen: user.driverProfile?.lastSeen
     });
 
     res.json({ 
@@ -97,19 +88,175 @@ router.post("/availability", requireAuth, async (req, res, next) => {
   }
 });
 
-// ⚠️ CRITICAL FIX: Driver location update endpoint (for REST fallback)
+// ✅✅✅ CRITICAL FIX: Get offered request with $elemMatch - FIXED VERSION
+router.get("/offered-request", requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    console.log(`🔍 Driver ${driverId} checking for offered requests`);
+
+    // ✅✅✅ FIXED: Use $elemMatch to find trip where driver is offered
+    const activeRequest = await TripRequest.findOne({
+      status: 'searching',
+      candidates: {
+        $elemMatch: {
+          driverId: driverId,
+          status: "offered"
+        }
+      }
+    })
+    .populate("passengerId", "name phone")
+    .lean();
+
+    if (!activeRequest) {
+      console.log(`❌ No active offer found for driver ${driverId}`);
+      
+      // ✅ Debug: Check what trips this driver is actually in
+      const debugTrips = await TripRequest.find({
+        candidates: {
+          $elemMatch: { driverId: driverId }
+        },
+        createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) }
+      })
+      .select('_id status candidates')
+      .lean();
+      
+      console.log(`🔍 Debug: Driver ${driverId} is in ${debugTrips.length} trips:`);
+      debugTrips.forEach(trip => {
+        const cand = trip.candidates.find(c => c.driverId.toString() === driverId);
+        console.log(`  - Trip ${trip._id}: status=${trip.status}, candidate_status=${cand?.status}`);
+      });
+      
+      return res.status(404).json({ 
+        message: "No active offer",
+        debug: { 
+          driverId, 
+          tripCount: debugTrips.length,
+          timestamp: new Date().toISOString() 
+        }
+      });
+    }
+
+    const candidate = activeRequest.candidates.find(
+      (c) => c.driverId.toString() === driverId && c.status === "offered"
+    );
+
+    if (!candidate) {
+      console.log(`❌ Candidate mismatch for driver ${driverId}`);
+      return res.status(404).json({ 
+        message: "No active offer",
+        debug: { 
+          driverId, 
+          tripStatus: activeRequest.status,
+          allCandidates: activeRequest.candidates.map(c => ({
+            driverId: c.driverId,
+            status: c.status,
+            offeredAt: c.offeredAt
+          }))
+        }
+      });
+    }
+
+    console.log(`✅ Found active offer for driver ${driverId}:`, {
+      requestId: activeRequest._id,
+      passenger: activeRequest.passengerId?.name,
+      fare: activeRequest.estimatedFare,
+      serviceType: activeRequest.serviceType
+    });
+
+    const response = {
+      request: {
+        requestId: activeRequest._id,
+        passengerId: activeRequest.passengerId?._id,
+        passengerName: activeRequest.passengerId?.name || "Passenger",
+        passengerPhone: activeRequest.passengerId?.phone || "",
+        rating: 4.8,
+        
+        // ✅ Location data
+        pickup: activeRequest.pickup,
+        dropoff: activeRequest.dropoff || null,
+        pickupAddress: activeRequest.pickupAddress || "Pickup location near you",
+        dropoffAddress: activeRequest.dropoffAddress || "Destination nearby",
+        
+        // ✅ Fare and trip details
+        estimatedFare: activeRequest.estimatedFare || 0,
+        fare: activeRequest.estimatedFare || 0,
+        distance: activeRequest.distance || 0,
+        duration: activeRequest.duration || 0,
+        serviceType: activeRequest.serviceType || 'CITY_RIDE',
+        
+        // Offer timing
+        offeredAt: candidate.offeredAt,
+        expiresIn: 20,
+        
+        // Candidate info
+        candidateInfo: {
+          status: candidate.status,
+          offeredAt: candidate.offeredAt,
+          driverName: candidate.driverName
+        }
+      },
+    };
+    
+    res.json(response);
+  } catch (err) {
+    console.error('❌ Error in /offered-request:', err);
+    next(err);
+  }
+});
+
+// ✅ NEW: Debug endpoint to see all trips where driver is a candidate
+router.get("/debug/my-offers", requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const trips = await TripRequest.find({
+      candidates: {
+        $elemMatch: { driverId: driverId }
+      },
+      createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) }
+    })
+    .populate("passengerId", "name phone")
+    .select('_id status serviceType estimatedFare pickup dropoff candidates createdAt')
+    .sort({ createdAt: -1 })
+    .lean();
+    
+    const formatted = trips.map(trip => {
+      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
+      return {
+        requestId: trip._id,
+        passengerName: trip.passengerId?.name,
+        serviceType: trip.serviceType,
+        estimatedFare: trip.estimatedFare,
+        tripStatus: trip.status,
+        candidateStatus: candidate?.status,
+        offeredAt: candidate?.offeredAt,
+        rejectedAt: candidate?.rejectedAt,
+        createdAt: trip.createdAt,
+        allCandidates: trip.candidates.map(c => ({
+          driverId: c.driverId,
+          status: c.status,
+          offeredAt: c.offeredAt
+        }))
+      };
+    });
+    
+    res.json({
+      driverId,
+      tripCount: formatted.length,
+      trips: formatted,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Error in /debug/my-offers:', err);
+    next(err);
+  }
+});
+
+// Driver location update endpoint
 router.post('/location', requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const { latitude, longitude, heading } = req.body;
-
-    console.log('📍 Location update received:', {
-      driverId,
-      latitude,
-      longitude,
-      heading,
-      timestamp: new Date().toISOString()
-    });
 
     if (!latitude || !longitude) {
       return res.status(400).json({ 
@@ -131,23 +278,18 @@ router.post('/location', requireAuth, async (req, res, next) => {
         $set: {
           'driverProfile.location': {
             type: 'Point',
-            coordinates: [longitude, latitude] // GeoJSON: [lng, lat]
+            coordinates: [longitude, latitude]
           },
           'driverProfile.heading': heading || 0,
           'driverProfile.lastSeen': new Date()
         }
       },
       { new: true }
-    ).select('driverProfile.location driverProfile.isAvailable');
+    ).select('driverProfile.location driverProfile.isAvailable driverProfile.lastSeen');
 
     if (!updated) {
       return res.status(404).json({ error: { message: 'Driver not found' } });
     }
-
-    console.log(`✅ Driver ${driverId} location updated via REST:`, {
-      coordinates: [latitude, longitude],
-      isAvailable: updated.driverProfile?.isAvailable
-    });
 
     res.json({ 
       success: true,
@@ -190,7 +332,7 @@ router.get('/location', requireAuth, async (req, res, next) => {
   }
 });
 
-// Subscribe or renew subscription (driver action)
+// Subscribe or renew subscription
 router.post("/subscribe", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user && req.user.sub;
@@ -330,17 +472,13 @@ router.post("/service-categories", requireAuth, async (req, res, next) => {
 router.put("/request-verification", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user?.sub;
-    console.log("🚀 === VERIFICATION REQUEST START ===");
-    console.log("User ID:", userId);
 
     if (!userId) {
-      console.log("❌ No user ID found in token");
       return res.status(401).json({ error: { message: "Unauthorized" } });
     }
 
     const existingUser = await User.findById(userId);
     if (!existingUser) {
-      console.log("❌ User not found");
       return res.status(404).json({ error: { message: "User not found" } });
     }
 
@@ -406,15 +544,12 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         name: name.trim(),
         "roles.isDriver": true,
         "roles.isUser": true,
-        "roles.isAdmin": existingUser.roles?.isAdmin || false,
         "driverProfile.vehicleMake": vehicleMake.trim(),
         "driverProfile.vehicleModel": vehicleModel.trim(),
         "driverProfile.vehicleNumber": vehicleNumber.trim().toUpperCase(),
         "driverProfile.nin": nin.trim(),
         "driverProfile.licenseNumber": licenseNumber.trim(),
-        "driverProfile.serviceCategories": Array.isArray(serviceCategories)
-          ? serviceCategories
-          : [serviceCategories],
+        "driverProfile.serviceCategories": serviceCategories,
         "driverProfile.profilePicUrl": profilePicUrl,
         "driverProfile.carPicUrl": carPicUrl,
         "driverProfile.ninImageUrl": ninImageUrl,
@@ -423,38 +558,20 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
         "driverProfile.verified": false,
         "driverProfile.verificationState": "pending",
         "driverProfile.submittedAt": new Date(),
-        "driverProfile.isAvailable":
-          existingUser.driverProfile?.isAvailable !== undefined
-            ? existingUser.driverProfile.isAvailable
-            : true,
-        "driverProfile.location": existingUser.driverProfile?.location
-          ? existingUser.driverProfile.location
-          : { type: "Point", coordinates: [0, 0] },
-        "driverProfile.lastSeen": existingUser.driverProfile?.lastSeen
-          ? existingUser.driverProfile.lastSeen
-          : new Date(),
       },
     };
 
     const updatedUser = await User.findOneAndUpdate(
       { _id: userId },
       updateData,
-      {
-        new: true,
-        runValidators: true,
-        upsert: false,
-        setDefaultsOnInsert: true,
-      }
+      { new: true }
     ).select("name phone roles driverProfile");
 
     if (!updatedUser) {
-      console.log("❌ Failed to update user");
       return res.status(500).json({
         error: { message: "Failed to update user profile" },
       });
     }
-
-    console.log("✅ Driver verification request submitted successfully");
 
     res.json({
       success: true,
@@ -462,9 +579,7 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
       data: {
         userId: updatedUser._id,
         name: updatedUser.name,
-        verificationState:
-          updatedUser.driverProfile?.verificationState || "pending",
-        submittedAt: updatedUser.driverProfile?.submittedAt || new Date(),
+        verificationState: updatedUser.driverProfile?.verificationState || "pending",
       }
     });
   } catch (err) {
@@ -473,111 +588,7 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
   }
 });
 
-// ✅ FIX 1C: CRITICAL FIX - GET currently offered trip request for the driver with $elemMatch
-router.get("/offered-request", requireAuth, async (req, res, next) => {
-  try {
-    const driverId = req.user.sub;
-    console.log(`🔍 Driver ${driverId} checking for offered requests at ${new Date().toISOString()}`);
-
-    // ✅ CRITICAL FIX: Use $elemMatch to filter ONLY 'offered' status
-    const activeRequest = await TripRequest.findOne({
-      status: 'searching',
-      candidates: {
-        $elemMatch: {
-          driverId: driverId,
-          status: "offered"  // ✅ ONLY return if driver has 'offered' status
-        }
-      }
-    })
-    .populate("passengerId", "name phone")
-    .lean();
-
-    if (!activeRequest) {
-      console.log(`❌ No active offer found for driver ${driverId}`);
-      return res.status(404).json({ 
-        message: "No active offer",
-        debug: { driverId, timestamp: new Date().toISOString() }
-      });
-    }
-
-    const candidate = activeRequest.candidates.find(
-      (c) => c.driverId.toString() === driverId && c.status === "offered"
-    );
-
-    if (!candidate) {
-      console.log(`❌ Driver ${driverId} not offered this trip (candidate mismatch)`);
-      return res.status(404).json({ 
-        message: "No active offer",
-        debug: { 
-          driverId, 
-          availableStatuses: activeRequest.candidates.map(c => ({
-            driverId: c.driverId,
-            status: c.status
-          })),
-          tripStatus: activeRequest.status
-        }
-      });
-    }
-
-    console.log(`✅ Found active offer for driver ${driverId}:`, {
-      requestId: activeRequest._id,
-      status: activeRequest.status,
-      offeredAt: candidate.offeredAt,
-      passengerName: activeRequest.passengerId?.name,
-      estimatedFare: activeRequest.estimatedFare,  // ✅ Use estimatedFare from database
-      distance: activeRequest.distance,
-      serviceType: activeRequest.serviceType,
-      hasDropoff: !!activeRequest.dropoff
-    });
-
-    // ✅ FIX 2B & 2D: Return complete trip details with correct field names
-    const response = {
-      request: {
-        requestId: activeRequest._id,
-        passengerId: activeRequest.passengerId?._id,
-        passengerName: activeRequest.passengerId?.name || "Passenger",
-        passengerPhone: activeRequest.passengerId?.phone || "",
-        rating: 4.8,
-        
-        // ✅ Location data
-        pickup: activeRequest.pickup,
-        dropoff: activeRequest.dropoff || null,  // ✅ Include dropoff for driver visibility
-        pickupAddress: activeRequest.pickupAddress || "Pickup location near you",
-        dropoffAddress: activeRequest.dropoffAddress || "Destination nearby",
-        
-        // ✅ Fare and trip details - Use database fields
-        estimatedFare: activeRequest.estimatedFare || 0,  // ✅ FIX 2B: Send estimatedFare
-        fare: activeRequest.estimatedFare || 0,  // ✅ Also include 'fare' for backward compatibility
-        distance: activeRequest.distance || 0,
-        duration: activeRequest.duration || 0,
-        serviceType: activeRequest.serviceType || 'CITY_RIDE',
-        
-        // Offer timing
-        offeredAt: candidate.offeredAt,
-        expiresIn: 20,
-        
-        // Debug info
-        candidateInfo: {
-          status: candidate.status,
-          offeredAt: candidate.offeredAt,
-          driverName: candidate.driverName
-        }
-      },
-    };
-
-    console.log(`📤 Returning offer to driver with:
-      - Fare: ₦${response.request.estimatedFare}
-      - Has dropoff: ${!!response.request.dropoff}
-      - Dropoff address: ${response.request.dropoffAddress}`);
-    
-    res.json(response);
-  } catch (err) {
-    console.error('❌ Error in /offered-request:', err);
-    next(err);
-  }
-});
-
-// ✅ NEW: Get driver's current trip status (if any)
+// Get driver's current trip status
 router.get("/current-trip", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
@@ -590,7 +601,6 @@ router.get("/current-trip", requireAuth, async (req, res, next) => {
       return res.json({ hasCurrentTrip: false });
     }
     
-    // You might want to populate trip details here
     res.json({
       hasCurrentTrip: true,
       tripId: user.driverProfile.currentTripId
@@ -600,7 +610,7 @@ router.get("/current-trip", requireAuth, async (req, res, next) => {
   }
 });
 
-// ✅ NEW: Endpoint for driver to check if they have any pending/offered trips
+// Endpoint for driver to check pending/offered trips
 router.get("/pending-offers", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
@@ -613,7 +623,7 @@ router.get("/pending-offers", requireAuth, async (req, res, next) => {
         }
       },
       status: { $in: ['searching', 'assigned'] },
-      createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) } // Last 10 minutes
+      createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) }
     })
     .select('_id status serviceType pickup candidates')
     .lean();
@@ -640,11 +650,9 @@ router.get("/pending-offers", requireAuth, async (req, res, next) => {
   }
 });
 
-// DEBUG: Get all currently online drivers (NO AUTH)
+// DEBUG: Get all currently online drivers
 router.get('/debug/online', async (req, res) => {
   try {
-    console.log('📡 [DEBUG] Requested online drivers list');
-
     const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
 
     const onlineDrivers = await User.find({
@@ -654,28 +662,14 @@ router.get('/debug/online', async (req, res) => {
       'driverProfile.verificationState': 'approved',
       'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
     })
-      .select(
-        'name phone driverProfile.location driverProfile.heading driverProfile.lastSeen driverProfile.vehicleModel driverProfile.vehicleNumber driverProfile.serviceCategories'
-      )
+      .select('name phone driverProfile.location driverProfile.lastSeen driverProfile.vehicleModel driverProfile.serviceCategories')
       .lean();
-
-    if (!onlineDrivers?.length) {
-      return res.json({
-        success: true,
-        message: 'No drivers are currently online',
-        count: 0,
-        drivers: [],
-        timestamp: new Date().toISOString()
-      });
-    }
 
     const formatted = onlineDrivers.map(driver => ({
       driverId: driver._id.toString(),
       name: driver.name || 'Unknown Driver',
       phone: driver.phone || 'Not set',
-      vehicle: driver.driverProfile?.vehicleModel
-        ? `${driver.driverProfile.vehicleModel} (${driver.driverProfile.vehicleNumber || 'N/A'})`
-        : 'No vehicle info',
+      vehicle: driver.driverProfile?.vehicleModel || 'No vehicle',
       serviceCategories: driver.driverProfile?.serviceCategories || [],
       location: driver.driverProfile?.location?.coordinates
         ? {
@@ -683,7 +677,6 @@ router.get('/debug/online', async (req, res) => {
             longitude: driver.driverProfile.location.coordinates[0]
           }
         : null,
-      heading: driver.driverProfile?.heading || 0,
       lastSeen: driver.driverProfile?.lastSeen?.toISOString() || null,
       isOnline: true
     }));
@@ -701,67 +694,6 @@ router.get('/debug/online', async (req, res) => {
       error: 'Failed to fetch online drivers',
       message: err.message
     });
-  }
-});
-
-// ✅ NEW DEBUG: Check what trips a specific driver can see
-router.get('/debug/driver-offers/:driverId', async (req, res) => {
-  try {
-    const { driverId } = req.params;
-    
-    console.log(`🔍 [DEBUG] Checking offers for driver: ${driverId}`);
-    
-    const driver = await User.findById(driverId)
-      .select('name driverProfile.isAvailable driverProfile.lastSeen')
-      .lean();
-    
-    if (!driver) {
-      return res.status(404).json({ error: 'Driver not found' });
-    }
-    
-    // Check trip requests where driver is a candidate
-    const tripRequests = await TripRequest.find({
-      candidates: {
-        $elemMatch: { driverId: driverId }
-      },
-      createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) } // Last 30 minutes
-    })
-    .select('_id status serviceType candidates pickup createdAt')
-    .sort({ createdAt: -1 })
-    .lean();
-    
-    const driverCandidates = tripRequests.map(trip => {
-      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
-      return {
-        requestId: trip._id,
-        tripStatus: trip.status,
-        candidateStatus: candidate?.status,
-        serviceType: trip.serviceType,
-        offeredAt: candidate?.offeredAt,
-        createdAt: trip.createdAt,
-        pickup: trip.pickup,
-        allCandidates: trip.candidates.map(c => ({
-          driverId: c.driverId,
-          status: c.status,
-          offeredAt: c.offeredAt
-        }))
-      };
-    });
-    
-    res.json({
-      driver: {
-        id: driverId,
-        name: driver.name,
-        isAvailable: driver.driverProfile?.isAvailable,
-        lastSeen: driver.driverProfile?.lastSeen
-      },
-      tripCount: driverCandidates.length,
-      trips: driverCandidates,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    console.error('Error in /debug/driver-offers:', err);
-    res.status(500).json({ error: err.message });
   }
 });
 

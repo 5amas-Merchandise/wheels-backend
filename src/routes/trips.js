@@ -1,4 +1,3 @@
-// routes/trips.js - COMPLETE FINAL VERSION WITH AUTO-CLEANUP
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -213,25 +212,36 @@ router.post('/request', requireAuth, async (req, res, next) => {
 
     console.log(`📊 Found ${nearbyDrivers?.length || 0} nearby drivers`);
 
-    // Filter candidates
+    // ✅✅✅ CRITICAL FIX: ALWAYS ADD DRIVERS TO CANDIDATES LIST
     const candidates = [];
     for (const driver of (nearbyDrivers || [])) {
+      // Check if driver supports this service type
       const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
-      
+      if (!supportsService) {
+        console.log(`   ⚠️ Driver ${driver._id} doesn't support ${serviceType}`);
+        continue; // Skip drivers who don't support this service
+      }
+
+      // Check subscription for CITY_RIDE services
       if (!isLuxury(serviceType)) {
         const sub = driver.subscription;
         if (!sub?.expiresAt || new Date(sub.expiresAt) <= now) {
-          console.log(`   ⚠️ Driver ${driver._id} subscription expired`);
-          continue;
+          console.log(`   ⚠️ Driver ${driver._id} subscription expired for CITY_RIDE`);
+          continue; // Skip drivers without valid subscription for CITY_RIDE
         }
       }
 
+      // ✅✅✅ ADD DRIVER TO CANDIDATES LIST - THIS WAS MISSING!
       candidates.push({ 
         driverId: driver._id, 
         status: 'pending',
         driverName: driver.name,
-        offeredAt: null
+        offeredAt: null,
+        rejectedAt: null,
+        rejectionReason: null
       });
+      
+      console.log(`   ✅ Added driver ${driver._id} to candidates list`);
     }
 
     console.log(`✅ ${candidates.length} drivers qualified as candidates`);
@@ -269,10 +279,11 @@ router.post('/request', requireAuth, async (req, res, next) => {
       });
     }
 
-    // Offer to first driver immediately
+    // ✅✅✅ OFFER TO FIRST DRIVER IMMEDIATELY - THIS WAS ALREADY CORRECT
     if (candidates.length > 0) {
       candidates[0].status = 'offered';
       candidates[0].offeredAt = new Date();
+      console.log(`📤 Offering to first driver: ${candidates[0].driverId}`);
     }
 
     tripRequest = await TripRequest.create({
@@ -291,35 +302,35 @@ router.post('/request', requireAuth, async (req, res, next) => {
       expiresAt: new Date(now.getTime() + 5 * 60 * 1000)
     });
 
-    console.log(`✅ Trip request ${tripRequest._id} created`);
+    console.log(`✅ Trip request ${tripRequest._id} created with ${candidates.length} candidates`);
 
-    // Send notifications to drivers
-    candidates.forEach(candidate => {
-      if (candidate.status === 'offered') {
-        emitter.emit('notification', {
-          userId: candidate.driverId.toString(),
-          type: 'trip_offered',
-          title: 'New Trip Request',
-          body: `New ${serviceType} ride - Accept within 20 seconds`,
-          data: {
-            requestId: tripRequest._id,
-            serviceType: serviceType,
-            estimatedFare: estimatedFare || 0,  // ✅ FIX: Send estimatedFare not fare
-            distance: distance || 0,
-            duration: duration || 0,
-            pickup: pickup,
-            dropoff: dropoff,  // ✅ FIX: Include dropoff for driver visibility
-            pickupAddress: pickupAddress || '',
-            dropoffAddress: dropoffAddress || '',
-            immediateOffer: true
-          }
-        });
-      }
-    });
+    // ✅✅✅ SEND NOTIFICATION TO FIRST DRIVER - THIS WAS ALREADY CORRECT
+    const firstCandidate = candidates.find(c => c.status === 'offered');
+    if (firstCandidate) {
+      emitter.emit('notification', {
+        userId: firstCandidate.driverId.toString(),
+        type: 'trip_offered',
+        title: 'New Trip Request',
+        body: `New ${serviceType} ride - Accept within 20 seconds`,
+        data: {
+          requestId: tripRequest._id,
+          serviceType: serviceType,
+          estimatedFare: estimatedFare || 0,
+          distance: distance || 0,
+          duration: duration || 0,
+          pickup: pickup,
+          dropoff: dropoff,
+          pickupAddress: pickupAddress || '',
+          dropoffAddress: dropoffAddress || '',
+          immediateOffer: true
+        }
+      });
+      console.log(`📨 Notification sent to driver ${firstCandidate.driverId}`);
+    }
 
     // Timeout for first driver
-    if (candidates.length > 0 && candidates[0].status === 'offered') {
-      const firstDriverId = candidates[0].driverId;
+    if (candidates.length > 0 && firstCandidate) {
+      const firstDriverId = firstCandidate.driverId;
       
       setTimeout(async () => {
         try {
@@ -333,12 +344,13 @@ router.post('/request', requireAuth, async (req, res, next) => {
             cand.rejectionReason = 'timeout';
             await fresh.save();
             
+            console.log(`⏱️ First driver ${firstDriverId} timeout, moving to next`);
             await offerToNext(tripRequest._id);
           }
         } catch (err) {
           console.error('Timeout error:', err);
         }
-      }, 20000);
+      }, 20000); // 20 seconds timeout
     }
 
     res.json({ 
@@ -363,6 +375,7 @@ async function offerToNext(requestId) {
     
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
+      console.log(`❌ Trip ${requestId} not searching or not found`);
       tripRejectionCounts.delete(requestId.toString());
       return;
     }
@@ -370,26 +383,29 @@ async function offerToNext(requestId) {
     // ✅ Check rejection count BEFORE offering to next
     const shouldCleanup = trackRejection(requestId);
     if (shouldCleanup) {
+      console.log(`🚫 Trip ${requestId} reached max rejections, cleaning up`);
       return; // Cleanup already triggered, stop here
     }
 
-    // ✅ FIX 1A: Strictly exclude rejected drivers
+    // ✅✅✅ CRITICAL FIX: Find next pending candidate who hasn't been rejected
     const nextCandidate = tripRequest.candidates.find(
       c => c.status === 'pending' && !c.rejectedAt
     );
     
     if (!nextCandidate) {
-      console.log(`⚠️ No more candidates for ${requestId}`);
+      console.log(`⚠️ No more pending candidates for ${requestId}`);
       await cleanupFailedTripRequest(requestId);
       return;
     }
 
-    // ✅ FIX 1B: Hard block re-offer to same driver
-    if (tripRequest.candidates.some(
-      c => c.driverId.equals(nextCandidate.driverId) && c.status === 'rejected'
-    )) {
-      console.log(`🚫 Driver ${nextCandidate.driverId} was already rejected, skipping`);
-      // Move this candidate to rejected and try next
+    // ✅ Double-check: never offer to previously rejected drivers (extra safety)
+    const wasRejected = tripRequest.candidates.some(
+      c => c.driverId.equals(nextCandidate.driverId) && 
+           (c.status === 'rejected' || c.rejectedAt)
+    );
+    
+    if (wasRejected) {
+      console.log(`🚫 Driver ${nextCandidate.driverId} was already rejected, marking and moving to next`);
       nextCandidate.status = 'rejected';
       nextCandidate.rejectedAt = new Date();
       nextCandidate.rejectionReason = 'already_rejected';
@@ -397,6 +413,7 @@ async function offerToNext(requestId) {
       return await offerToNext(requestId);
     }
 
+    // ✅✅✅ OFFER TO THE NEXT DRIVER
     nextCandidate.status = 'offered';
     nextCandidate.offeredAt = new Date();
     await tripRequest.save();
@@ -405,6 +422,7 @@ async function offerToNext(requestId) {
     const attemptNum = (tripRejectionCounts.get(requestId.toString()) || 0) + 1;
     console.log(`📤 Offering to driver ${driverId} (Attempt ${attemptNum}/5)`);
 
+    // ✅✅✅ SEND NOTIFICATION TO THE DRIVER
     emitter.emit('notification', {
       userId: driverId.toString(),
       type: 'trip_offered',
@@ -413,11 +431,11 @@ async function offerToNext(requestId) {
       data: {
         requestId: tripRequest._id,
         serviceType: tripRequest.serviceType,
-        estimatedFare: tripRequest.estimatedFare || 0,  // ✅ FIX: Send estimatedFare
+        estimatedFare: tripRequest.estimatedFare || 0,
         distance: tripRequest.distance || 0,
         duration: tripRequest.duration || 0,
         pickup: tripRequest.pickup,
-        dropoff: tripRequest.dropoff,  // ✅ FIX: Include dropoff
+        dropoff: tripRequest.dropoff,
         pickupAddress: tripRequest.pickupAddress || '',
         dropoffAddress: tripRequest.dropoffAddress || '',
         immediateOffer: true
@@ -429,12 +447,14 @@ async function offerToNext(requestId) {
       try {
         const fresh = await TripRequest.findById(requestId);
         if (!fresh || fresh.status !== 'searching') {
+          console.log(`Trip ${requestId} no longer searching, stopping timeout`);
           tripRejectionCounts.delete(requestId.toString());
           return;
         }
 
         const cand = fresh.candidates.find(c => c.driverId.toString() === driverId.toString());
         if (cand && cand.status === 'offered') {
+          console.log(`⏱️ Driver ${driverId} timeout, rejecting`);
           cand.status = 'rejected';
           cand.rejectedAt = new Date();
           cand.rejectionReason = 'timeout';
@@ -445,7 +465,7 @@ async function offerToNext(requestId) {
       } catch (err) {
         console.error('Timeout error:', err);
       }
-    }, 20000);
+    }, 20000); // 20 seconds timeout
   } catch (err) {
     console.error('❌ offerToNext error:', err);
     tripRejectionCounts.delete(requestId.toString());
@@ -501,10 +521,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     const driverId = req.user.sub;
     const { requestId } = req.body;
 
-    console.log(`🤝 Driver ${driverId} accepting ${requestId}`);
+    console.log(`🤝 Driver ${driverId} attempting to accept ${requestId}`);
 
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== 'searching') {
+      console.log(`❌ Trip ${requestId} no longer searching`);
       tripRejectionCounts.delete(requestId.toString());
       return res.status(400).json({ error: { message: 'Trip no longer available' } });
     }
@@ -514,65 +535,76 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     );
 
     if (!candidate) {
+      console.log(`❌ Driver ${driverId} not offered trip ${requestId}`);
+      console.log('Available candidates:', tripRequest.candidates.map(c => ({
+        driverId: c.driverId,
+        status: c.status,
+        offeredAt: c.offeredAt
+      })));
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
     const session = await mongoose.startSession();
     let newTrip;
 
-    await session.withTransaction(async () => {
-      tripRequest.assignedDriverId = driverId;
-      tripRequest.status = 'assigned';
-      candidate.status = 'accepted';
-      await tripRequest.save({ session });
+    try {
+      await session.withTransaction(async () => {
+        tripRequest.assignedDriverId = driverId;
+        tripRequest.status = 'assigned';
+        candidate.status = 'accepted';
+        await tripRequest.save({ session });
 
-      const tripDoc = await Trip.create([{
-        passengerId: tripRequest.passengerId,
-        driverId,
-        tripRequestId: tripRequest._id,
-        serviceType: tripRequest.serviceType,
-        paymentMethod: tripRequest.paymentMethod,
-        pickupLocation: tripRequest.pickup,
-        dropoffLocation: tripRequest.dropoff,
-        status: 'assigned',
-        estimatedFare: tripRequest.estimatedFare || 0,
-        distanceKm: tripRequest.distance || 0,
-        durationMinutes: Math.round((tripRequest.duration || 0) / 60),
-        requestedAt: new Date()
-      }], { session });
+        const tripDoc = await Trip.create([{
+          passengerId: tripRequest.passengerId,
+          driverId,
+          tripRequestId: tripRequest._id,
+          serviceType: tripRequest.serviceType,
+          paymentMethod: tripRequest.paymentMethod,
+          pickupLocation: tripRequest.pickup,
+          dropoffLocation: tripRequest.dropoff,
+          status: 'assigned',
+          estimatedFare: tripRequest.estimatedFare || 0,
+          distanceKm: tripRequest.distance || 0,
+          durationMinutes: Math.round((tripRequest.duration || 0) / 60),
+          requestedAt: new Date()
+        }], { session });
 
-      newTrip = tripDoc[0];
+        newTrip = tripDoc[0];
 
-      await User.findByIdAndUpdate(driverId, {
-        'driverProfile.isAvailable': false,
-        'driverProfile.currentTripId': newTrip._id
-      }, { session });
-    });
+        await User.findByIdAndUpdate(driverId, {
+          'driverProfile.isAvailable': false,
+          'driverProfile.currentTripId': newTrip._id
+        }, { session });
+      });
 
-    await session.endSession();
+      await session.endSession();
 
-    // ✅ Clear tracking - trip accepted successfully
-    tripRejectionCounts.delete(requestId.toString());
+      // ✅ Clear tracking - trip accepted successfully
+      tripRejectionCounts.delete(requestId.toString());
 
-    console.log(`✅ Trip accepted, created ${newTrip._id}`);
+      console.log(`✅ Trip accepted, created ${newTrip._id}`);
 
-    emitter.emit('notification', {
-      userId: tripRequest.passengerId.toString(),
-      type: 'trip_accepted',
-      title: 'Driver Accepted!',
-      body: 'Your driver is on the way',
-      data: {
-        requestId: tripRequest._id.toString(),
-        tripId: newTrip._id.toString(),
-        driverId: driverId.toString()
-      }
-    });
+      emitter.emit('notification', {
+        userId: tripRequest.passengerId.toString(),
+        type: 'trip_accepted',
+        title: 'Driver Accepted!',
+        body: 'Your driver is on the way',
+        data: {
+          requestId: tripRequest._id.toString(),
+          tripId: newTrip._id.toString(),
+          driverId: driverId.toString()
+        }
+      });
 
-    res.json({
-      success: true,
-      tripId: newTrip._id,
-      requestId: tripRequest._id
-    });
+      res.json({
+        success: true,
+        tripId: newTrip._id,
+        requestId: tripRequest._id
+      });
+    } catch (transactionError) {
+      await session.endSession();
+      throw transactionError;
+    }
   } catch (err) {
     console.error('❌ Accept error:', err);
     next(err);
@@ -604,20 +636,64 @@ router.post('/reject', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
-    // ✅ FIX 1B: Mark as rejected with timestamp
+    // ✅ Mark as rejected with timestamp
     candidate.status = 'rejected';
     candidate.rejectedAt = new Date();
     candidate.rejectionReason = 'manual_rejection';
     await tripRequest.save();
 
-    console.log(`❌ Driver rejected, moving to next`);
+    console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
     
-    // ✅ This will track rejection and potentially cleanup
+    // ✅ Move to next driver
     await offerToNext(requestId);
 
     res.json({ success: true });
   } catch (err) {
     console.error('❌ Reject error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /trips/searching - DEBUG: Get all searching trip requests
+// ==========================================
+
+router.get('/searching', requireAuth, async (req, res, next) => {
+  try {
+    const searchingTrips = await TripRequest.find({
+      status: 'searching'
+    })
+    .populate('passengerId', 'name phone')
+    .select('_id serviceType pickup dropoff estimatedFare candidates status createdAt')
+    .sort({ createdAt: -1 })
+    .lean();
+
+    const formatted = searchingTrips.map(trip => ({
+      requestId: trip._id,
+      passengerName: trip.passengerId?.name || 'Unknown',
+      serviceType: trip.serviceType,
+      estimatedFare: trip.estimatedFare,
+      pickup: trip.pickup,
+      dropoff: trip.dropoff,
+      status: trip.status,
+      createdAt: trip.createdAt,
+      candidates: trip.candidates.map(c => ({
+        driverId: c.driverId,
+        status: c.status,
+        offeredAt: c.offeredAt,
+        rejectedAt: c.rejectedAt
+      })),
+      candidateCount: trip.candidates.length,
+      activeOffers: trip.candidates.filter(c => c.status === 'offered').length
+    }));
+
+    res.json({
+      count: formatted.length,
+      trips: formatted,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Error in /searching:', err);
     next(err);
   }
 });
@@ -773,14 +849,19 @@ function startPeriodicCleanup() {
       }).lean();
 
       for (const req of expired) {
+        console.log(`🧹 Cleaning up expired trip request: ${req._id}`);
         await cleanupFailedTripRequest(req._id);
       }
 
       // Delete old no_drivers requests (older than 10 minutes)
-      await TripRequest.deleteMany({
+      const deleted = await TripRequest.deleteMany({
         status: 'no_drivers',
         createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) }
       });
+
+      if (deleted.deletedCount > 0) {
+        console.log(`🗑️ Deleted ${deleted.deletedCount} old no_drivers requests`);
+      }
 
     } catch (err) {
       console.error('Cleanup error:', err);
