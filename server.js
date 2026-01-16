@@ -1,16 +1,14 @@
-// server.js
-// Minimal but complete WebSocket-based backend for ride-hailing (no Socket.IO)
-// Copy-paste ready — requires: express, ws, jsonwebtoken, mongoose
-
+// server.js - UNIFIED VERSION
 require('dotenv').config();
 
 const http = require('http');
-const express = require('express');
 const WebSocket = require('ws');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 
-const app = express();
+// ✅ Import your Express app with all routes
+const app = require('./src/app'); // This is your existing app.js with all routes
+
 const server = http.createServer(app);
 
 // ────────────────────────────────────────────────
@@ -75,7 +73,7 @@ wss.on('connection', (ws, req) => {
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key-change-me');
     ws.userId = (payload.sub || payload.userId || payload._id)?.toString();
-    ws.isDriver = !!payload.isDriver; // or payload.roles?.driver etc.
+    ws.isDriver = !!payload.isDriver;
 
     if (!ws.userId) throw new Error('No valid userId in token');
 
@@ -113,7 +111,6 @@ wss.on('connection', (ws, req) => {
     const { type, ...data } = msg;
 
     switch (type) {
-      // Driver sends location
       case 'driver:location': {
         if (!ws.isDriver) return;
 
@@ -123,12 +120,8 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // You should save to DB here in real app
         console.log(`📍 ${ws.userId} → [${latitude.toFixed(5)}, ${longitude.toFixed(5)}]`);
 
-        // Broadcast to everyone in the same trip room (if any)
-        // In real app → find active trip → get trip:${tripId} room
-        // For demo: broadcast to all drivers & connected passengers (simple)
         broadcastToRoom('drivers', {
           type: 'driver:location',
           driverId: ws.userId,
@@ -141,7 +134,6 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
-      // Passenger / driver joins a trip room
       case 'join:trip': {
         const { tripId } = data;
         if (!tripId) return;
@@ -159,7 +151,6 @@ wss.on('connection', (ws, req) => {
         break;
       }
 
-      // Driver accepts trip → notify passenger & create room
       case 'driver:accept_trip': {
         if (!ws.isDriver) return;
 
@@ -170,7 +161,6 @@ wss.on('connection', (ws, req) => {
 
         joinRoom(ws, room);
 
-        // Notify passenger
         sendToUser(passengerId, {
           type: 'trip:accepted',
           tripId,
@@ -179,18 +169,16 @@ wss.on('connection', (ws, req) => {
           timestamp: new Date().toISOString()
         });
 
-        // Try to add passenger to room
         const pWs = connectedUsers.get(passengerId.toString());
         if (pWs) joinRoom(pWs, room);
 
-        // Notify everyone in trip room (including driver & passenger)
         broadcastToRoom(room, {
           type: 'trip:status',
           status: 'accepted',
           driverId: ws.userId,
           tripId,
           timestamp: new Date().toISOString()
-        }, ws); // exclude sender if you want
+        }, ws);
 
         break;
       }
@@ -206,6 +194,10 @@ wss.on('connection', (ws, req) => {
     connectedUsers.delete(ws.userId);
     leaveAllRooms(ws);
   });
+
+  ws.on('error', (error) => {
+    console.error(`WebSocket error for user ${ws.userId}:`, error);
+  });
 });
 
 // Heartbeat — clean dead connections
@@ -218,35 +210,18 @@ setInterval(() => {
 }, 30000);
 
 // ────────────────────────────────────────────────
-//  Basic HTTP routes (for testing)
-// ────────────────────────────────────────────────
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    connectedClients: wss.clients.size,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get('/', (req, res) => {
-  res.send(`
-    <h1>Ride-hailing WebSocket server</h1>
-    <p>Connect via: <code>ws://your-domain/?token=your-jwt-token</code></p>
-    <p>Health check: <a href="/health">/health</a></p>
-  `);
-});
-
-// ────────────────────────────────────────────────
-//  MongoDB connection (minimal)
+//  MongoDB connection
 // ────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 const MONGODB_URI = process.env.MONGO_URI;
 
 mongoose.connect(MONGODB_URI)
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err);
+    process.exit(1);
+  });
 
 // ────────────────────────────────────────────────
 //  Start server
@@ -255,7 +230,7 @@ mongoose.connect(MONGODB_URI)
 server.listen(PORT, () => {
   console.log(`
   ╔════════════════════════════════════════════╗
-  ║   Ride-hailing WebSocket server running    ║
+  ║   Ride-hailing Server Running              ║
   ║                                            ║
   ║   HTTP:  http://localhost:${PORT}           ║
   ║   WS:    ws://localhost:${PORT}             ║
@@ -263,6 +238,23 @@ server.listen(PORT, () => {
   ║   Connect with ?token=your-jwt-token       ║
   ╚════════════════════════════════════════════╝
   `);
+  
+  console.log('✅ Express routes loaded from app.js');
+  console.log('✅ WebSocket server ready');
+});
+
+// ────────────────────────────────────────────────
+//  Error Handling
+// ────────────────────────────────────────────────
+
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
 });
 
 // Graceful shutdown
@@ -270,8 +262,22 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM received. Closing server...');
   wss.close(() => {
     server.close(() => {
-      console.log('Server closed.');
-      process.exit(0);
+      mongoose.connection.close(false, () => {
+        console.log('Server closed.');
+        process.exit(0);
+      });
+    });
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Closing server...');
+  wss.close(() => {
+    server.close(() => {
+      mongoose.connection.close(false, () => {
+        console.log('Server closed.');
+        process.exit(0);
+      });
     });
   });
 });

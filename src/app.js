@@ -1,5 +1,5 @@
 const express = require('express');
-const cors = require('cors'); // ← Added for CORS
+const cors = require('cors');
 const requestLogger = require('./middleware/requestLogger');
 const errorHandler = require('./middleware/errorHandler');
 const { optionalAuth } = require('./middleware/auth');
@@ -7,8 +7,8 @@ const { authLimiter, paymentLimiter, defaultLimiter } = require('./middleware/ra
 
 const app = express();
 
-// === CORS: Allow requests from ANY origin (all URLs and networks) ===
-app.use(cors()); // Default: allows all origins, all methods, all headers
+// === CORS ===
+app.use(cors());
 
 // Parse JSON bodies
 app.use(express.json());
@@ -18,15 +18,10 @@ app.use(requestLogger);
 app.use(optionalAuth);
 app.use(defaultLimiter);
 
-// Simple healthcheck endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
-});
-
 // === Routes ===
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
-const driverRoutes = require('../src/routes/drivers');
+const driverRoutes = require('./routes/drivers'); // ✅ Fixed path
 const matchingRoutes = require('./routes/matching');
 const paymentsRoutes = require('./routes/payments');
 const walletRoutes = require('./routes/wallet');
@@ -53,7 +48,6 @@ app.use('/pricing', pricingRoutes);
 app.use('/trips', tripsRoutes);
 
 // === 404 Handler ===
-// Catch all unmatched routes
 app.use((req, res, next) => {
   const err = new Error('Not Found');
   err.status = 404;
