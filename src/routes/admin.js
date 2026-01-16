@@ -343,6 +343,19 @@ router.get('/audit', requireAuth, requireAdmin, async (req, res, next) => {
   }
 });
 
+router.post('/force-cleanup-driver/:driverId',   async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.params.driverId, {
+      'driverProfile.isAvailable': true,
+      $unset: { 'driverProfile.currentTripId': '' }
+    });
+    
+    res.json({ success: true, message: 'Driver cleaned up' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 
 module.exports = router;

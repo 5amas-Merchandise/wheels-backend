@@ -712,4 +712,113 @@ router.get('/debug/online', async (req, res) => {
   }
 });
 
+// ==========================================
+// GET /drivers/current-state - Get driver state for cleanup checks
+// ==========================================
+router.get('/current-state', requireAuth, async (req, res) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const driver = await User.findById(driverId)
+      .select('name driverProfile')
+      .lean();
+
+    if (!driver) {
+      return res.status(404).json({ error: { message: 'Driver not found' } });
+    }
+
+    let currentTrip = null;
+    if (driver.driverProfile?.currentTripId) {
+      currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+        .select('status requestedAt startedAt completedAt cancelledAt')
+        .lean();
+    }
+
+    res.json({
+      driverId,
+      name: driver.name,
+      isAvailable: driver.driverProfile?.isAvailable,
+      currentTripId: driver.driverProfile?.currentTripId?.toString() || null,
+      currentTrip: currentTrip ? {
+        id: currentTrip._id,
+        status: currentTrip.status,
+        requestedAt: currentTrip.requestedAt,
+        startedAt: currentTrip.startedAt,
+        completedAt: currentTrip.completedAt,
+        cancelledAt: currentTrip.cancelledAt
+      } : null,
+      needsCleanup: driver.driverProfile?.currentTripId && 
+                    (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status))
+    });
+
+  } catch (err) {
+    console.error('Get state error:', err);
+    res.status(500).json({ error: { message: 'Failed to get state' } });
+  }
+});
+
+// ==========================================
+// POST /drivers/cleanup-state - Cleanup stale driver state
+// ==========================================
+router.post('/cleanup-state', requireAuth, async (req, res) => {
+  try {
+    const driverId = req.user.sub;
+    
+    console.log(`🧹 Cleaning up state for driver ${driverId}`);
+    
+    const driver = await User.findById(driverId).select('driverProfile');
+    
+    if (!driver) {
+      return res.status(404).json({ error: { message: 'Driver not found' } });
+    }
+
+    let cleaned = false;
+    const issues = [];
+
+    // Check if driver has a currentTripId
+    if (driver.driverProfile?.currentTripId) {
+      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+        .select('status');
+
+      if (!currentTrip) {
+        issues.push('Trip not found - removing stale reference');
+        cleaned = true;
+      } else if (['completed', 'cancelled'].includes(currentTrip.status)) {
+        issues.push(`Trip ${currentTrip.status} - removing stale reference`);
+        cleaned = true;
+      } else {
+        issues.push(`Trip is ${currentTrip.status} - keeping reference`);
+      }
+    }
+
+    // Perform cleanup if needed
+    if (cleaned) {
+      await User.findByIdAndUpdate(driverId, {
+        'driverProfile.isAvailable': true,
+        $unset: { 'driverProfile.currentTripId': '' }
+      });
+
+      console.log(`✅ Driver ${driverId} state cleaned up`);
+
+      res.json({
+        success: true,
+        message: 'Driver state cleaned up successfully',
+        issues,
+        cleaned: true
+      });
+    } else {
+      res.json({
+        success: true,
+        message: 'No cleanup needed',
+        issues,
+        cleaned: false
+      });
+    }
+
+  } catch (err) {
+    console.error('Cleanup error:', err);
+    res.status(500).json({ error: { message: 'Cleanup failed' } });
+  }
+});
+
 module.exports = router;
