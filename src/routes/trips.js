@@ -597,6 +597,7 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 // In /trips/accept endpoint - COMPLETELY FIXED WITH PROPER LOCKING
 
 // ✅ COMPLETELY REWRITTEN: Accept Ride Endpoint (Backend)
+// ✅ FIXED: Accept Ride with Automatic State Cleanup
 router.post('/accept', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -632,7 +633,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       console.log('⚠️ Duplicate request detected');
       
       if (existingKey.status === 'completed' && existingKey.tripId) {
-        // Return cached successful result
         console.log('✅ Returning cached trip data');
         await session.abortTransaction();
         
@@ -659,13 +659,13 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       requestId: requestId,
       status: 'processing',
       createdAt: new Date(),
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
     }, { session });
 
-    console.log('🔒 Idempotency key inserted, processing locked');
+    console.log('🔒 Idempotency key inserted');
 
     // ============================================
-    // STEP 3: Verify Driver Availability
+    // STEP 3: Verify Driver Availability + AUTO CLEANUP
     // ============================================
     const driver = await User.findById(driverId)
       .select('name driverProfile')
@@ -675,22 +675,69 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       throw new Error('Driver not found');
     }
 
-    if (!driver.driverProfile?.isAvailable) {
-      await idempotencyCollection.updateOne(
-        { key: finalIdempotencyKey },
-        { $set: { status: 'failed', error: 'Driver not available' } },
-        { session }
-      );
-      throw new Error('Driver is not available');
+    // ✅ CHECK IF CURRENT TRIP IS ACTUALLY ACTIVE
+    if (driver.driverProfile?.currentTripId) {
+      console.log(`⚠️ Driver has currentTripId: ${driver.driverProfile.currentTripId}`);
+      
+      // Check if the trip actually exists and is active
+      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+        .select('status')
+        .session(session);
+
+      if (!currentTrip || ['completed', 'cancelled'].includes(currentTrip.status)) {
+        // Trip doesn't exist or is finished - CLEAN UP THE STALE STATE
+        console.log(`🧹 Cleaning up stale currentTripId for driver ${driverId}`);
+        
+        await User.findByIdAndUpdate(
+          driverId,
+          {
+            'driverProfile.isAvailable': true,
+            $unset: { 'driverProfile.currentTripId': '' }
+          },
+          { session }
+        );
+
+        // Reload driver data after cleanup
+        const cleanedDriver = await User.findById(driverId)
+          .select('name driverProfile')
+          .session(session);
+        
+        driver.driverProfile = cleanedDriver.driverProfile;
+        console.log('✅ Driver state cleaned up and reloaded');
+      } else if (['assigned', 'started', 'in_progress'].includes(currentTrip.status)) {
+        // Driver is ACTUALLY on an active trip
+        await idempotencyCollection.updateOne(
+          { key: finalIdempotencyKey },
+          { $set: { status: 'failed', error: 'Driver on active trip' } },
+          { session }
+        );
+        throw new Error('Driver is already on an active trip');
+      }
     }
 
-    if (driver.driverProfile?.currentTripId) {
-      await idempotencyCollection.updateOne(
-        { key: finalIdempotencyKey },
-        { $set: { status: 'failed', error: 'Driver already on trip' } },
-        { session }
-      );
-      throw new Error('Driver is already on a trip');
+    // ✅ NOW CHECK AVAILABILITY AFTER CLEANUP
+    if (!driver.driverProfile?.isAvailable) {
+      console.log(`⚠️ Driver isAvailable: ${driver.driverProfile?.isAvailable}`);
+      
+      // Auto-fix: If driver has no current trip but is marked unavailable, fix it
+      if (!driver.driverProfile?.currentTripId) {
+        console.log('🧹 Auto-fixing driver availability status');
+        
+        await User.findByIdAndUpdate(
+          driverId,
+          { 'driverProfile.isAvailable': true },
+          { session }
+        );
+        
+        console.log('✅ Driver availability auto-fixed');
+      } else {
+        await idempotencyCollection.updateOne(
+          { key: finalIdempotencyKey },
+          { $set: { status: 'failed', error: 'Driver not available' } },
+          { session }
+        );
+        throw new Error('Driver is not available');
+      }
     }
 
     console.log('✅ Driver availability verified');
@@ -702,11 +749,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       {
         _id: requestId,
         status: 'searching',
-        assignedDriverId: null, // CRITICAL: Must be null
+        assignedDriverId: null,
         'candidates': {
           $elemMatch: {
             driverId: driverId,
-            status: 'offered' // Driver must have been offered this trip
+            status: 'offered'
           }
         }
       },
@@ -728,11 +775,9 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     if (!tripRequest) {
       console.log(`❌ Cannot assign trip - checking current state`);
       
-      // Debug: Check why it failed
       const currentRequest = await TripRequest.findById(requestId).session(session);
       
       if (!currentRequest) {
-        console.log('Trip request not found');
         await idempotencyCollection.updateOne(
           { key: finalIdempotencyKey },
           { $set: { status: 'failed', error: 'Trip request not found' } },
@@ -861,7 +906,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     // ============================================
     setImmediate(() => {
       try {
-        // Notify passenger
         emitter.emit('notification', {
           userId: notificationData.passengerId,
           type: 'trip_accepted',
@@ -882,7 +926,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
           }
         });
 
-        // Emit WebSocket event
         emitter.emit('trip_accepted', {
           requestId: notificationData.requestId,
           tripId: notificationData.tripId,
@@ -897,28 +940,24 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     });
 
   } catch (error) {
-    // Abort transaction if not committed
     if (session.inTransaction()) {
       await session.abortTransaction();
       console.log('❌ Transaction aborted');
     }
 
     console.error('❌ Accept error:', error.message);
-    console.error('Stack:', error.stack);
 
-    // Send error response if not already sent
     if (!responseSent) {
       const errorMessage = error.message || 'Failed to accept ride';
       let statusCode = 500;
       let errorCode = 'INTERNAL_ERROR';
 
-      // Determine status code and error code
       if (errorMessage.includes('not found')) {
         statusCode = 404;
         errorCode = 'NOT_FOUND';
       } else if (
         errorMessage.includes('not available') ||
-        errorMessage.includes('already on a trip') ||
+        errorMessage.includes('active trip') ||
         errorMessage.includes('not offered') ||
         errorMessage.includes('already assigned') ||
         errorMessage.includes('already processed')
@@ -946,7 +985,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       });
     }
   } finally {
-    // Always end session
     await session.endSession();
   }
 });
@@ -1219,7 +1257,6 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
     const trip = await Trip.findById(req.params.tripId);
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
 
-    // Authorization: passenger can cancel, driver can cancel if they're the assigned driver
     const isPassenger = trip.passengerId.toString() === userId;
     const isDriver = trip.driverId?.toString() === userId;
     
@@ -1232,27 +1269,31 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
     trip.cancellationReason = reason || (isPassenger ? 'passenger_cancelled' : 'driver_cancelled');
     await trip.save();
 
+    // ✅ ENSURE DRIVER STATE IS CLEANED UP
     if (trip.driverId) {
       await User.findByIdAndUpdate(trip.driverId, {
         'driverProfile.isAvailable': true,
         $unset: { 'driverProfile.currentTripId': '' }
       });
+      
+      console.log(`✅ Driver ${trip.driverId} state cleaned up after cancellation`);
     }
 
-    // Notify the other party
     const notifyUserId = isPassenger ? trip.driverId : trip.passengerId;
     if (notifyUserId) {
-      try {
-        emitter.emit('notification', {
-          userId: notifyUserId.toString(),
-          type: 'trip_cancelled',
-          title: 'Trip Cancelled',
-          body: `Trip was cancelled: ${trip.cancellationReason}`,
-          data: { tripId: trip._id, reason: trip.cancellationReason }
-        });
-      } catch (emitErr) {
-        console.error('Notification emit error:', emitErr);
-      }
+      setImmediate(() => {
+        try {
+          emitter.emit('notification', {
+            userId: notifyUserId.toString(),
+            type: 'trip_cancelled',
+            title: 'Trip Cancelled',
+            body: `Trip was cancelled: ${trip.cancellationReason}`,
+            data: { tripId: trip._id, reason: trip.cancellationReason }
+          });
+        } catch (emitErr) {
+          console.error('Notification error:', emitErr);
+        }
+      });
     }
 
     res.json({ trip });
@@ -1375,6 +1416,303 @@ router.get('/admin/config', requireAuth, requireAdmin, async (req, res) => {
       })
     }
   });
+});
+
+// ==========================================
+// Cleanup single driver state (Driver can call this)
+// ==========================================
+router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
+  try {
+    const driverId = req.user.sub;
+    
+    console.log(`🧹 Cleaning up state for driver ${driverId}`);
+    
+    const driver = await User.findById(driverId).select('driverProfile');
+    
+    if (!driver) {
+      return res.status(404).json({ error: { message: 'Driver not found' } });
+    }
+
+    let cleaned = false;
+    const issues = [];
+
+    // Check if driver has a currentTripId
+    if (driver.driverProfile?.currentTripId) {
+      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+        .select('status');
+
+      if (!currentTrip) {
+        issues.push('Trip not found - removing stale reference');
+        cleaned = true;
+      } else if (['completed', 'cancelled'].includes(currentTrip.status)) {
+        issues.push(`Trip ${currentTrip.status} - removing stale reference`);
+        cleaned = true;
+      } else {
+        issues.push(`Trip is ${currentTrip.status} - keeping reference`);
+      }
+    }
+
+    // Perform cleanup if needed
+    if (cleaned) {
+      await User.findByIdAndUpdate(driverId, {
+        'driverProfile.isAvailable': true,
+        $unset: { 'driverProfile.currentTripId': '' }
+      });
+
+      console.log(`✅ Driver ${driverId} state cleaned up`);
+
+      res.json({
+        success: true,
+        message: 'Driver state cleaned up successfully',
+        issues,
+        cleaned: true
+      });
+    } else {
+      res.json({
+        success: true,
+        message: 'No cleanup needed',
+        issues,
+        cleaned: false
+      });
+    }
+
+  } catch (err) {
+    console.error('Cleanup error:', err);
+    res.status(500).json({ error: { message: 'Cleanup failed' } });
+  }
+});
+
+// ==========================================
+// Cleanup all drivers (ADMIN ONLY)
+// ==========================================
+router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    console.log('🧹 Starting cleanup of all driver states');
+
+    // Find all drivers with currentTripId
+    const driversWithTrips = await User.find({
+      'driverProfile.currentTripId': { $exists: true, $ne: null }
+    }).select('_id name driverProfile');
+
+    const results = {
+      total: driversWithTrips.length,
+      cleaned: 0,
+      active: 0,
+      errors: []
+    };
+
+    for (const driver of driversWithTrips) {
+      try {
+        const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+          .select('status');
+
+        if (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status)) {
+          // Clean up stale reference
+          await User.findByIdAndUpdate(driver._id, {
+            'driverProfile.isAvailable': true,
+            $unset: { 'driverProfile.currentTripId': '' }
+          });
+
+          results.cleaned++;
+          console.log(`✅ Cleaned up driver ${driver._id} (${driver.name})`);
+        } else {
+          results.active++;
+          console.log(`⏩ Driver ${driver._id} has active trip ${currentTrip.status}`);
+        }
+      } catch (err) {
+        results.errors.push({
+          driverId: driver._id,
+          error: err.message
+        });
+        console.error(`❌ Error cleaning driver ${driver._id}:`, err.message);
+      }
+    }
+
+    console.log('✅ Cleanup complete:', results);
+
+    res.json({
+      success: true,
+      message: 'Driver state cleanup complete',
+      results
+    });
+
+  } catch (err) {
+    console.error('Admin cleanup error:', err);
+    res.status(500).json({ error: { message: 'Cleanup failed' } });
+  }
+});
+
+// ==========================================
+// Get driver current state (for debugging)
+// ==========================================
+router.get('/drivers/current-state', requireAuth, async (req, res) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const driver = await User.findById(driverId)
+      .select('name driverProfile')
+      .lean();
+
+    if (!driver) {
+      return res.status(404).json({ error: { message: 'Driver not found' } });
+    }
+
+    let currentTrip = null;
+    if (driver.driverProfile?.currentTripId) {
+      currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+        .select('status requestedAt startedAt completedAt cancelledAt')
+        .lean();
+    }
+
+    res.json({
+      driverId,
+      name: driver.name,
+      isAvailable: driver.driverProfile?.isAvailable,
+      currentTripId: driver.driverProfile?.currentTripId?.toString() || null,
+      currentTrip: currentTrip ? {
+        id: currentTrip._id,
+        status: currentTrip.status,
+        requestedAt: currentTrip.requestedAt,
+        startedAt: currentTrip.startedAt,
+        completedAt: currentTrip.completedAt,
+        cancelledAt: currentTrip.cancelledAt
+      } : null,
+      needsCleanup: driver.driverProfile?.currentTripId && 
+                    (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status))
+    });
+
+  } catch (err) {
+    console.error('Get state error:', err);
+    res.status(500).json({ error: { message: 'Failed to get state' } });
+  }
+});
+
+// ==========================================
+// AUTOMATIC CLEANUP ON TRIP COMPLETION/CANCELLATION
+// ==========================================
+// Add this to your existing /trips/:tripId/complete endpoint
+// (This ensures driver state is ALWAYS cleaned up when trip ends)
+
+router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
+  const session = await mongoose.startSession();
+  let tripData;
+  
+  try {
+    await session.withTransaction(async () => {
+      const driverId = req.user.sub;
+      const { actualDistanceKm, actualDurationMinutes } = req.body;
+
+      const trip = await Trip.findById(req.params.tripId).session(session);
+      if (!trip) throw new Error('Trip not found');
+      if (trip.driverId.toString() !== driverId) throw new Error('Unauthorized');
+
+      const finalDistance = actualDistanceKm || trip.distanceKm;
+      const finalDuration = actualDurationMinutes || trip.durationMinutes;
+
+      const fareData = await calculateFare({
+        serviceType: trip.serviceType,
+        distanceKm: finalDistance,
+        durationMinutes: finalDuration
+      });
+
+      trip.finalFare = fareData.baseAmount;
+      trip.distanceKm = finalDistance;
+      trip.durationMinutes = finalDuration;
+
+      let commission = 0;
+      if (isLuxury(trip.serviceType)) {
+        const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
+        const percent = setting?.value ? Number(setting.value) : 10;
+        commission = Math.round((percent / 100) * trip.finalFare);
+      }
+
+      trip.commission = commission;
+      trip.driverEarnings = trip.finalFare - commission;
+
+      if (trip.paymentMethod === 'wallet') {
+        const passengerWallet = await Wallet.findOne({ owner: trip.passengerId }).session(session);
+        if (!passengerWallet || passengerWallet.balance < trip.finalFare) {
+          throw new Error('Insufficient balance');
+        }
+
+        await Wallet.findOneAndUpdate(
+          { owner: trip.passengerId },
+          { $inc: { balance: -trip.finalFare } },
+          { session }
+        );
+
+        await Wallet.findOneAndUpdate(
+          { owner: driverId },
+          { $inc: { balance: trip.driverEarnings } },
+          { upsert: true, session }
+        );
+
+        await Transaction.create([{
+          userId: trip.passengerId,
+          type: 'trip_payment',
+          amount: -trip.finalFare,
+          description: `Trip #${trip._id.toString().slice(-6)}`,
+          metadata: { tripId: trip._id }
+        }, {
+          userId: driverId,
+          type: 'trip_earnings',
+          amount: trip.driverEarnings,
+          description: `Earnings from trip #${trip._id.toString().slice(-6)}`,
+          metadata: { tripId: trip._id, commission: commission }
+        }], { session });
+      }
+
+      trip.status = 'completed';
+      trip.completedAt = new Date();
+      await trip.save({ session });
+
+      // ✅ ENSURE DRIVER STATE IS CLEANED UP
+      await User.findByIdAndUpdate(
+        driverId,
+        {
+          'driverProfile.isAvailable': true,
+          $unset: { 'driverProfile.currentTripId': '' }
+        },
+        { session }
+      );
+
+      console.log(`✅ Driver ${driverId} state cleaned up after trip completion`);
+
+      tripData = {
+        tripId: trip._id.toString(),
+        passengerId: trip.passengerId.toString(),
+        finalFare: trip.finalFare
+      };
+    });
+
+    res.json({ trip: tripData });
+
+    setImmediate(() => {
+      try {
+        emitter.emit('notification', {
+          userId: tripData.passengerId,
+          type: 'trip_completed',
+          title: 'Trip Completed',
+          body: `Your trip has been completed. Amount: ₦${(tripData.finalFare / 100).toFixed(2)}`,
+          data: { tripId: tripData.tripId, fare: tripData.finalFare }
+        });
+      } catch (emitErr) {
+        console.error('Notification error:', emitErr);
+      }
+    });
+
+  } catch (err) {
+    await session.abortTransaction();
+    console.error('Complete trip error:', err);
+    
+    if (err.message.includes('Insufficient')) {
+      return res.status(402).json({ error: { message: err.message } });
+    }
+    
+    next(err);
+  } finally {
+    await session.endSession();
+  }
 });
 
 // ==========================================
