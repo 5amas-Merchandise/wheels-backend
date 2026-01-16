@@ -596,251 +596,357 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 
 // In /trips/accept endpoint - COMPLETELY FIXED WITH PROPER LOCKING
 
+// ✅ COMPLETELY REWRITTEN: Accept Ride Endpoint (Backend)
 router.post('/accept', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
+  session.startTransaction();
+  
   let tripData = null;
   let notificationData = null;
-  let driverId = null;
-  let requestId = null;
+  let responseSent = false;
 
   try {
-    await session.withTransaction(async () => {
-      driverId = req.user.sub;
-      requestId = req.body.requestId;
-      const idempotencyKey = req.body.idempotencyKey || `accept_${requestId}_${driverId}_${Date.now()}`;
+    const driverId = req.user.sub;
+    const { requestId, idempotencyKey } = req.body;
 
-      console.log(`🤝 Driver ${driverId} attempting to accept ${requestId}`, { idempotencyKey });
+    // Validation
+    if (!requestId) {
+      throw new Error('Request ID is required');
+    }
 
-      // ✅ 1. Check idempotency FIRST
-      const idempotencyCollection = mongoose.connection.collection('idempotency_keys');
-      const existingKey = await idempotencyCollection.findOne({ key: idempotencyKey });
+    const finalIdempotencyKey = idempotencyKey || `accept_${requestId}_${driverId}_${Date.now()}`;
+
+    console.log(`🤝 Driver ${driverId} attempting to accept request ${requestId}`);
+    console.log('Idempotency key:', finalIdempotencyKey);
+
+    // ============================================
+    // STEP 1: Check Idempotency
+    // ============================================
+    const idempotencyCollection = mongoose.connection.collection('idempotency_keys');
+    const existingKey = await idempotencyCollection.findOne(
+      { key: finalIdempotencyKey },
+      { session }
+    );
+
+    if (existingKey) {
+      console.log('⚠️ Duplicate request detected');
       
-      if (existingKey) {
-        console.log('⚠️ Duplicate request detected via idempotency key');
-        // Return success if already processed
-        if (existingKey.tripId) {
-          console.log('✅ Returning existing trip data');
-          tripData = {
-            success: true,
-            tripId: existingKey.tripId.toString(),
-            requestId: existingKey.requestId.toString(),
-            fromCache: true
-          };
-          return; // Skip processing, return cached result
-        }
-        // If key exists but no tripId, it means processing failed previously
-        throw new Error('Previous accept attempt failed');
-      }
-
-      // ✅ 2. Insert idempotency key BEFORE processing (prevents race conditions)
-      await idempotencyCollection.insertOne({
-        key: idempotencyKey,
-        driverId: driverId,
-        requestId: requestId,
-        status: 'processing',
-        createdAt: new Date(),
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
-      }, { session });
-
-      // ✅ 3. Check driver availability
-      const driver = await User.findById(driverId).session(session);
-      if (!driver?.driverProfile?.isAvailable || driver.driverProfile.currentTripId) {
-        await idempotencyCollection.updateOne(
-          { key: idempotencyKey },
-          { $set: { status: 'failed', error: 'Driver not available' } },
-          { session }
-        );
-        throw new Error('Driver not available or already on a trip');
-      }
-
-      // ✅ 4. ATOMIC OPERATION: Find and update trip request with PROPER LOCKING
-      const tripRequest = await TripRequest.findOneAndUpdate(
-        {
-          _id: requestId,
-          status: 'searching',
-          assignedDriverId: null, // CRITICAL: Only if not already assigned
-          'candidates': {
-            $elemMatch: {
-              driverId: driverId,
-              status: 'offered'
-            }
-          }
-        },
-        {
-          $set: {
-            assignedDriverId: driverId,
-            status: 'assigned',
-            'candidates.$[elem].status': 'accepted'
-          }
-        },
-        {
-          arrayFilters: [{ 'elem.driverId': driverId }],
-          new: true,
-          session
-        }
-      );
-
-      if (!tripRequest) {
-        console.log(`❌ Driver ${driverId} cannot accept - trip unavailable or already assigned`);
+      if (existingKey.status === 'completed' && existingKey.tripId) {
+        // Return cached successful result
+        console.log('✅ Returning cached trip data');
+        await session.abortTransaction();
         
-        // Check why it failed
-        const currentRequest = await TripRequest.findById(requestId).session(session);
-        if (currentRequest) {
-          console.log(`Current status: ${currentRequest.status}, assigned to: ${currentRequest.assignedDriverId}`);
-        }
-        
-        await idempotencyCollection.updateOne(
-          { key: idempotencyKey },
-          { $set: { status: 'failed', error: 'Trip no longer available' } },
-          { session }
-        );
-        throw new Error('Trip no longer available or already assigned to another driver');
+        return res.json({
+          success: true,
+          tripId: existingKey.tripId.toString(),
+          requestId: existingKey.requestId.toString(),
+          driverId: driverId.toString(),
+          fromCache: true
+        });
+      } else if (existingKey.status === 'processing') {
+        throw new Error('Request is already being processed');
+      } else {
+        throw new Error('Previous accept attempt failed. Please try again.');
       }
+    }
 
-      console.log(`✅ Trip ${requestId} atomically assigned to driver ${driverId}`);
+    // ============================================
+    // STEP 2: Insert Idempotency Key (Lock)
+    // ============================================
+    await idempotencyCollection.insertOne({
+      key: finalIdempotencyKey,
+      driverId: driverId,
+      requestId: requestId,
+      status: 'processing',
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
+    }, { session });
 
-      // ✅ 5. Create trip document
-      const tripDoc = await Trip.create([{
-        passengerId: tripRequest.passengerId,
-        driverId,
-        tripRequestId: tripRequest._id,
-        serviceType: tripRequest.serviceType,
-        paymentMethod: tripRequest.paymentMethod,
-        pickupLocation: tripRequest.pickup,
-        dropoffLocation: tripRequest.dropoff,
-        status: 'assigned',
-        estimatedFare: tripRequest.estimatedFare || 0,
-        distanceKm: tripRequest.distance || 0,
-        durationMinutes: Math.round((tripRequest.duration || 0) / 60),
-        requestedAt: new Date()
-      }], { session });
+    console.log('🔒 Idempotency key inserted, processing locked');
 
-      const newTrip = tripDoc[0];
+    // ============================================
+    // STEP 3: Verify Driver Availability
+    // ============================================
+    const driver = await User.findById(driverId)
+      .select('name driverProfile')
+      .session(session);
 
-      // ✅ 6. Update driver availability
-      await User.findByIdAndUpdate(
-        driverId,
-        {
-          'driverProfile.isAvailable': false,
-          'driverProfile.currentTripId': newTrip._id
-        },
-        { session }
-      );
+    if (!driver) {
+      throw new Error('Driver not found');
+    }
 
-      // ✅ 7. Update idempotency key with success
+    if (!driver.driverProfile?.isAvailable) {
       await idempotencyCollection.updateOne(
-        { key: idempotencyKey },
-        { 
-          $set: { 
-            status: 'completed',
-            tripId: newTrip._id,
-            updatedAt: new Date()
-          }
-        },
+        { key: finalIdempotencyKey },
+        { $set: { status: 'failed', error: 'Driver not available' } },
         { session }
       );
+      throw new Error('Driver is not available');
+    }
 
-      // ✅ 8. Prepare response data
-      tripData = {
-        success: true,
-        tripId: newTrip._id.toString(),
-        requestId: tripRequest._id.toString(),
-        driverId: driverId.toString()
-      };
+    if (driver.driverProfile?.currentTripId) {
+      await idempotencyCollection.updateOne(
+        { key: finalIdempotencyKey },
+        { $set: { status: 'failed', error: 'Driver already on trip' } },
+        { session }
+      );
+      throw new Error('Driver is already on a trip');
+    }
 
-      // ✅ 9. Prepare notification data
-      notificationData = {
-        passengerId: tripRequest.passengerId.toString(),
-        driverId: driverId.toString(),
-        tripId: newTrip._id.toString(),
-        requestId: tripRequest._id.toString(),
-        driverName: driver.name,
-        serviceType: tripRequest.serviceType,
-        estimatedFare: tripRequest.estimatedFare || 0,
-        pickup: tripRequest.pickup,
-        dropoff: tripRequest.dropoff,
-        pickupAddress: tripRequest.pickupAddress || '',
-        dropoffAddress: tripRequest.dropoffAddress || ''
-      };
+    console.log('✅ Driver availability verified');
 
-      console.log(`✅ Trip ${newTrip._id} created successfully for driver ${driverId}`);
-    });
+    // ============================================
+    // STEP 4: Atomic Trip Assignment
+    // ============================================
+    const tripRequest = await TripRequest.findOneAndUpdate(
+      {
+        _id: requestId,
+        status: 'searching',
+        assignedDriverId: null, // CRITICAL: Must be null
+        'candidates': {
+          $elemMatch: {
+            driverId: driverId,
+            status: 'offered' // Driver must have been offered this trip
+          }
+        }
+      },
+      {
+        $set: {
+          assignedDriverId: driverId,
+          status: 'assigned',
+          'candidates.$[elem].status': 'accepted',
+          'candidates.$[elem].acceptedAt': new Date()
+        }
+      },
+      {
+        arrayFilters: [{ 'elem.driverId': driverId }],
+        new: true,
+        session
+      }
+    );
 
-    // ✅✅✅ SEND RESPONSE ONLY AFTER TRANSACTION COMMITS
-    console.log('Transaction committed, sending response');
+    if (!tripRequest) {
+      console.log(`❌ Cannot assign trip - checking current state`);
+      
+      // Debug: Check why it failed
+      const currentRequest = await TripRequest.findById(requestId).session(session);
+      
+      if (!currentRequest) {
+        console.log('Trip request not found');
+        await idempotencyCollection.updateOne(
+          { key: finalIdempotencyKey },
+          { $set: { status: 'failed', error: 'Trip request not found' } },
+          { session }
+        );
+        throw new Error('Trip request not found');
+      }
+      
+      console.log(`Current status: ${currentRequest.status}`);
+      console.log(`Assigned to: ${currentRequest.assignedDriverId}`);
+      
+      const candidate = currentRequest.candidates.find(c => c.driverId.toString() === driverId.toString());
+      console.log(`Candidate status: ${candidate?.status || 'not found'}`);
+      
+      await idempotencyCollection.updateOne(
+        { key: finalIdempotencyKey },
+        { $set: { status: 'failed', error: 'Trip no longer available' } },
+        { session }
+      );
+      
+      if (currentRequest.assignedDriverId && currentRequest.assignedDriverId.toString() !== driverId.toString()) {
+        throw new Error('Trip was already assigned to another driver');
+      } else if (currentRequest.status !== 'searching') {
+        throw new Error('Trip is no longer available');
+      } else if (!candidate || candidate.status !== 'offered') {
+        throw new Error('You were not offered this trip');
+      } else {
+        throw new Error('Trip is no longer available');
+      }
+    }
+
+    console.log(`✅ Trip ${requestId} atomically assigned to driver ${driverId}`);
+
+    // ============================================
+    // STEP 5: Create Trip Document
+    // ============================================
+    const tripDoc = await Trip.create([{
+      passengerId: tripRequest.passengerId,
+      driverId: driverId,
+      tripRequestId: tripRequest._id,
+      serviceType: tripRequest.serviceType,
+      paymentMethod: tripRequest.paymentMethod || 'wallet',
+      pickupLocation: tripRequest.pickup,
+      dropoffLocation: tripRequest.dropoff,
+      status: 'assigned',
+      estimatedFare: tripRequest.estimatedFare || 0,
+      distanceKm: tripRequest.distance || 0,
+      durationMinutes: Math.round((tripRequest.duration || 0) / 60),
+      requestedAt: new Date()
+    }], { session });
+
+    const newTrip = tripDoc[0];
+    console.log(`✅ Trip document ${newTrip._id} created`);
+
+    // ============================================
+    // STEP 6: Update Driver Status
+    // ============================================
+    await User.findByIdAndUpdate(
+      driverId,
+      {
+        'driverProfile.isAvailable': false,
+        'driverProfile.currentTripId': newTrip._id
+      },
+      { session }
+    );
+
+    console.log('✅ Driver status updated');
+
+    // ============================================
+    // STEP 7: Update Idempotency Key (Success)
+    // ============================================
+    await idempotencyCollection.updateOne(
+      { key: finalIdempotencyKey },
+      { 
+        $set: { 
+          status: 'completed',
+          tripId: newTrip._id,
+          requestId: tripRequest._id,
+          updatedAt: new Date()
+        }
+      },
+      { session }
+    );
+
+    console.log('✅ Idempotency key updated to completed');
+
+    // ============================================
+    // STEP 8: Commit Transaction
+    // ============================================
+    await session.commitTransaction();
+    console.log('✅ Transaction committed successfully');
+
+    // ============================================
+    // STEP 9: Prepare Response
+    // ============================================
+    tripData = {
+      success: true,
+      tripId: newTrip._id.toString(),
+      requestId: tripRequest._id.toString(),
+      driverId: driverId.toString()
+    };
+
+    notificationData = {
+      passengerId: tripRequest.passengerId.toString(),
+      driverId: driverId.toString(),
+      tripId: newTrip._id.toString(),
+      requestId: tripRequest._id.toString(),
+      driverName: driver.name || 'Driver',
+      serviceType: tripRequest.serviceType,
+      estimatedFare: tripRequest.estimatedFare || 0,
+      pickup: tripRequest.pickup,
+      dropoff: tripRequest.dropoff,
+      pickupAddress: tripRequest.pickupAddress || '',
+      dropoffAddress: tripRequest.dropoffAddress || ''
+    };
+
+    // ============================================
+    // STEP 10: Send Response IMMEDIATELY
+    // ============================================
     res.json(tripData);
+    responseSent = true;
+    console.log('✅ Response sent to driver');
 
-    // ✅ Send notifications AFTER response (non-blocking)
-    if (notificationData) {
-      setTimeout(() => {
-        try {
-          // Notify passenger
-          emitter.emit('notification', {
-            userId: notificationData.passengerId,
-            type: 'trip_accepted',
-            notificationType: 'trip_accepted',
-            title: 'Driver Accepted!',
-            body: `${notificationData.driverName} is on the way`,
-            data: {
-              requestId: notificationData.requestId,
-              tripId: notificationData.tripId,
-              driverId: notificationData.driverId,
-              driverName: notificationData.driverName,
-              serviceType: notificationData.serviceType,
-              estimatedFare: notificationData.estimatedFare,
-              pickup: notificationData.pickup,
-              dropoff: notificationData.dropoff,
-              pickupAddress: notificationData.pickupAddress,
-              dropoffAddress: notificationData.dropoffAddress
-            }
-          });
-
-          console.log(`📨 Trip acceptance notification sent to passenger ${notificationData.passengerId}`);
-          
-          // Also emit WebSocket event
-          emitter.emit('trip_accepted', {
+    // ============================================
+    // STEP 11: Send Notifications (Non-blocking)
+    // ============================================
+    setImmediate(() => {
+      try {
+        // Notify passenger
+        emitter.emit('notification', {
+          userId: notificationData.passengerId,
+          type: 'trip_accepted',
+          notificationType: 'trip_accepted',
+          title: 'Driver Accepted!',
+          body: `${notificationData.driverName} is on the way`,
+          data: {
             requestId: notificationData.requestId,
             tripId: notificationData.tripId,
             driverId: notificationData.driverId,
-            driverName: notificationData.driverName
-          });
-
-        } catch (emitErr) {
-          console.error('❌ Notification emit error (non-fatal):', emitErr);
-        }
-      }, 100);
-    }
-
-  } catch (err) {
-    await session.abortTransaction();
-    console.error('❌ Accept error:', err.message);
-
-    // Clean up idempotency key if it exists
-    try {
-      if (requestId && driverId) {
-        const errorIdempotencyKey = `accept_${requestId}_${driverId}_${Date.now()}`;
-        await mongoose.connection.collection('idempotency_keys').deleteOne({ 
-          key: errorIdempotencyKey 
+            driverName: notificationData.driverName,
+            serviceType: notificationData.serviceType,
+            estimatedFare: notificationData.estimatedFare,
+            pickup: notificationData.pickup,
+            dropoff: notificationData.dropoff,
+            pickupAddress: notificationData.pickupAddress,
+            dropoffAddress: notificationData.dropoffAddress
+          }
         });
+
+        // Emit WebSocket event
+        emitter.emit('trip_accepted', {
+          requestId: notificationData.requestId,
+          tripId: notificationData.tripId,
+          driverId: notificationData.driverId,
+          driverName: notificationData.driverName
+        });
+
+        console.log(`📨 Notifications sent for trip ${notificationData.tripId}`);
+      } catch (emitErr) {
+        console.error('❌ Notification error (non-fatal):', emitErr.message);
       }
-    } catch (cleanupErr) {
-      console.error('Idempotency key cleanup error:', cleanupErr);
+    });
+
+  } catch (error) {
+    // Abort transaction if not committed
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log('❌ Transaction aborted');
     }
 
-    const errorMessage = err.message;
-    const statusCode = errorMessage.includes('not available') || 
-                       errorMessage.includes('no longer available') ||
-                       errorMessage.includes('already assigned') ||
-                       errorMessage.includes('already processed') ? 400 : 500;
+    console.error('❌ Accept error:', error.message);
+    console.error('Stack:', error.stack);
 
-    res.status(statusCode).json({ 
-      error: { 
-        message: errorMessage,
-        code: errorMessage.includes('already processed') ? 'DUPLICATE_REQUEST' : 
-              errorMessage.includes('already assigned') ? 'TRIP_ALREADY_ASSIGNED' : 'TRIP_UNAVAILABLE'
-      } 
-    });
+    // Send error response if not already sent
+    if (!responseSent) {
+      const errorMessage = error.message || 'Failed to accept ride';
+      let statusCode = 500;
+      let errorCode = 'INTERNAL_ERROR';
+
+      // Determine status code and error code
+      if (errorMessage.includes('not found')) {
+        statusCode = 404;
+        errorCode = 'NOT_FOUND';
+      } else if (
+        errorMessage.includes('not available') ||
+        errorMessage.includes('already on a trip') ||
+        errorMessage.includes('not offered') ||
+        errorMessage.includes('already assigned') ||
+        errorMessage.includes('already processed')
+      ) {
+        statusCode = 400;
+        
+        if (errorMessage.includes('already processed')) {
+          errorCode = 'DUPLICATE_REQUEST';
+        } else if (errorMessage.includes('already assigned')) {
+          errorCode = 'TRIP_ALREADY_ASSIGNED';
+        } else {
+          errorCode = 'TRIP_UNAVAILABLE';
+        }
+      } else if (errorMessage.includes('required') || errorMessage.includes('Invalid')) {
+        statusCode = 400;
+        errorCode = 'INVALID_REQUEST';
+      }
+
+      res.status(statusCode).json({
+        success: false,
+        error: {
+          message: errorMessage,
+          code: errorCode
+        }
+      });
+    }
   } finally {
+    // Always end session
     await session.endSession();
   }
 });
