@@ -1588,128 +1588,223 @@ router.get('/drivers/current-state', requireAuth, async (req, res) => {
 });
 
 // ==========================================
-// AUTOMATIC CLEANUP ON TRIP COMPLETION/CANCELLATION
+// POST /trips/:tripId/complete - COMPLETELY FIXED
 // ==========================================
-// Add this to your existing /trips/:tripId/complete endpoint
-// (This ensures driver state is ALWAYS cleaned up when trip ends)
 
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
-  let tripData;
+  session.startTransaction();
   
+  let tripData = null;
+  let passengerId = null;
+  let finalFare = 0;
+  let tripId = req.params.tripId;
+
   try {
-    await session.withTransaction(async () => {
-      const driverId = req.user.sub;
-      const { actualDistanceKm, actualDurationMinutes } = req.body;
+    const driverId = req.user.sub;
+    const { actualDistanceKm, actualDurationMinutes, paymentConfirmation } = req.body;
 
-      const trip = await Trip.findById(req.params.tripId).session(session);
-      if (!trip) throw new Error('Trip not found');
-      if (trip.driverId.toString() !== driverId) throw new Error('Unauthorized');
+    console.log(`✅ Driver ${driverId} completing trip ${tripId}`);
+    console.log('Payment confirmation:', paymentConfirmation);
 
-      const finalDistance = actualDistanceKm || trip.distanceKm;
-      const finalDuration = actualDurationMinutes || trip.durationMinutes;
+    // Check if trip exists
+    const existingTrip = await Trip.findById(tripId).session(session);
+    if (!existingTrip) {
+      throw new Error('Trip not found');
+    }
 
-      const fareData = await calculateFare({
-        serviceType: trip.serviceType,
-        distanceKm: finalDistance,
-        durationMinutes: finalDuration
-      });
+    // Authorization check
+    if (existingTrip.driverId.toString() !== driverId) {
+      throw new Error('Unauthorized: You are not the driver for this trip');
+    }
 
-      trip.finalFare = fareData.baseAmount;
-      trip.distanceKm = finalDistance;
-      trip.durationMinutes = finalDuration;
+    // Check if trip is already completed or cancelled
+    if (['completed', 'cancelled'].includes(existingTrip.status)) {
+      throw new Error(`Trip is already ${existingTrip.status}`);
+    }
 
-      let commission = 0;
-      if (isLuxury(trip.serviceType)) {
-        const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
-        const percent = setting?.value ? Number(setting.value) : 10;
-        commission = Math.round((percent / 100) * trip.finalFare);
+    // Use actual metrics if provided, otherwise use estimated
+    const finalDistance = actualDistanceKm || existingTrip.distanceKm || 0;
+    const finalDuration = actualDurationMinutes || existingTrip.durationMinutes || 0;
+
+    // Calculate fare
+    const fareData = await calculateFare({
+      serviceType: existingTrip.serviceType,
+      distanceKm: finalDistance,
+      durationMinutes: finalDuration
+    });
+
+    finalFare = fareData.baseAmount;
+
+    // Calculate commission for luxury rides
+    let commission = 0;
+    if (isLuxury(existingTrip.serviceType)) {
+      const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
+      const percent = setting?.value ? Number(setting.value) : 10;
+      commission = Math.round((percent / 100) * finalFare);
+    }
+
+    const driverEarnings = finalFare - commission;
+
+    // Handle wallet payment
+    if (existingTrip.paymentMethod === 'wallet') {
+      const passengerWallet = await Wallet.findOne({ owner: existingTrip.passengerId }).session(session);
+      if (!passengerWallet) {
+        throw new Error('Passenger wallet not found');
       }
 
-      trip.commission = commission;
-      trip.driverEarnings = trip.finalFare - commission;
-
-      if (trip.paymentMethod === 'wallet') {
-        const passengerWallet = await Wallet.findOne({ owner: trip.passengerId }).session(session);
-        if (!passengerWallet || passengerWallet.balance < trip.finalFare) {
-          throw new Error('Insufficient balance');
-        }
-
-        await Wallet.findOneAndUpdate(
-          { owner: trip.passengerId },
-          { $inc: { balance: -trip.finalFare } },
-          { session }
-        );
-
-        await Wallet.findOneAndUpdate(
-          { owner: driverId },
-          { $inc: { balance: trip.driverEarnings } },
-          { upsert: true, session }
-        );
-
-        await Transaction.create([{
-          userId: trip.passengerId,
-          type: 'trip_payment',
-          amount: -trip.finalFare,
-          description: `Trip #${trip._id.toString().slice(-6)}`,
-          metadata: { tripId: trip._id }
-        }, {
-          userId: driverId,
-          type: 'trip_earnings',
-          amount: trip.driverEarnings,
-          description: `Earnings from trip #${trip._id.toString().slice(-6)}`,
-          metadata: { tripId: trip._id, commission: commission }
-        }], { session });
+      if (passengerWallet.balance < finalFare) {
+        throw new Error('Passenger has insufficient balance');
       }
 
-      trip.status = 'completed';
-      trip.completedAt = new Date();
-      await trip.save({ session });
-
-      // ✅ ENSURE DRIVER STATE IS CLEANED UP
-      await User.findByIdAndUpdate(
-        driverId,
-        {
-          'driverProfile.isAvailable': true,
-          $unset: { 'driverProfile.currentTripId': '' }
-        },
+      // Deduct from passenger wallet
+      await Wallet.findOneAndUpdate(
+        { owner: existingTrip.passengerId },
+        { $inc: { balance: -finalFare } },
         { session }
       );
 
-      console.log(`✅ Driver ${driverId} state cleaned up after trip completion`);
+      // Add to driver wallet
+      await Wallet.findOneAndUpdate(
+        { owner: driverId },
+        { $inc: { balance: driverEarnings } },
+        { upsert: true, session }
+      );
 
-      tripData = {
-        tripId: trip._id.toString(),
-        passengerId: trip.passengerId.toString(),
-        finalFare: trip.finalFare
-      };
-    });
+      // Record transactions
+      await Transaction.create([{
+        userId: existingTrip.passengerId,
+        type: 'trip_payment',
+        amount: -finalFare,
+        description: `Trip #${tripId.slice(-6)}`,
+        metadata: { tripId: existingTrip._id }
+      }, {
+        userId: driverId,
+        type: 'trip_earnings',
+        amount: driverEarnings,
+        description: `Earnings from trip #${tripId.slice(-6)}`,
+        metadata: { tripId: existingTrip._id, commission }
+      }], { session });
+    }
 
-    res.json({ trip: tripData });
+    // Update trip document
+    const updatedTrip = await Trip.findByIdAndUpdate(
+      tripId,
+      {
+        status: 'completed',
+        finalFare,
+        distanceKm: finalDistance,
+        durationMinutes: finalDuration,
+        commission,
+        driverEarnings,
+        completedAt: new Date()
+      },
+      { new: true, session }
+    );
 
-    setImmediate(() => {
+    // Store data for response
+    tripData = updatedTrip;
+    passengerId = existingTrip.passengerId.toString();
+
+    // CRITICAL: Clean up driver state
+    await User.findByIdAndUpdate(
+      driverId,
+      {
+        'driverProfile.isAvailable': true,
+        $unset: { 'driverProfile.currentTripId': '' }
+      },
+      { session }
+    );
+
+    console.log(`✅ Driver ${driverId} state cleaned up and marked available`);
+
+    // Commit transaction
+    await session.commitTransaction();
+    console.log(`✅ Transaction committed for trip ${tripId}`);
+
+    // Prepare success response
+    const responseData = {
+      success: true,
+      trip: {
+        id: tripData._id.toString(),
+        status: tripData.status,
+        finalFare: tripData.finalFare,
+        completedAt: tripData.completedAt,
+        driverEarnings: tripData.driverEarnings
+      }
+    };
+
+    res.json(responseData);
+
+    // Send notifications AFTER response is sent (non-blocking)
+    setImmediate(async () => {
       try {
+        // Notify passenger
         emitter.emit('notification', {
-          userId: tripData.passengerId,
+          userId: passengerId,
           type: 'trip_completed',
           title: 'Trip Completed',
-          body: `Your trip has been completed. Amount: ₦${(tripData.finalFare / 100).toFixed(2)}`,
-          data: { tripId: tripData.tripId, fare: tripData.finalFare }
+          body: `Your trip has been completed. Amount: ₦${(finalFare / 100).toFixed(2)}`,
+          data: {
+            tripId: tripId,
+            fare: finalFare,
+            status: 'completed'
+          }
         });
+
+        // Also emit trip_completed event for real-time updates
+        emitter.emit('trip_completed', {
+          tripId: tripId,
+          driverId: driverId,
+          passengerId: passengerId,
+          finalFare: finalFare,
+          completedAt: new Date()
+        });
+
+        console.log(`📨 Notifications sent for completed trip ${tripId}`);
       } catch (emitErr) {
-        console.error('Notification error:', emitErr);
+        console.error('Notification error (non-fatal):', emitErr);
       }
     });
 
-  } catch (err) {
-    await session.abortTransaction();
-    console.error('Complete trip error:', err);
-    
-    if (err.message.includes('Insufficient')) {
-      return res.status(402).json({ error: { message: err.message } });
+  } catch (error) {
+    // Abort transaction on error
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+      console.log('❌ Transaction aborted');
     }
-    
-    next(err);
+
+    console.error('❌ Complete trip error:', error.message);
+
+    // Determine appropriate error response
+    let statusCode = 500;
+    let errorCode = 'INTERNAL_ERROR';
+    let errorMessage = error.message || 'Failed to complete trip';
+
+    if (error.message.includes('not found')) {
+      statusCode = 404;
+      errorCode = 'TRIP_NOT_FOUND';
+    } else if (error.message.includes('Unauthorized')) {
+      statusCode = 403;
+      errorCode = 'UNAUTHORIZED';
+    } else if (error.message.includes('already completed') || error.message.includes('already cancelled')) {
+      statusCode = 400;
+      errorCode = 'TRIP_ALREADY_ENDED';
+    } else if (error.message.includes('insufficient balance')) {
+      statusCode = 402;
+      errorCode = 'INSUFFICIENT_BALANCE';
+    } else if (error.message.includes('required') || error.message.includes('Invalid')) {
+      statusCode = 400;
+      errorCode = 'INVALID_REQUEST';
+    }
+
+    res.status(statusCode).json({
+      success: false,
+      error: {
+        message: errorMessage,
+        code: errorCode
+      }
+    });
   } finally {
     await session.endSession();
   }

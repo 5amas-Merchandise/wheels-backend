@@ -6,7 +6,7 @@ const TripSchema = new mongoose.Schema({
   driverId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
   tripRequestId: { type: mongoose.Schema.Types.ObjectId, ref: 'TripRequest' },
   serviceType: { type: String, required: true },
-  paymentMethod: { type: String, enum: ['wallet','cash'], default: 'wallet' },
+  paymentMethod: { type: String, enum: ['wallet','cash'], default: 'cash' },
   status: {
     type: String,
     enum: ['assigned', 'pending', 'started', 'in_progress', 'completed', 'cancelled'],
