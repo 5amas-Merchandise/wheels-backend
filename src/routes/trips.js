@@ -1000,105 +1000,54 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
 // 🚨 FIX #2: CORRECT TRANSACTION USAGE - REMOVE manual start/commit, use withTransaction
 // ONLY KEEP THIS ONE /complete ENDPOINT
 
+// In routes/trips.routes.js - SIMPLIFIED CASH-ONLY COMPLETE ENDPOINT
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
   
   try {
-    // 🚨 FIX #2: Use withTransaction instead of manual start/commit
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
-      const { actualDistanceKm, actualDurationMinutes, paymentConfirmation } = req.body;
+      const { cashReceived } = req.body;
       const tripId = req.params.tripId;
 
-      console.log(`✅ Driver ${driverId} completing trip ${tripId}`);
-      console.log('Payment confirmation:', paymentConfirmation);
+      console.log(`✅ Driver ${driverId} completing trip ${tripId} (Cash payment)`);
 
+      // 1. Find the trip
       const existingTrip = await Trip.findById(tripId).session(session);
       if (!existingTrip) {
         throw new Error('Trip not found');
       }
 
+      // 2. Authorization check
       if (existingTrip.driverId.toString() !== driverId) {
         throw new Error('Unauthorized: You are not the driver for this trip');
       }
 
+      // 3. Check if trip is already ended
       if (['completed', 'cancelled'].includes(existingTrip.status)) {
         throw new Error(`Trip is already ${existingTrip.status}`);
       }
 
-      // 🚨 FIX #4: Use actual metrics if provided, otherwise use stored values
-      const finalDistance = actualDistanceKm || existingTrip.distanceKm || 0;
-      const finalDuration = actualDurationMinutes || existingTrip.durationMinutes || 0;
+      // 4. SIMPLIFIED: Use estimated fare as final fare (no calculations)
+      const finalFare = existingTrip.estimatedFare || 0;
+      
+      console.log(`💰 Using estimated fare: ₦${(finalFare / 100).toFixed(2)}`);
 
-      const fareData = await calculateFare({
-        serviceType: existingTrip.serviceType,
-        distanceKm: finalDistance,
-        durationMinutes: finalDuration
-      });
-
-      const finalFare = fareData.baseAmount;
-
-      let commission = 0;
-      if (isLuxury(existingTrip.serviceType)) {
-        const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
-        const percent = setting?.value ? Number(setting.value) : 10;
-        commission = Math.round((percent / 100) * finalFare);
-      }
-
-      const driverEarnings = finalFare - commission;
-
-      if (existingTrip.paymentMethod === 'wallet') {
-        const passengerWallet = await Wallet.findOne({ owner: existingTrip.passengerId }).session(session);
-        if (!passengerWallet) {
-          throw new Error('Passenger wallet not found');
-        }
-
-        if (passengerWallet.balance < finalFare) {
-          throw new Error('Passenger has insufficient balance');
-        }
-
-        await Wallet.findOneAndUpdate(
-          { owner: existingTrip.passengerId },
-          { $inc: { balance: -finalFare } },
-          { session }
-        );
-
-        await Wallet.findOneAndUpdate(
-          { owner: driverId },
-          { $inc: { balance: driverEarnings } },
-          { upsert: true, session }
-        );
-
-        await Transaction.create([{
-          userId: existingTrip.passengerId,
-          type: 'trip_payment',
-          amount: -finalFare,
-          description: `Trip #${tripId.slice(-6)}`,
-          metadata: { tripId: existingTrip._id }
-        }, {
-          userId: driverId,
-          type: 'trip_earnings',
-          amount: driverEarnings,
-          description: `Earnings from trip #${tripId.slice(-6)}`,
-          metadata: { tripId: existingTrip._id, commission }
-        }], { session });
-      }
-
+      // 5. Update trip document - SIMPLIFIED: Just mark as completed
       const updatedTrip = await Trip.findByIdAndUpdate(
         tripId,
         {
           status: 'completed',
-          finalFare,
-          distanceKm: finalDistance,
-          durationMinutes: finalDuration,
-          commission,
-          driverEarnings,
-          completedAt: new Date()
+          finalFare: finalFare,
+          completedAt: new Date(),
+          // Store that it was cash payment
+          paymentMethod: 'cash',
+          paymentConfirmed: cashReceived || true
         },
         { new: true, session }
       );
 
-      // CRITICAL: Clean up driver state
+      // 6. CRITICAL: Clean up driver state (make driver available again)
       await User.findByIdAndUpdate(
         driverId,
         {
@@ -1108,23 +1057,24 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
         { session }
       );
 
-      console.log(`✅ Driver ${driverId} state cleaned up and marked available`);
+      console.log(`✅ Driver ${driverId} marked available after cash trip completion`);
 
-      // 🚨 FIX #3: Consistent response format
+      // 7. Send simple success response
       res.json({
         success: true,
         trip: {
           id: updatedTrip._id.toString(),
           status: updatedTrip.status,
           finalFare: updatedTrip.finalFare,
-          completedAt: updatedTrip.completedAt,
-          driverEarnings: updatedTrip.driverEarnings
-        }
+          completedAt: updatedTrip.completedAt
+        },
+        message: 'Trip completed successfully. Driver is now available for new trips.'
       });
 
-      // Send notifications AFTER response
+      // 8. Send notifications AFTER response (non-blocking)
       setImmediate(async () => {
         try {
+          // Notify passenger
           emitter.emit('notification', {
             userId: existingTrip.passengerId.toString(),
             type: 'trip_completed',
@@ -1137,6 +1087,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
             }
           });
 
+          // Emit trip_completed event for real-time updates
           emitter.emit('trip_completed', {
             tripId: tripId,
             driverId: driverId,
@@ -1155,6 +1106,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   } catch (error) {
     console.error('❌ Complete trip error:', error.message);
 
+    // SIMPLIFIED error handling
     let statusCode = 500;
     let errorCode = 'INTERNAL_ERROR';
     let errorMessage = error.message || 'Failed to complete trip';
@@ -1168,12 +1120,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
     } else if (error.message.includes('already completed') || error.message.includes('already cancelled')) {
       statusCode = 400;
       errorCode = 'TRIP_ALREADY_ENDED';
-    } else if (error.message.includes('insufficient balance')) {
-      statusCode = 402;
-      errorCode = 'INSUFFICIENT_BALANCE';
-    } else if (error.message.includes('required') || error.message.includes('Invalid')) {
-      statusCode = 400;
-      errorCode = 'INVALID_REQUEST';
+      errorMessage = 'This trip has already been ended.';
     }
 
     res.status(statusCode).json({
@@ -1207,41 +1154,32 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
 
+    // SIMPLIFIED: Just mark as cancelled
     trip.status = 'cancelled';
     trip.cancelledAt = new Date();
     trip.cancellationReason = reason || (isPassenger ? 'passenger_cancelled' : 'driver_cancelled');
     await trip.save();
 
-    // ✅ Clean up driver state
-    if (trip.driverId) {
+    // ✅ Clean up driver state if driver cancelled
+    if (isDriver && trip.driverId) {
       await User.findByIdAndUpdate(trip.driverId, {
         'driverProfile.isAvailable': true,
         $unset: { 'driverProfile.currentTripId': '' }
       });
-      
-      console.log(`✅ Driver ${trip.driverId} state cleaned up after cancellation`);
     }
 
-    const notifyUserId = isPassenger ? trip.driverId : trip.passengerId;
-    if (notifyUserId) {
-      setImmediate(() => {
-        try {
-          emitter.emit('notification', {
-            userId: notifyUserId.toString(),
-            type: 'trip_cancelled',
-            title: 'Trip Cancelled',
-            body: `Trip was cancelled: ${trip.cancellationReason}`,
-            data: { tripId: trip._id, reason: trip.cancellationReason }
-          });
-        } catch (emitErr) {
-          console.error('Notification error:', emitErr);
-        }
-      });
-    }
+    res.json({ 
+      success: true,
+      trip,
+      message: 'Trip cancelled successfully'
+    });
 
-    res.json({ trip });
   } catch (err) {
-    next(err);
+    console.error('Cancel error:', err);
+    res.status(500).json({ 
+      success: false,
+      error: { message: 'Failed to cancel trip' } 
+    });
   }
 });
 
