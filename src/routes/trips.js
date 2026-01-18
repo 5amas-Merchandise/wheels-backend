@@ -1,3 +1,4 @@
+// routes/trips.routes.js (FIXED VERSION)
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -39,11 +40,6 @@ const CONFIG = {
 // ==========================================
 // REJECTION TRACKING IN DATABASE
 // ==========================================
-// We'll store rejection counts in TripRequest document instead of in-memory Map
-
-/**
- * Cleanup a trip request that couldn't find a driver
- */
 async function cleanupFailedTripRequest(requestId) {
   try {
     console.log(`🧹 Cleaning up failed trip request: ${requestId}`);
@@ -54,7 +50,6 @@ async function cleanupFailedTripRequest(requestId) {
       return;
     }
 
-    // Mark all remaining candidates as rejected
     tripRequest.candidates.forEach(candidate => {
       if (candidate.status === 'offered' || candidate.status === 'pending') {
         candidate.status = 'rejected';
@@ -66,7 +61,6 @@ async function cleanupFailedTripRequest(requestId) {
     tripRequest.status = 'no_drivers';
     await tripRequest.save();
 
-    // Notify passenger
     try {
       emitter.emit('notification', {
         userId: tripRequest.passengerId.toString(),
@@ -84,7 +78,6 @@ async function cleanupFailedTripRequest(requestId) {
 
     console.log(`✅ Trip request ${requestId} marked as no_drivers and cleaned up`);
 
-    // Delete after configured time
     setTimeout(async () => {
       try {
         await TripRequest.findByIdAndDelete(requestId);
@@ -99,18 +92,14 @@ async function cleanupFailedTripRequest(requestId) {
   }
 }
 
-/**
- * Track rejection and cleanup if threshold reached
- */
 async function trackRejection(requestId) {
   try {
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest) return false;
 
-    // Count active rejections (excluding timeouts that happen after cleanup)
     const rejectionCount = tripRequest.candidates.filter(
       c => c.status === 'rejected' && 
-           c.rejectionReason !== 'max_attempts_reached' // Don't count auto-cleanup rejections
+           c.rejectionReason !== 'max_attempts_reached'
     ).length;
 
     console.log(`📊 Trip ${requestId} rejection count: ${rejectionCount}/${CONFIG.MAX_REJECTIONS}`);
@@ -118,10 +107,10 @@ async function trackRejection(requestId) {
     if (rejectionCount >= CONFIG.MAX_REJECTIONS) {
       console.log(`🚫 Trip ${requestId} reached max rejections (${CONFIG.MAX_REJECTIONS}), initiating cleanup`);
       await cleanupFailedTripRequest(requestId);
-      return true; // Cleanup triggered
+      return true;
     }
 
-    return false; // Continue to next driver
+    return false;
   } catch (err) {
     console.error(`❌ Error tracking rejection for ${requestId}:`, err);
     return false;
@@ -148,7 +137,7 @@ function toRad(degrees) {
 }
 
 // ==========================================
-// POST /trips/request - CREATE TRIP REQUEST (FIXED)
+// POST /trips/request - CREATE TRIP REQUEST
 // ==========================================
 
 router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
@@ -182,7 +171,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
       console.log('Estimated Fare:', estimatedFare);
       console.log('Distance:', distance, 'km');
 
-      // Input validation
       if (!pickup || !validateCoordinates(pickup.coordinates)) {
         throw new Error('Invalid pickup coordinates');
       }
@@ -191,7 +179,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         throw new Error('Invalid serviceType');
       }
 
-      // Validate numeric inputs
       if (estimatedFare && (estimatedFare < 0 || estimatedFare > 1000000)) {
         throw new Error('Invalid estimated fare');
       }
@@ -211,11 +198,9 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
       console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${searchRadius}m`);
 
-      // Find nearby drivers
       let nearbyDrivers = [];
       
       try {
-        // Primary: Use MongoDB geospatial query with 2dsphere index
         nearbyDrivers = await User.find({
           'roles.isDriver': true,
           'driverProfile.verified': true,
@@ -244,7 +229,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
       console.log(`📊 Found ${nearbyDrivers?.length || 0} nearby drivers`);
 
-      // Filter drivers by service type
       const candidates = [];
       for (const driver of (nearbyDrivers || [])) {
         const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
@@ -287,7 +271,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
         createdRequestId = tripRequest[0]._id;
         
-        // Store response data
         responsePayload = {
           requestId: tripRequest[0]._id,
           message: 'No drivers available'
@@ -296,10 +279,9 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         candidateData = null;
         firstCandidate = null;
         
-        return; // Transaction will commit
+        return;
       }
 
-      // Offer to first driver immediately
       if (candidates.length > 0) {
         candidates[0].status = 'offered';
         candidates[0].offeredAt = now;
@@ -307,7 +289,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         console.log(`📤 Offering to first driver: ${candidates[0].driverId}`);
       }
 
-      // Create trip request
       tripRequest = await TripRequest.create([{
         passengerId,
         pickup,
@@ -329,7 +310,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
       console.log(`✅ Trip request ${createdRequest._id} created with ${candidates.length} candidates`);
 
-      // Store response data
       responsePayload = {
         requestId: createdRequest._id,
         candidatesCount: candidates.length,
@@ -351,10 +331,8 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
       
     });
 
-    // ✅ Send response AFTER transaction
     res.json(responsePayload);
 
-    // ✅ Now safe to emit events
     if (createdRequestId) {
       if (firstCandidate) {
         try {
@@ -382,7 +360,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         }
       }
 
-      // Timeout for first driver (outside transaction)
       if (firstCandidate) {
         const firstDriverId = firstCandidate.driverId;
         
@@ -407,7 +384,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         }, CONFIG.OFFER_TIMEOUT_MS);
       }
     } else {
-      // No drivers case
       try {
         emitter.emit('notification', {
           userId: passengerId,
@@ -436,7 +412,7 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 });
 
 // ==========================================
-// OFFER TO NEXT DRIVER - WITH REJECTION CHECK
+// OFFER TO NEXT DRIVER
 // ==========================================
 
 async function offerToNext(requestId) {
@@ -449,14 +425,12 @@ async function offerToNext(requestId) {
       return;
     }
 
-    // Check rejection count BEFORE offering to next
     const shouldCleanup = await trackRejection(requestId);
     if (shouldCleanup) {
       console.log(`🚫 Trip ${requestId} reached max rejections, cleaning up`);
-      return; // Cleanup already triggered, stop here
+      return;
     }
 
-    // Find next pending candidate who hasn't been rejected
     const nextCandidate = tripRequest.candidates.find(
       c => c.status === 'pending' && !c.rejectedAt
     );
@@ -467,7 +441,6 @@ async function offerToNext(requestId) {
       return;
     }
 
-    // Double-check: never offer to previously rejected drivers (extra safety)
     const wasRejected = tripRequest.candidates.some(
       c => c.driverId.equals(nextCandidate.driverId) &&
            (c.status === 'rejected' || c.rejectedAt)
@@ -482,18 +455,15 @@ async function offerToNext(requestId) {
       return await offerToNext(requestId);
     }
 
-    // OFFER TO THE NEXT DRIVER
     nextCandidate.status = 'offered';
     nextCandidate.offeredAt = new Date();
     await tripRequest.save();
 
     const driverId = nextCandidate.driverId;
     
-    // Count current rejections for logging
     const rejectionCount = tripRequest.candidates.filter(c => c.status === 'rejected').length;
     console.log(`📤 Offering to driver ${driverId} (Attempt ${rejectionCount + 1}/${CONFIG.MAX_REJECTIONS})`);
 
-    // SEND NOTIFICATION TO THE DRIVER
     try {
       emitter.emit('notification', {
         userId: driverId.toString(),
@@ -517,7 +487,6 @@ async function offerToNext(requestId) {
       console.error('Notification emit error in offerToNext:', emitErr);
     }
 
-    // Timeout for this driver
     setTimeout(async () => {
       try {
         const fresh = await TripRequest.findById(requestId);
@@ -587,17 +556,9 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/accept - DRIVER ACCEPTS (COMPLETELY FIXED)
+// POST /trips/accept - DRIVER ACCEPTS (FIXED - NO AUTO CLEANUP)
 // ==========================================
 
-// ==========================================
-// POST /trips/accept - DRIVER ACCEPTS (COMPLETELY FIXED)
-// ==========================================
-
-// In /trips/accept endpoint - COMPLETELY FIXED WITH PROPER LOCKING
-
-// ✅ COMPLETELY REWRITTEN: Accept Ride Endpoint (Backend)
-// ✅ FIXED: Accept Ride with Automatic State Cleanup
 router.post('/accept', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -610,7 +571,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     const driverId = req.user.sub;
     const { requestId, idempotencyKey } = req.body;
 
-    // Validation
     if (!requestId) {
       throw new Error('Request ID is required');
     }
@@ -620,9 +580,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     console.log(`🤝 Driver ${driverId} attempting to accept request ${requestId}`);
     console.log('Idempotency key:', finalIdempotencyKey);
 
-    // ============================================
-    // STEP 1: Check Idempotency
-    // ============================================
     const idempotencyCollection = mongoose.connection.collection('idempotency_keys');
     const existingKey = await idempotencyCollection.findOne(
       { key: finalIdempotencyKey },
@@ -650,9 +607,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       }
     }
 
-    // ============================================
-    // STEP 2: Insert Idempotency Key (Lock)
-    // ============================================
     await idempotencyCollection.insertOne({
       key: finalIdempotencyKey,
       driverId: driverId,
@@ -664,9 +618,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.log('🔒 Idempotency key inserted');
 
-    // ============================================
-    // STEP 3: Verify Driver Availability + AUTO CLEANUP
-    // ============================================
     const driver = await User.findById(driverId)
       .select('name driverProfile')
       .session(session);
@@ -675,76 +626,19 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       throw new Error('Driver not found');
     }
 
-    // ✅ CHECK IF CURRENT TRIP IS ACTUALLY ACTIVE
-    if (driver.driverProfile?.currentTripId) {
-      console.log(`⚠️ Driver has currentTripId: ${driver.driverProfile.currentTripId}`);
-      
-      // Check if the trip actually exists and is active
-      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
-        .select('status')
-        .session(session);
-
-      if (!currentTrip || ['completed', 'cancelled'].includes(currentTrip.status)) {
-        // Trip doesn't exist or is finished - CLEAN UP THE STALE STATE
-        console.log(`🧹 Cleaning up stale currentTripId for driver ${driverId}`);
-        
-        await User.findByIdAndUpdate(
-          driverId,
-          {
-            'driverProfile.isAvailable': true,
-            $unset: { 'driverProfile.currentTripId': '' }
-          },
-          { session }
-        );
-
-        // Reload driver data after cleanup
-        const cleanedDriver = await User.findById(driverId)
-          .select('name driverProfile')
-          .session(session);
-        
-        driver.driverProfile = cleanedDriver.driverProfile;
-        console.log('✅ Driver state cleaned up and reloaded');
-      } else if (['assigned', 'started', 'in_progress'].includes(currentTrip.status)) {
-        // Driver is ACTUALLY on an active trip
-        await idempotencyCollection.updateOne(
-          { key: finalIdempotencyKey },
-          { $set: { status: 'failed', error: 'Driver on active trip' } },
-          { session }
-        );
-        throw new Error('Driver is already on an active trip');
-      }
-    }
-
-    // ✅ NOW CHECK AVAILABILITY AFTER CLEANUP
+    // 🚨 FIX #6: REMOVED AUTO-FIX LOGIC - Only check availability
     if (!driver.driverProfile?.isAvailable) {
       console.log(`⚠️ Driver isAvailable: ${driver.driverProfile?.isAvailable}`);
-      
-      // Auto-fix: If driver has no current trip but is marked unavailable, fix it
-      if (!driver.driverProfile?.currentTripId) {
-        console.log('🧹 Auto-fixing driver availability status');
-        
-        await User.findByIdAndUpdate(
-          driverId,
-          { 'driverProfile.isAvailable': true },
-          { session }
-        );
-        
-        console.log('✅ Driver availability auto-fixed');
-      } else {
-        await idempotencyCollection.updateOne(
-          { key: finalIdempotencyKey },
-          { $set: { status: 'failed', error: 'Driver not available' } },
-          { session }
-        );
-        throw new Error('Driver is not available');
-      }
+      await idempotencyCollection.updateOne(
+        { key: finalIdempotencyKey },
+        { $set: { status: 'failed', error: 'Driver not available' } },
+        { session }
+      );
+      throw new Error('Driver is not available');
     }
 
     console.log('✅ Driver availability verified');
 
-    // ============================================
-    // STEP 4: Atomic Trip Assignment
-    // ============================================
     const tripRequest = await TripRequest.findOneAndUpdate(
       {
         _id: requestId,
@@ -811,9 +705,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.log(`✅ Trip ${requestId} atomically assigned to driver ${driverId}`);
 
-    // ============================================
-    // STEP 5: Create Trip Document
-    // ============================================
     const tripDoc = await Trip.create([{
       passengerId: tripRequest.passengerId,
       driverId: driverId,
@@ -832,9 +723,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     const newTrip = tripDoc[0];
     console.log(`✅ Trip document ${newTrip._id} created`);
 
-    // ============================================
-    // STEP 6: Update Driver Status
-    // ============================================
     await User.findByIdAndUpdate(
       driverId,
       {
@@ -846,9 +734,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.log('✅ Driver status updated');
 
-    // ============================================
-    // STEP 7: Update Idempotency Key (Success)
-    // ============================================
     await idempotencyCollection.updateOne(
       { key: finalIdempotencyKey },
       { 
@@ -864,15 +749,9 @@ router.post('/accept', requireAuth, async (req, res, next) => {
 
     console.log('✅ Idempotency key updated to completed');
 
-    // ============================================
-    // STEP 8: Commit Transaction
-    // ============================================
     await session.commitTransaction();
     console.log('✅ Transaction committed successfully');
 
-    // ============================================
-    // STEP 9: Prepare Response
-    // ============================================
     tripData = {
       success: true,
       tripId: newTrip._id.toString(),
@@ -894,16 +773,10 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       dropoffAddress: tripRequest.dropoffAddress || ''
     };
 
-    // ============================================
-    // STEP 10: Send Response IMMEDIATELY
-    // ============================================
     res.json(tripData);
     responseSent = true;
     console.log('✅ Response sent to driver');
 
-    // ============================================
-    // STEP 11: Send Notifications (Non-blocking)
-    // ============================================
     setImmediate(() => {
       try {
         emitter.emit('notification', {
@@ -1013,7 +886,6 @@ router.post('/reject', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: { message: 'You were not offered this trip' } });
     }
 
-    // Mark as rejected with timestamp
     candidate.status = 'rejected';
     candidate.rejectedAt = new Date();
     candidate.rejectionReason = 'manual_rejection';
@@ -1021,7 +893,6 @@ router.post('/reject', requireAuth, async (req, res, next) => {
 
     console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
 
-    // Move to next driver
     await offerToNext(requestId);
 
     res.json({ success: true });
@@ -1032,7 +903,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// GET /trips/searching - DEBUG: Get all searching trip requests (ADMIN ONLY)
+// ADMIN ENDPOINTS
 // ==========================================
 
 const requireAdmin = (req, res, next) => {
@@ -1125,81 +996,109 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
   }
 });
 
+// 🚨 FIX #1: DELETE DUPLICATE COMPLETE ENDPOINT
+// 🚨 FIX #2: CORRECT TRANSACTION USAGE - REMOVE manual start/commit, use withTransaction
+// ONLY KEEP THIS ONE /complete ENDPOINT
+
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
-  let tripData;
   
   try {
+    // 🚨 FIX #2: Use withTransaction instead of manual start/commit
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
-      const { actualDistanceKm, actualDurationMinutes } = req.body;
+      const { actualDistanceKm, actualDurationMinutes, paymentConfirmation } = req.body;
+      const tripId = req.params.tripId;
 
-      const trip = await Trip.findById(req.params.tripId).session(session);
-      if (!trip) throw new Error('Trip not found');
-      if (trip.driverId.toString() !== driverId) throw new Error('Unauthorized');
+      console.log(`✅ Driver ${driverId} completing trip ${tripId}`);
+      console.log('Payment confirmation:', paymentConfirmation);
 
-      // Use actual metrics if provided, otherwise use estimated
-      const finalDistance = actualDistanceKm || trip.distanceKm;
-      const finalDuration = actualDurationMinutes || trip.durationMinutes;
+      const existingTrip = await Trip.findById(tripId).session(session);
+      if (!existingTrip) {
+        throw new Error('Trip not found');
+      }
+
+      if (existingTrip.driverId.toString() !== driverId) {
+        throw new Error('Unauthorized: You are not the driver for this trip');
+      }
+
+      if (['completed', 'cancelled'].includes(existingTrip.status)) {
+        throw new Error(`Trip is already ${existingTrip.status}`);
+      }
+
+      // 🚨 FIX #4: Use actual metrics if provided, otherwise use stored values
+      const finalDistance = actualDistanceKm || existingTrip.distanceKm || 0;
+      const finalDuration = actualDurationMinutes || existingTrip.durationMinutes || 0;
 
       const fareData = await calculateFare({
-        serviceType: trip.serviceType,
+        serviceType: existingTrip.serviceType,
         distanceKm: finalDistance,
         durationMinutes: finalDuration
       });
 
-      trip.finalFare = fareData.baseAmount;
-      trip.distanceKm = finalDistance;
-      trip.durationMinutes = finalDuration;
+      const finalFare = fareData.baseAmount;
 
       let commission = 0;
-      if (isLuxury(trip.serviceType)) {
+      if (isLuxury(existingTrip.serviceType)) {
         const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
         const percent = setting?.value ? Number(setting.value) : 10;
-        commission = Math.round((percent / 100) * trip.finalFare);
+        commission = Math.round((percent / 100) * finalFare);
       }
 
-      trip.commission = commission;
-      trip.driverEarnings = trip.finalFare - commission;
+      const driverEarnings = finalFare - commission;
 
-      if (trip.paymentMethod === 'wallet') {
-        const passengerWallet = await Wallet.findOne({ owner: trip.passengerId }).session(session);
-        if (!passengerWallet || passengerWallet.balance < trip.finalFare) {
-          throw new Error('Insufficient balance');
+      if (existingTrip.paymentMethod === 'wallet') {
+        const passengerWallet = await Wallet.findOne({ owner: existingTrip.passengerId }).session(session);
+        if (!passengerWallet) {
+          throw new Error('Passenger wallet not found');
+        }
+
+        if (passengerWallet.balance < finalFare) {
+          throw new Error('Passenger has insufficient balance');
         }
 
         await Wallet.findOneAndUpdate(
-          { owner: trip.passengerId },
-          { $inc: { balance: -trip.finalFare } },
+          { owner: existingTrip.passengerId },
+          { $inc: { balance: -finalFare } },
           { session }
         );
 
         await Wallet.findOneAndUpdate(
           { owner: driverId },
-          { $inc: { balance: trip.driverEarnings } },
+          { $inc: { balance: driverEarnings } },
           { upsert: true, session }
         );
 
-        // Record transaction
         await Transaction.create([{
-          userId: trip.passengerId,
+          userId: existingTrip.passengerId,
           type: 'trip_payment',
-          amount: -trip.finalFare,
-          description: `Trip #${trip._id.toString().slice(-6)}`,
-          metadata: { tripId: trip._id }
+          amount: -finalFare,
+          description: `Trip #${tripId.slice(-6)}`,
+          metadata: { tripId: existingTrip._id }
         }, {
           userId: driverId,
           type: 'trip_earnings',
-          amount: trip.driverEarnings,
-          description: `Earnings from trip #${trip._id.toString().slice(-6)}`,
-          metadata: { tripId: trip._id, commission: commission }
+          amount: driverEarnings,
+          description: `Earnings from trip #${tripId.slice(-6)}`,
+          metadata: { tripId: existingTrip._id, commission }
         }], { session });
       }
 
-      trip.status = 'completed';
-      trip.completedAt = new Date();
-      await trip.save({ session });
+      const updatedTrip = await Trip.findByIdAndUpdate(
+        tripId,
+        {
+          status: 'completed',
+          finalFare,
+          distanceKm: finalDistance,
+          durationMinutes: finalDuration,
+          commission,
+          driverEarnings,
+          completedAt: new Date()
+        },
+        { new: true, session }
+      );
 
+      // CRITICAL: Clean up driver state
       await User.findByIdAndUpdate(
         driverId,
         {
@@ -1209,45 +1108,89 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
         { session }
       );
 
-      // Store trip data for notification
-      tripData = {
-        tripId: trip._id.toString(),
-        passengerId: trip.passengerId.toString(),
-        finalFare: trip.finalFare
-      };
+      console.log(`✅ Driver ${driverId} state cleaned up and marked available`);
 
-      await session.commitTransaction();
+      // 🚨 FIX #3: Consistent response format
+      res.json({
+        success: true,
+        trip: {
+          id: updatedTrip._id.toString(),
+          status: updatedTrip.status,
+          finalFare: updatedTrip.finalFare,
+          completedAt: updatedTrip.completedAt,
+          driverEarnings: updatedTrip.driverEarnings
+        }
+      });
+
+      // Send notifications AFTER response
+      setImmediate(async () => {
+        try {
+          emitter.emit('notification', {
+            userId: existingTrip.passengerId.toString(),
+            type: 'trip_completed',
+            title: 'Trip Completed',
+            body: `Your trip has been completed. Amount: ₦${(finalFare / 100).toFixed(2)}`,
+            data: {
+              tripId: tripId,
+              fare: finalFare,
+              status: 'completed'
+            }
+          });
+
+          emitter.emit('trip_completed', {
+            tripId: tripId,
+            driverId: driverId,
+            passengerId: existingTrip.passengerId.toString(),
+            finalFare: finalFare,
+            completedAt: new Date()
+          });
+
+          console.log(`📨 Notifications sent for completed trip ${tripId}`);
+        } catch (emitErr) {
+          console.error('Notification error (non-fatal):', emitErr);
+        }
+      });
     });
 
-    // Send response
-    res.json({ trip: tripData });
+  } catch (error) {
+    console.error('❌ Complete trip error:', error.message);
 
-    // Emit notification AFTER response
-    try {
-      emitter.emit('notification', {
-        userId: tripData.passengerId,
-        type: 'trip_completed',
-        title: 'Trip Completed',
-        body: `Your trip has been completed. Amount: ₦${(tripData.finalFare / 100).toFixed(2)}`,
-        data: { tripId: tripData.tripId, fare: tripData.finalFare }
-      });
-    } catch (emitErr) {
-      console.error('Notification emit error:', emitErr);
+    let statusCode = 500;
+    let errorCode = 'INTERNAL_ERROR';
+    let errorMessage = error.message || 'Failed to complete trip';
+
+    if (error.message.includes('not found')) {
+      statusCode = 404;
+      errorCode = 'TRIP_NOT_FOUND';
+    } else if (error.message.includes('Unauthorized')) {
+      statusCode = 403;
+      errorCode = 'UNAUTHORIZED';
+    } else if (error.message.includes('already completed') || error.message.includes('already cancelled')) {
+      statusCode = 400;
+      errorCode = 'TRIP_ALREADY_ENDED';
+    } else if (error.message.includes('insufficient balance')) {
+      statusCode = 402;
+      errorCode = 'INSUFFICIENT_BALANCE';
+    } else if (error.message.includes('required') || error.message.includes('Invalid')) {
+      statusCode = 400;
+      errorCode = 'INVALID_REQUEST';
     }
 
-  } catch (err) {
-    await session.abortTransaction();
-    console.error('Complete trip error:', err);
-    
-    if (err.message.includes('Insufficient')) {
-      return res.status(402).json({ error: { message: err.message } });
-    }
-    
-    next(err);
+    res.status(statusCode).json({
+      success: false,
+      error: {
+        message: errorMessage,
+        code: errorCode
+      }
+    });
   } finally {
     await session.endSession();
   }
 });
+
+// ==========================================
+// POST /trips/:tripId/cancel
+// ==========================================
 
 router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
   try {
@@ -1269,7 +1212,7 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
     trip.cancellationReason = reason || (isPassenger ? 'passenger_cancelled' : 'driver_cancelled');
     await trip.save();
 
-    // ✅ ENSURE DRIVER STATE IS CLEANED UP
+    // ✅ Clean up driver state
     if (trip.driverId) {
       await User.findByIdAndUpdate(trip.driverId, {
         'driverProfile.isAvailable': true,
@@ -1302,12 +1245,15 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
   }
 });
 
+// ==========================================
+// GET /trips/:tripId
+// ==========================================
+
 router.get('/:tripId', requireAuth, async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.tripId).lean();
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
     
-    // Authorization check
     const userId = req.user.sub;
     const isPassenger = trip.passengerId.toString() === userId;
     const isDriver = trip.driverId?.toString() === userId;
@@ -1321,6 +1267,10 @@ router.get('/:tripId', requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
+// ==========================================
+// GET /trips
+// ==========================================
 
 router.get('/', requireAuth, async (req, res, next) => {
   try {
@@ -1349,7 +1299,6 @@ function startPeriodicCleanup() {
     try {
       const now = new Date();
 
-      // Cleanup expired searching requests
       const expired = await TripRequest.find({
         status: 'searching',
         expiresAt: { $lt: now }
@@ -1360,7 +1309,6 @@ function startPeriodicCleanup() {
         await cleanupFailedTripRequest(req._id);
       }
 
-      // Delete old no_drivers requests (older than 10 minutes)
       const deleted = await TripRequest.deleteMany({
         status: 'no_drivers',
         createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) }
@@ -1370,7 +1318,6 @@ function startPeriodicCleanup() {
         console.log(`🗑️ Deleted ${deleted.deletedCount} old no_drivers requests`);
       }
 
-      // Cleanup old idempotency keys
       await mongoose.connection.collection('idempotency_keys').deleteMany({
         expiresAt: { $lt: now }
       });
@@ -1378,7 +1325,7 @@ function startPeriodicCleanup() {
     } catch (err) {
       console.error('Cleanup error:', err);
     }
-  }, 5 * 60 * 1000); // Every 5 minutes
+  }, 5 * 60 * 1000);
 }
 
 startPeriodicCleanup();
@@ -1389,7 +1336,6 @@ startPeriodicCleanup();
 
 router.post('/admin/flush-trips', requireAuth, requireAdmin, async (req, res) => {
   try {
-    // Delete only old/expired trips, not all
     const deleted = await TripRequest.deleteMany({
       expiresAt: { $lt: new Date() }
     });
@@ -1419,7 +1365,7 @@ router.get('/admin/config', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // ==========================================
-// Cleanup single driver state (Driver can call this)
+// Cleanup single driver state
 // ==========================================
 router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
   try {
@@ -1436,7 +1382,6 @@ router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
     let cleaned = false;
     const issues = [];
 
-    // Check if driver has a currentTripId
     if (driver.driverProfile?.currentTripId) {
       const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
         .select('status');
@@ -1452,7 +1397,6 @@ router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
       }
     }
 
-    // Perform cleanup if needed
     if (cleaned) {
       await User.findByIdAndUpdate(driverId, {
         'driverProfile.isAvailable': true,
@@ -1489,7 +1433,6 @@ router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req,
   try {
     console.log('🧹 Starting cleanup of all driver states');
 
-    // Find all drivers with currentTripId
     const driversWithTrips = await User.find({
       'driverProfile.currentTripId': { $exists: true, $ne: null }
     }).select('_id name driverProfile');
@@ -1507,7 +1450,6 @@ router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req,
           .select('status');
 
         if (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status)) {
-          // Clean up stale reference
           await User.findByIdAndUpdate(driver._id, {
             'driverProfile.isAvailable': true,
             $unset: { 'driverProfile.currentTripId': '' }
@@ -1543,7 +1485,7 @@ router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req,
 });
 
 // ==========================================
-// Get driver current state (for debugging)
+// Get driver current state
 // ==========================================
 router.get('/drivers/current-state', requireAuth, async (req, res) => {
   try {
@@ -1588,238 +1530,14 @@ router.get('/drivers/current-state', requireAuth, async (req, res) => {
 });
 
 // ==========================================
-// POST /trips/:tripId/complete - COMPLETELY FIXED
-// ==========================================
-
-router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-  
-  let tripData = null;
-  let passengerId = null;
-  let finalFare = 0;
-  let tripId = req.params.tripId;
-
-  try {
-    const driverId = req.user.sub;
-    const { actualDistanceKm, actualDurationMinutes, paymentConfirmation } = req.body;
-
-    console.log(`✅ Driver ${driverId} completing trip ${tripId}`);
-    console.log('Payment confirmation:', paymentConfirmation);
-
-    // Check if trip exists
-    const existingTrip = await Trip.findById(tripId).session(session);
-    if (!existingTrip) {
-      throw new Error('Trip not found');
-    }
-
-    // Authorization check
-    if (existingTrip.driverId.toString() !== driverId) {
-      throw new Error('Unauthorized: You are not the driver for this trip');
-    }
-
-    // Check if trip is already completed or cancelled
-    if (['completed', 'cancelled'].includes(existingTrip.status)) {
-      throw new Error(`Trip is already ${existingTrip.status}`);
-    }
-
-    // Use actual metrics if provided, otherwise use estimated
-    const finalDistance = actualDistanceKm || existingTrip.distanceKm || 0;
-    const finalDuration = actualDurationMinutes || existingTrip.durationMinutes || 0;
-
-    // Calculate fare
-    const fareData = await calculateFare({
-      serviceType: existingTrip.serviceType,
-      distanceKm: finalDistance,
-      durationMinutes: finalDuration
-    });
-
-    finalFare = fareData.baseAmount;
-
-    // Calculate commission for luxury rides
-    let commission = 0;
-    if (isLuxury(existingTrip.serviceType)) {
-      const setting = await Settings.findOne({ key: 'commission_percent' }).lean();
-      const percent = setting?.value ? Number(setting.value) : 10;
-      commission = Math.round((percent / 100) * finalFare);
-    }
-
-    const driverEarnings = finalFare - commission;
-
-    // Handle wallet payment
-    if (existingTrip.paymentMethod === 'wallet') {
-      const passengerWallet = await Wallet.findOne({ owner: existingTrip.passengerId }).session(session);
-      if (!passengerWallet) {
-        throw new Error('Passenger wallet not found');
-      }
-
-      if (passengerWallet.balance < finalFare) {
-        throw new Error('Passenger has insufficient balance');
-      }
-
-      // Deduct from passenger wallet
-      await Wallet.findOneAndUpdate(
-        { owner: existingTrip.passengerId },
-        { $inc: { balance: -finalFare } },
-        { session }
-      );
-
-      // Add to driver wallet
-      await Wallet.findOneAndUpdate(
-        { owner: driverId },
-        { $inc: { balance: driverEarnings } },
-        { upsert: true, session }
-      );
-
-      // Record transactions
-      await Transaction.create([{
-        userId: existingTrip.passengerId,
-        type: 'trip_payment',
-        amount: -finalFare,
-        description: `Trip #${tripId.slice(-6)}`,
-        metadata: { tripId: existingTrip._id }
-      }, {
-        userId: driverId,
-        type: 'trip_earnings',
-        amount: driverEarnings,
-        description: `Earnings from trip #${tripId.slice(-6)}`,
-        metadata: { tripId: existingTrip._id, commission }
-      }], { session });
-    }
-
-    // Update trip document
-    const updatedTrip = await Trip.findByIdAndUpdate(
-      tripId,
-      {
-        status: 'completed',
-        finalFare,
-        distanceKm: finalDistance,
-        durationMinutes: finalDuration,
-        commission,
-        driverEarnings,
-        completedAt: new Date()
-      },
-      { new: true, session }
-    );
-
-    // Store data for response
-    tripData = updatedTrip;
-    passengerId = existingTrip.passengerId.toString();
-
-    // CRITICAL: Clean up driver state
-    await User.findByIdAndUpdate(
-      driverId,
-      {
-        'driverProfile.isAvailable': true,
-        $unset: { 'driverProfile.currentTripId': '' }
-      },
-      { session }
-    );
-
-    console.log(`✅ Driver ${driverId} state cleaned up and marked available`);
-
-    // Commit transaction
-    await session.commitTransaction();
-    console.log(`✅ Transaction committed for trip ${tripId}`);
-
-    // Prepare success response
-    const responseData = {
-      success: true,
-      trip: {
-        id: tripData._id.toString(),
-        status: tripData.status,
-        finalFare: tripData.finalFare,
-        completedAt: tripData.completedAt,
-        driverEarnings: tripData.driverEarnings
-      }
-    };
-
-    res.json(responseData);
-
-    // Send notifications AFTER response is sent (non-blocking)
-    setImmediate(async () => {
-      try {
-        // Notify passenger
-        emitter.emit('notification', {
-          userId: passengerId,
-          type: 'trip_completed',
-          title: 'Trip Completed',
-          body: `Your trip has been completed. Amount: ₦${(finalFare / 100).toFixed(2)}`,
-          data: {
-            tripId: tripId,
-            fare: finalFare,
-            status: 'completed'
-          }
-        });
-
-        // Also emit trip_completed event for real-time updates
-        emitter.emit('trip_completed', {
-          tripId: tripId,
-          driverId: driverId,
-          passengerId: passengerId,
-          finalFare: finalFare,
-          completedAt: new Date()
-        });
-
-        console.log(`📨 Notifications sent for completed trip ${tripId}`);
-      } catch (emitErr) {
-        console.error('Notification error (non-fatal):', emitErr);
-      }
-    });
-
-  } catch (error) {
-    // Abort transaction on error
-    if (session.inTransaction()) {
-      await session.abortTransaction();
-      console.log('❌ Transaction aborted');
-    }
-
-    console.error('❌ Complete trip error:', error.message);
-
-    // Determine appropriate error response
-    let statusCode = 500;
-    let errorCode = 'INTERNAL_ERROR';
-    let errorMessage = error.message || 'Failed to complete trip';
-
-    if (error.message.includes('not found')) {
-      statusCode = 404;
-      errorCode = 'TRIP_NOT_FOUND';
-    } else if (error.message.includes('Unauthorized')) {
-      statusCode = 403;
-      errorCode = 'UNAUTHORIZED';
-    } else if (error.message.includes('already completed') || error.message.includes('already cancelled')) {
-      statusCode = 400;
-      errorCode = 'TRIP_ALREADY_ENDED';
-    } else if (error.message.includes('insufficient balance')) {
-      statusCode = 402;
-      errorCode = 'INSUFFICIENT_BALANCE';
-    } else if (error.message.includes('required') || error.message.includes('Invalid')) {
-      statusCode = 400;
-      errorCode = 'INVALID_REQUEST';
-    }
-
-    res.status(statusCode).json({
-      success: false,
-      error: {
-        message: errorMessage,
-        code: errorCode
-      }
-    });
-  } finally {
-    await session.endSession();
-  }
-});
-
-// ==========================================
-// MONGOOSE INDEX CREATION (Run once)
+// CREATE INDEXES
 // ==========================================
 
 async function createIndexes() {
   try {
-    // Create idempotency key index
     await mongoose.connection.collection('idempotency_keys').createIndex(
       { key: 1 },
-      { unique: true, expireAfterSeconds: 24 * 60 * 60 } // 24 hour TTL
+      { unique: true, expireAfterSeconds: 24 * 60 * 60 }
     );
     
     console.log('✅ Idempotency key index created');
@@ -1828,7 +1546,6 @@ async function createIndexes() {
   }
 }
 
-// Call on startup
 createIndexes();
 
 module.exports = router;
