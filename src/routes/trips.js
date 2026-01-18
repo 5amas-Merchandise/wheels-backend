@@ -1484,6 +1484,402 @@ async function createIndexes() {
   }
 }
 
+// ==========================================
+// GET /trips/history - GET USER TRIP HISTORY
+// ==========================================
+
+/**
+ * Get trip history for the authenticated user
+ * Query params:
+ * - role: 'passenger' | 'driver' (default: 'passenger')
+ * - status: 'completed' | 'cancelled' | 'all' (default: 'all')
+ * - limit: number (default: 50, max: 100)
+ * - offset: number (default: 0)
+ * - startDate: ISO date string (optional)
+ * - endDate: ISO date string (optional)
+ */
+router.get('/history', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const { 
+      role = 'passenger', 
+      status = 'all',
+      limit = 50, 
+      offset = 0,
+      startDate,
+      endDate
+    } = req.query;
+
+    console.log(`📊 Fetching trip history for user ${userId} (role: ${role})`);
+
+    // Build filter
+    const filter = {};
+    
+    // Filter by role
+    if (role === 'driver') {
+      filter.driverId = userId;
+    } else {
+      filter.passengerId = userId;
+    }
+
+    // Filter by status
+    if (status === 'completed') {
+      filter.status = 'completed';
+    } else if (status === 'cancelled') {
+      filter.status = 'cancelled';
+    } else {
+      // 'all' - get completed and cancelled trips
+      filter.status = { $in: ['completed', 'cancelled'] };
+    }
+
+    // Date range filter
+    if (startDate || endDate) {
+      filter.completedAt = {};
+      if (startDate) {
+        filter.completedAt.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        filter.completedAt.$lte = new Date(endDate);
+      }
+    }
+
+    const parsedLimit = Math.min(parseInt(limit) || 50, 100);
+    const parsedOffset = parseInt(offset) || 0;
+
+    // Fetch trips with populated data
+    const trips = await Trip.find(filter)
+      .populate('passengerId', 'name phone profilePicUrl')
+      .populate('driverId', 'name phone profilePicUrl driverProfile')
+      .sort({ completedAt: -1, cancelledAt: -1, createdAt: -1 })
+      .limit(parsedLimit)
+      .skip(parsedOffset)
+      .lean();
+
+    const total = await Trip.countDocuments(filter);
+
+    // Format trips for frontend
+    const formattedTrips = trips.map(trip => {
+      const isDriver = trip.driverId?._id?.toString() === userId;
+      
+      return {
+        id: trip._id.toString(),
+        date: trip.completedAt || trip.cancelledAt || trip.createdAt,
+        status: trip.status,
+        
+        // Route information
+        pickup: {
+          address: trip.pickupLocation?.address || 'Pickup Location',
+          coordinates: trip.pickupLocation?.coordinates
+        },
+        dropoff: {
+          address: trip.dropoffLocation?.address || 'Dropoff Location',
+          coordinates: trip.dropoffLocation?.coordinates
+        },
+        
+        // Service details
+        serviceType: trip.serviceType,
+        paymentMethod: trip.paymentMethod,
+        
+        // Pricing
+        estimatedFare: trip.estimatedFare,
+        finalFare: trip.finalFare,
+        fareInNaira: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
+        
+        // Trip metrics
+        distanceKm: trip.distanceKm,
+        durationMinutes: trip.durationMinutes,
+        
+        // Timestamps
+        requestedAt: trip.requestedAt,
+        startedAt: trip.startedAt,
+        completedAt: trip.completedAt,
+        cancelledAt: trip.cancelledAt,
+        cancellationReason: trip.cancellationReason,
+        
+        // Other party info (driver for passenger, passenger for driver)
+        otherParty: isDriver ? {
+          id: trip.passengerId?._id?.toString(),
+          name: trip.passengerId?.name || 'Passenger',
+          phone: trip.passengerId?.phone,
+          profilePicUrl: trip.passengerId?.profilePicUrl
+        } : {
+          id: trip.driverId?._id?.toString(),
+          name: trip.driverId?.name || 'Driver',
+          phone: trip.driverId?.phone,
+          profilePicUrl: trip.driverId?.profilePicUrl,
+          vehicleInfo: trip.driverId?.driverProfile ? {
+            make: trip.driverId.driverProfile.vehicleMake,
+            model: trip.driverId.driverProfile.vehicleModel,
+            number: trip.driverId.driverProfile.vehicleNumber
+          } : null
+        }
+      };
+    });
+
+    // Calculate summary stats
+    const stats = {
+      totalTrips: total,
+      completedTrips: await Trip.countDocuments({ 
+        ...filter, 
+        status: 'completed' 
+      }),
+      cancelledTrips: await Trip.countDocuments({ 
+        ...filter, 
+        status: 'cancelled' 
+      }),
+      totalSpent: trips
+        .filter(t => t.status === 'completed')
+        .reduce((sum, t) => sum + (t.finalFare || 0), 0)
+    };
+
+    console.log(`✅ Found ${formattedTrips.length} trips (${total} total)`);
+
+    res.json({
+      success: true,
+      trips: formattedTrips,
+      pagination: {
+        total,
+        limit: parsedLimit,
+        offset: parsedOffset,
+        hasMore: total > parsedOffset + parsedLimit
+      },
+      stats: {
+        ...stats,
+        totalSpentInNaira: (stats.totalSpent / 100).toFixed(2)
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Trip history error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /trips/history/stats - GET TRIP STATISTICS
+// ==========================================
+
+/**
+ * Get detailed statistics about trip history
+ * Query params:
+ * - role: 'passenger' | 'driver' (default: 'passenger')
+ * - period: 'week' | 'month' | 'year' | 'all' (default: 'month')
+ */
+router.get('/history/stats', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const { role = 'passenger', period = 'month' } = req.query;
+
+    console.log(`📊 Fetching trip stats for user ${userId} (period: ${period})`);
+
+    // Calculate date range
+    const now = new Date();
+    let startDate;
+    
+    switch (period) {
+      case 'week':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case 'month':
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+        break;
+      case 'year':
+        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = null;
+    }
+
+    const filter = role === 'driver' 
+      ? { driverId: userId }
+      : { passengerId: userId };
+    
+    if (startDate) {
+      filter.completedAt = { $gte: startDate };
+    }
+
+    // Aggregate statistics
+    const completedFilter = { ...filter, status: 'completed' };
+    
+    const [
+      completedTrips,
+      cancelledTrips,
+      totalDistanceResult,
+      totalFareResult,
+      serviceTypeBreakdown
+    ] = await Promise.all([
+      Trip.countDocuments(completedFilter),
+      Trip.countDocuments({ ...filter, status: 'cancelled' }),
+      Trip.aggregate([
+        { $match: completedFilter },
+        { $group: { _id: null, total: { $sum: '$distanceKm' } } }
+      ]),
+      Trip.aggregate([
+        { $match: completedFilter },
+        { $group: { _id: null, total: { $sum: '$finalFare' } } }
+      ]),
+      Trip.aggregate([
+        { $match: completedFilter },
+        { 
+          $group: { 
+            _id: '$serviceType', 
+            count: { $sum: 1 },
+            totalFare: { $sum: '$finalFare' }
+          } 
+        }
+      ])
+    ]);
+
+    const totalDistance = totalDistanceResult[0]?.total || 0;
+    const totalFare = totalFareResult[0]?.total || 0;
+
+    res.json({
+      success: true,
+      period,
+      stats: {
+        totalTrips: completedTrips + cancelledTrips,
+        completedTrips,
+        cancelledTrips,
+        totalDistance: parseFloat(totalDistance.toFixed(2)),
+        totalFare,
+        totalFareInNaira: (totalFare / 100).toFixed(2),
+        averageFare: completedTrips > 0 ? totalFare / completedTrips : 0,
+        averageFareInNaira: completedTrips > 0 
+          ? ((totalFare / completedTrips) / 100).toFixed(2) 
+          : '0.00',
+        serviceTypeBreakdown: serviceTypeBreakdown.map(item => ({
+          serviceType: item._id,
+          count: item.count,
+          totalFare: item.totalFare,
+          totalFareInNaira: (item.totalFare / 100).toFixed(2)
+        }))
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Trip stats error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /trips/history/:tripId - GET SINGLE TRIP DETAILS
+// ==========================================
+
+/**
+ * Get detailed information about a specific trip from history
+ */
+router.get('/history/:tripId', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const { tripId } = req.params;
+
+    console.log(`📄 Fetching trip details: ${tripId}`);
+
+    const trip = await Trip.findById(tripId)
+      .populate('passengerId', 'name phone profilePicUrl')
+      .populate('driverId', 'name phone profilePicUrl driverProfile')
+      .lean();
+
+    if (!trip) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Trip not found' }
+      });
+    }
+
+    // Authorization check
+    const isPassenger = trip.passengerId?._id?.toString() === userId;
+    const isDriver = trip.driverId?._id?.toString() === userId;
+    
+    if (!isPassenger && !isDriver) {
+      return res.status(403).json({
+        success: false,
+        error: { message: 'Unauthorized access to this trip' }
+      });
+    }
+
+    // Format detailed trip data
+    const detailedTrip = {
+      id: trip._id.toString(),
+      status: trip.status,
+      
+      // Passenger info
+      passenger: {
+        id: trip.passengerId?._id?.toString(),
+        name: trip.passengerId?.name || 'Passenger',
+        phone: trip.passengerId?.phone,
+        profilePicUrl: trip.passengerId?.profilePicUrl
+      },
+      
+      // Driver info
+      driver: {
+        id: trip.driverId?._id?.toString(),
+        name: trip.driverId?.name || 'Driver',
+        phone: trip.driverId?.phone,
+        profilePicUrl: trip.driverId?.profilePicUrl,
+        vehicle: trip.driverId?.driverProfile ? {
+          make: trip.driverId.driverProfile.vehicleMake,
+          model: trip.driverId.driverProfile.vehicleModel,
+          number: trip.driverId.driverProfile.vehicleNumber
+        } : null
+      },
+      
+      // Route
+      pickup: {
+        address: trip.pickupLocation?.address || 'Pickup Location',
+        coordinates: trip.pickupLocation?.coordinates
+      },
+      dropoff: {
+        address: trip.dropoffLocation?.address || 'Dropoff Location',
+        coordinates: trip.dropoffLocation?.coordinates
+      },
+      
+      // Service & Payment
+      serviceType: trip.serviceType,
+      paymentMethod: trip.paymentMethod,
+      paymentConfirmed: trip.paymentConfirmed,
+      
+      // Pricing
+      estimatedFare: trip.estimatedFare,
+      finalFare: trip.finalFare,
+      commission: trip.commission,
+      driverEarnings: trip.driverEarnings,
+      fareBreakdown: {
+        estimated: (trip.estimatedFare / 100).toFixed(2),
+        final: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
+        commission: trip.commission ? (trip.commission / 100).toFixed(2) : '0.00',
+        driverEarnings: trip.driverEarnings ? (trip.driverEarnings / 100).toFixed(2) : '0.00'
+      },
+      
+      // Trip metrics
+      distanceKm: trip.distanceKm,
+      durationMinutes: trip.durationMinutes,
+      
+      // Timestamps
+      requestedAt: trip.requestedAt,
+      startedAt: trip.startedAt,
+      completedAt: trip.completedAt,
+      cancelledAt: trip.cancelledAt,
+      cancellationReason: trip.cancellationReason,
+      completionNotes: trip.completionNotes,
+      
+      // Trip request reference
+      tripRequestId: trip.tripRequestId?.toString()
+    };
+
+    res.json({
+      success: true,
+      trip: detailedTrip
+    });
+
+  } catch (err) {
+    console.error('❌ Trip detail error:', err);
+    next(err);
+  }
+});
+
+
 createIndexes();
 
 module.exports = router;
