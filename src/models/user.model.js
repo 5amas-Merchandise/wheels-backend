@@ -75,18 +75,15 @@ const TransportCompanyProfileSchema = new mongoose.Schema({
     phone: String,
     email: String
   },
-  // Business info
   yearsInOperation: { type: Number, default: 0 },
   fleetSize: { type: Number, default: 0 },
   description: { type: String },
   website: { type: String },
-  // Bank account for payments
   bankAccount: {
     bankName: String,
     accountNumber: String,
     accountName: String
   },
-  // Verification
   verified: { type: Boolean, default: false },
   verificationStatus: {
     type: String,
@@ -99,11 +96,9 @@ const TransportCompanyProfileSchema = new mongoose.Schema({
     insuranceCertificate: { type: String },
     otherDocuments: [{ type: String }]
   },
-  // Stats
   totalBookings: { type: Number, default: 0 },
   rating: { type: Number, default: 0, min: 0, max: 5 },
   totalReviews: { type: Number, default: 0 },
-  // Account status
   accountStatus: {
     type: String,
     enum: ['active', 'suspended', 'deactivated'],
@@ -116,13 +111,11 @@ const UserSchema = new mongoose.Schema({
   // Basic Info
   name: {
     type: String,
-    required: false,
     trim: true
   },
   email: {
     type: String,
     sparse: true,
-    unique: false,
     lowercase: true,
     trim: true
   },
@@ -130,11 +123,10 @@ const UserSchema = new mongoose.Schema({
     type: String,
     required: true,
     unique: true,
-    index: true,
     trim: true
   },
   
-  // Authentication
+  // Authentication - FIXED: Single password field
   password: {
     type: String,
     required: true,
@@ -146,7 +138,7 @@ const UserSchema = new mongoose.Schema({
     default: null
   },
   
-  // Roles and Permissions
+  // Roles
   roles: {
     isUser: { type: Boolean, default: true },
     isDriver: { type: Boolean, default: false },
@@ -194,24 +186,12 @@ const UserSchema = new mongoose.Schema({
     type: Boolean,
     default: true
   },
-  emailVerified: {
-    type: Boolean,
-    default: false
-  },
   phoneVerified: {
     type: Boolean,
     default: false
   },
   
   // Timestamps
-  createdAt: {
-    type: Date,
-    default: Date.now
-  },
-  updatedAt: {
-    type: Date,
-    default: Date.now
-  },
   lastLogin: {
     type: Date,
     default: null
@@ -230,26 +210,13 @@ const UserSchema = new mongoose.Schema({
   
   // Device Info
   deviceInfo: {
-    platform: String,
-    os: String,
-    browser: String,
-    lastIpAddress: String,
-    fcmToken: String // For push notifications
+    fcmToken: String
   },
   
-  // Statistics
-  stats: {
-    totalTrips: { type: Number, default: 0 },
-    totalBookings: { type: Number, default: 0 },
-    totalSpent: { type: Number, default: 0 },
-    joinedDate: { type: Date, default: Date.now }
-  },
-  
-  // Wallet/Balance (optional - can be separate model)
+  // Wallet
   wallet: {
     balance: { type: Number, default: 0 },
-    currency: { type: String, default: 'NGN' },
-    lastUpdated: { type: Date, default: Date.now }
+    currency: { type: String, default: 'NGN' }
   }
 }, {
   timestamps: true,
@@ -261,64 +228,43 @@ const UserSchema = new mongoose.Schema({
 // MIDDLEWARE
 // ==============================
 
-// Update timestamps on save
-UserSchema.pre('save', function(next) {
-  this.updatedAt = Date.now();
-  next();
-});
-
 // Hash password before saving
-
-
-// ==============================
-// VIRTUAL PROPERTIES
-// ==============================
-
-// Full name virtual
-UserSchema.virtual('fullName').get(function() {
-  return this.name || 'User';
-});
-
-// User type virtual
-UserSchema.virtual('userType').get(function() {
-  if (this.roles.isAdmin) return 'admin';
-  if (this.roles.isTransportCompany) return 'transport_company';
-  if (this.roles.isDriver) return 'driver';
-  if (this.roles.isUser) return 'user';
-  return 'unknown';
-});
-
-// Formatted phone virtual
-UserSchema.virtual('formattedPhone').get(function() {
-  if (!this.phone) return '';
-  // Format Nigerian phone numbers
-  const phone = this.phone.replace(/\D/g, '');
-  if (phone.startsWith('234') && phone.length === 13) {
-    return `+${phone}`;
-  } else if (phone.startsWith('0') && phone.length === 11) {
-    return `+234${phone.slice(1)}`;
+UserSchema.pre('save', async function(next) {
+  if (!this.isModified('password')) return next();
+  
+  try {
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error) {
+    next(error);
   }
-  return this.phone;
 });
 
+// ==============================
+// INSTANCE METHODS
+// ==============================
 
+// Compare password
+UserSchema.methods.comparePassword = async function(candidatePassword) {
+  try {
+    return await bcrypt.compare(candidatePassword, this.password);
+  } catch (error) {
+    return false;
+  }
+};
 
-
-
-
-// Update transport company stats
-UserSchema.methods.updateCompanyStats = function(bookingsCount = 0, amount = 0) {
+// Update company stats
+UserSchema.methods.updateCompanyStats = function(bookingsCount = 0) {
   if (!this.roles.isTransportCompany) return false;
   
   this.transportCompanyProfile.totalBookings += bookingsCount;
-  // Add other stats updates as needed
   return this.save();
 };
 
 // ==============================
 // STATIC METHODS
 // ==============================
-
 
 // Find transport companies by verification status
 UserSchema.statics.findTransportCompanies = function(verificationStatus = 'approved') {
@@ -345,27 +291,12 @@ UserSchema.statics.findByEmailOrPhone = function(email, phone) {
 // 2dsphere index for driver location
 UserSchema.index({ 'driverProfile.location': '2dsphere' });
 
-// Additional indexes for better query performance
+// Performance indexes
 UserSchema.index({ 'roles.isDriver': 1 });
 UserSchema.index({ 'roles.isTransportCompany': 1 });
-UserSchema.index({ 'roles.isAdmin': 1 });
 UserSchema.index({ 'driverProfile.isAvailable': 1 });
-UserSchema.index({ 'driverProfile.lastSeen': -1 });
-UserSchema.index({ 'driverProfile.verificationState': 1 });
-UserSchema.index({ 'transportCompanyProfile.verificationStatus': 1 });
 UserSchema.index({ phone: 1 }, { unique: true });
 UserSchema.index({ email: 1 }, { sparse: true });
-UserSchema.index({ 'subscription.expiresAt': 1 });
-UserSchema.index({ 'subscription.type': 1 });
-UserSchema.index({ isActive: 1 });
-UserSchema.index({ createdAt: -1 });
-
-// Text search index for names and company names
-UserSchema.index({
-  name: 'text',
-  'transportCompanyProfile.companyName': 'text',
-  'driverProfile.vehicleNumber': 'text'
-});
 
 // ==============================
 // TO JSON TRANSFORM
@@ -373,17 +304,12 @@ UserSchema.index({
 
 UserSchema.set('toJSON', {
   virtuals: true,
-  transform: function (doc, ret, options) {
+  transform: function (doc, ret) {
     // Hide sensitive fields
     delete ret.password;
     delete ret.otpCode;
     delete ret.otpExpiresAt;
-    delete ret.deviceInfo;
-    
-    // Format dates
-    if (ret.createdAt) ret.createdAt = ret.createdAt.toISOString();
-    if (ret.updatedAt) ret.updatedAt = ret.updatedAt.toISOString();
-    if (ret.lastLogin) ret.lastLogin = ret.lastLogin.toISOString();
+    delete ret.__v;
     
     return ret;
   }
