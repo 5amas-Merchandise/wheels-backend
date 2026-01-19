@@ -1,6 +1,7 @@
 // routes/auth.js
 const express = require('express');
 const router = express.Router();
+const bcrypt = require('bcryptjs');
 
 const User = require('../models/user.model');
 const Wallet = require('../models/wallet.model');
@@ -36,11 +37,13 @@ router.post('/request-otp', authLimiter, async (req, res, next) => {
 
     // Create new user if not found
     if (!user) {
+      const tempPassword = Math.random().toString(36).slice(-8);
+      const passwordHash = await bcrypt.hash(tempPassword, 10);
       user = new User({ 
         phone, 
         name, 
         email,
-        password: Math.random().toString(36).slice(-8) // Temporary password
+        passwordHash
       });
     }
 
@@ -164,22 +167,24 @@ router.post('/signup', authLimiter, async (req, res, next) => {
       }
     }
 
-    // Create user - password will be hashed by pre-save hook
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+    
+    // Create user
     const user = new User({ 
       name, 
       phone, 
       email, 
-      password // Will be auto-hashed
+      passwordHash
     });
 
-    // Set roles
+    // Set roles based on role parameter
     if (role === 'driver') {
       user.roles = { 
         isUser: false, 
         isDriver: true, 
         isTransportCompany: false,
-        isAdmin: false,
-        isAgent: false
+        isAdmin: false
       };
       if (driverProfile && typeof driverProfile === 'object') {
         user.driverProfile = driverProfile;
@@ -189,16 +194,15 @@ router.post('/signup', authLimiter, async (req, res, next) => {
         isUser: false, 
         isDriver: false, 
         isTransportCompany: true,
-        isAdmin: false,
-        isAgent: false
+        isAdmin: false
       };
     } else {
+      // Default to regular user
       user.roles = { 
         isUser: true, 
         isDriver: false, 
         isTransportCompany: false,
-        isAdmin: false,
-        isAgent: false
+        isAdmin: false
       };
     }
 
@@ -234,15 +238,15 @@ router.post('/login', authLimiter, async (req, res, next) => {
       ? { phone: identifier } 
       : { email: identifier.toLowerCase() };
     
-    // Must include password field explicitly
-    const user = await User.findOne(query).select('+password');
+    // IMPORTANT: Must select passwordHash explicitly since it has select: false
+    const user = await User.findOne(query).select('+passwordHash');
 
-    if (!user) {
+    if (!user || !user.passwordHash) {
       return res.status(400).json({ error: { message: 'Invalid credentials' } });
     }
 
-    // Use instance method to compare password
-    const isMatch = await user.comparePassword(password);
+    // Compare password
+    const isMatch = await bcrypt.compare(password, user.passwordHash);
     
     if (!isMatch) {
       return res.status(400).json({ error: { message: 'Invalid credentials' } });
@@ -254,10 +258,8 @@ router.post('/login', authLimiter, async (req, res, next) => {
 
     const token = signUser(user);
     
-    // Remove password from response
-    const userResponse = user.toJSON();
-    
-    return res.json({ token, user: userResponse });
+    // Return user without password
+    return res.json({ token, user: user.toJSON() });
   } catch (err) {
     next(err);
   }
