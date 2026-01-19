@@ -862,184 +862,201 @@ router.get('/search', async (req, res, next) => {
   }
 });
 
-// POST /intercity/bookings - CREATE BOOKING (WITH DETAILED LOGGING)
+// POST /intercity/bookings - CREATE BOOKING (FINAL FIXED VERSION)
 router.post('/bookings', requireAuth, async (req, res, next) => {
-  const session = await mongoose.startSession();
-  
   try {
     console.log('🚀 === BOOKING REQUEST STARTED ===');
-    console.log('📥 Request body:', JSON.stringify(req.body, null, 2));
-    console.log('👤 User ID:', req.user.sub);
+    const userId = req.user.sub;
+    const {
+      scheduleId,
+      passengerDetails,
+      numberOfSeats,
+      seatNumbers,
+      specialRequests
+    } = req.body;
 
-    await session.withTransaction(async () => {
-      const userId = req.user.sub;
-      const {
-        scheduleId,
-        passengerDetails,
-        numberOfSeats,
-        seatNumbers,
-        specialRequests
-      } = req.body;
+    console.log('📥 Request data:', {
+      userId,
+      scheduleId,
+      numberOfSeats,
+      passengerDetails: passengerDetails?.fullName
+    });
 
-      // Validate required fields
-      if (!scheduleId) {
-        throw new Error('Schedule ID is required');
-      }
-      if (!passengerDetails) {
-        throw new Error('Passenger details are required');
-      }
-      if (!numberOfSeats || numberOfSeats < 1) {
-        throw new Error('Number of seats must be at least 1');
-      }
-
-      console.log('✅ Step 1: Validation passed');
-      console.log('📝 Creating booking for user:', userId);
-      console.log('📝 Schedule ID:', scheduleId);
-
-      // Get schedule WITHOUT populate (populate doesn't work well in transactions)
-      console.log('🔍 Step 2: Fetching schedule...');
-      const schedule = await IntercitySchedule.findById(scheduleId).session(session);
-
-      if (!schedule) {
-        console.error('❌ Schedule not found:', scheduleId);
-        throw new Error('Schedule not found');
-      }
-
-      console.log('✅ Step 2: Schedule found');
-      console.log('📊 Schedule details:', {
-        id: schedule._id,
-        status: schedule.status,
-        totalSeats: schedule.totalSeats,
-        availableSeats: schedule.availableSeats,
-        bookedSeats: schedule.bookedSeats,
-        pricePerSeat: schedule.pricePerSeat,
-        routeId: schedule.routeId,
-        companyId: schedule.companyId
+    // Validate required fields
+    if (!scheduleId) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Schedule ID is required' }
       });
+    }
 
-      if (schedule.status !== 'scheduled') {
-        console.error('❌ Schedule not available, status:', schedule.status);
-        throw new Error('Schedule is not available for booking');
-      }
-
-      if (schedule.availableSeats < numberOfSeats) {
-        console.error('❌ Not enough seats:', {
-          requested: numberOfSeats,
-          available: schedule.availableSeats
-        });
-        throw new Error(`Only ${schedule.availableSeats} seats available`);
-      }
-
-      console.log('✅ Step 3: Availability check passed');
-
-      // Calculate total (pricePerSeat should already be in kobo)
-      const totalAmount = schedule.pricePerSeat * numberOfSeats;
-      console.log('💰 Total amount calculated:', {
-        pricePerSeat: schedule.pricePerSeat,
-        numberOfSeats,
-        totalAmount
+    if (!passengerDetails || !passengerDetails.fullName || !passengerDetails.email || !passengerDetails.phone) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Complete passenger details are required' }
       });
+    }
 
-      // Create booking - use ObjectIds directly, not populated objects
-      console.log('🔍 Step 4: Creating booking document...');
-      const bookingDoc = {
-        userId: userId,
-        scheduleId: schedule._id,
-        routeId: schedule.routeId, // This is already an ObjectId
-        companyId: schedule.companyId, // This is already an ObjectId
-        passengerDetails: passengerDetails,
-        numberOfSeats: numberOfSeats,
-        seatNumbers: seatNumbers || [],
-        totalAmount: totalAmount,
-        status: 'confirmed',
-        specialRequests: specialRequests || null
-      };
-
-      console.log('📄 Booking document to create:', JSON.stringify(bookingDoc, null, 2));
-
-      const booking = await IntercityBooking.create([bookingDoc], { session });
-      const newBooking = booking[0];
-
-      console.log('✅ Step 4: Booking created:', newBooking._id);
-      console.log('📋 Booking reference:', newBooking.bookingReference);
-
-      // Update schedule
-      console.log('🔍 Step 5: Updating schedule seats...');
-      schedule.bookedSeats += numberOfSeats;
-      schedule.availableSeats -= numberOfSeats;
-      await schedule.save({ session });
-
-      console.log('✅ Step 5: Schedule updated:', {
-        newBookedSeats: schedule.bookedSeats,
-        newAvailableSeats: schedule.availableSeats
+    if (!numberOfSeats || numberOfSeats < 1) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Number of seats must be at least 1' }
       });
+    }
 
-      // Update company stats
-      console.log('🔍 Step 6: Updating company stats...');
-      await IntercityCompany.findByIdAndUpdate(
-        schedule.companyId,
-        { $inc: { totalBookings: 1 } },
-        { session }
-      );
+    // Get schedule
+    console.log('🔍 Fetching schedule...');
+    const schedule = await IntercitySchedule.findById(scheduleId);
+    
+    if (!schedule) {
+      console.error('❌ Schedule not found:', scheduleId);
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Schedule not found' }
+      });
+    }
 
-      console.log('✅ Step 6: Company stats updated');
+    console.log('✅ Schedule found:', {
+      id: schedule._id,
+      status: schedule.status,
+      availableSeats: schedule.availableSeats,
+      pricePerSeat: schedule.pricePerSeat
+    });
 
-      // Transaction completed successfully
-      console.log('✅ Step 7: Transaction completed successfully');
+    // Check availability
+    if (schedule.status !== 'scheduled') {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Schedule is not available for booking' }
+      });
+    }
 
-      // Fetch populated data AFTER transaction for response
-      console.log('🔍 Step 8: Fetching populated schedule for response...');
-      const populatedSchedule = await IntercitySchedule.findById(schedule._id)
-        .populate('routeId')
-        .populate('companyId')
-        .lean();
+    if (schedule.availableSeats < numberOfSeats) {
+      return res.status(400).json({
+        success: false,
+        error: { message: `Only ${schedule.availableSeats} seats available` }
+      });
+    }
 
-      console.log('✅ Step 8: Populated schedule fetched');
+    // Calculate total
+    const totalAmount = schedule.pricePerSeat * numberOfSeats;
+    console.log('💰 Total amount:', totalAmount, 'kobo');
 
-      const responseData = {
+    // Create booking (bookingReference will be auto-generated by pre-save hook)
+    console.log('📝 Creating booking...');
+    const booking = await IntercityBooking.create({
+      userId,
+      scheduleId: schedule._id,
+      routeId: schedule.routeId,
+      companyId: schedule.companyId,
+      passengerDetails: {
+        fullName: passengerDetails.fullName.trim(),
+        email: passengerDetails.email.trim().toLowerCase(),
+        phone: passengerDetails.phone.trim(),
+        ...(passengerDetails.nextOfKin && {
+          nextOfKin: passengerDetails.nextOfKin
+        })
+      },
+      numberOfSeats: numberOfSeats,
+      seatNumbers: seatNumbers || [],
+      totalAmount: totalAmount,
+      status: 'confirmed',
+      paymentStatus: 'pending',
+      specialRequests: specialRequests || null
+    });
+
+    console.log('✅ Booking created:', {
+      id: booking._id,
+      reference: booking.bookingReference
+    });
+
+    // Update schedule seats
+    console.log('🔄 Updating schedule...');
+    schedule.bookedSeats = (schedule.bookedSeats || 0) + numberOfSeats;
+    schedule.availableSeats -= numberOfSeats;
+    await schedule.save();
+
+    console.log('✅ Schedule updated:', {
+      bookedSeats: schedule.bookedSeats,
+      availableSeats: schedule.availableSeats
+    });
+
+    // Update company stats
+    console.log('🔄 Updating company stats...');
+    await IntercityCompany.findByIdAndUpdate(
+      schedule.companyId,
+      { $inc: { totalBookings: 1 } }
+    );
+
+    console.log('✅ Company stats updated');
+
+    // Get populated data for response
+    console.log('🔍 Fetching populated data...');
+    const populatedSchedule = await IntercitySchedule.findById(schedule._id)
+      .populate('routeId')
+      .populate('companyId')
+      .lean();
+
+    if (!populatedSchedule || !populatedSchedule.routeId || !populatedSchedule.companyId) {
+      console.error('❌ Failed to populate schedule data');
+      // Still return success but with basic data
+      return res.status(201).json({
         success: true,
         booking: {
-          id: newBooking._id,
-          bookingReference: newBooking.bookingReference,
-          status: newBooking.status,
-          numberOfSeats: newBooking.numberOfSeats,
-          totalAmount: newBooking.totalAmount,
-          totalAmountInNaira: (newBooking.totalAmount / 100).toFixed(2),
-          company: populatedSchedule.companyId.companyName,
-          route: {
-            from: `${populatedSchedule.routeId.departureCity}, ${populatedSchedule.routeId.departureState}`,
-            to: `${populatedSchedule.routeId.arrivalCity}, ${populatedSchedule.routeId.arrivalState}`
-          },
-          departure: {
-            date: populatedSchedule.departureDate,
-            time: populatedSchedule.departureTime
-          }
+          id: booking._id,
+          bookingReference: booking.bookingReference,
+          status: booking.status,
+          numberOfSeats: booking.numberOfSeats,
+          totalAmount: booking.totalAmount,
+          totalAmountInNaira: (booking.totalAmount / 100).toFixed(2)
         },
         message: 'Booking confirmed successfully'
-      };
-
-      console.log('📤 Sending response:', JSON.stringify(responseData, null, 2));
-      console.log('✅ === BOOKING REQUEST COMPLETED ===');
-
-      res.status(201).json(responseData);
-
-      // Send notification after transaction (non-blocking)
-      setImmediate(() => {
-        try {
-          emitter.emit('notification', {
-            userId: userId.toString(),
-            type: 'booking_confirmed',
-            title: 'Booking Confirmed',
-            body: `Your booking ${newBooking.bookingReference} is confirmed`,
-            data: {
-              bookingId: newBooking._id,
-              bookingReference: newBooking.bookingReference
-            }
-          });
-        } catch (emitErr) {
-          console.error('⚠️ Notification error (non-critical):', emitErr);
-        }
       });
+    }
+
+    const responseData = {
+      success: true,
+      booking: {
+        id: booking._id,
+        bookingReference: booking.bookingReference,
+        status: booking.status,
+        numberOfSeats: booking.numberOfSeats,
+        totalAmount: booking.totalAmount,
+        totalAmountInNaira: (booking.totalAmount / 100).toFixed(2),
+        company: populatedSchedule.companyId.companyName,
+        route: {
+          from: `${populatedSchedule.routeId.departureCity}, ${populatedSchedule.routeId.departureState}`,
+          to: `${populatedSchedule.routeId.arrivalCity}, ${populatedSchedule.routeId.arrivalState}`
+        },
+        departure: {
+          date: populatedSchedule.departureDate,
+          time: populatedSchedule.departureTime
+        }
+      },
+      message: 'Booking confirmed successfully'
+    };
+
+    console.log('✅ === BOOKING COMPLETED SUCCESSFULLY ===');
+    console.log('📤 Response:', responseData);
+
+    res.status(201).json(responseData);
+
+    // Send notification (non-blocking)
+    setImmediate(() => {
+      try {
+        emitter.emit('notification', {
+          userId: userId.toString(),
+          type: 'booking_confirmed',
+          title: 'Booking Confirmed',
+          body: `Your booking ${booking.bookingReference} is confirmed`,
+          data: {
+            bookingId: booking._id,
+            bookingReference: booking.bookingReference
+          }
+        });
+      } catch (emitErr) {
+        console.error('⚠️ Notification error (non-critical):', emitErr);
+      }
     });
 
   } catch (err) {
@@ -1051,25 +1068,26 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
     let statusCode = 500;
     let errorMessage = err.message || 'Failed to create booking';
 
-    if (err.message.includes('not found')) {
+    if (err.name === 'ValidationError') {
+      statusCode = 400;
+      const messages = Object.values(err.errors).map(e => e.message);
+      errorMessage = messages.join(', ');
+    } else if (err.name === 'CastError') {
+      statusCode = 400;
+      errorMessage = 'Invalid ID format';
+    } else if (err.message.includes('not found')) {
       statusCode = 404;
-    } else if (err.message.includes('not available') || err.message.includes('seats available') || err.message.includes('required')) {
+    } else if (err.message.includes('not available') || err.message.includes('seats available')) {
       statusCode = 400;
     }
 
-    const errorResponse = {
+    res.status(statusCode).json({
       success: false,
       error: { 
         message: errorMessage,
         details: process.env.NODE_ENV === 'development' ? err.stack : undefined
       }
-    };
-
-    console.error('📤 Sending error response:', errorResponse);
-    res.status(statusCode).json(errorResponse);
-  } finally {
-    await session.endSession();
-    console.log('🔒 Session ended');
+    });
   }
 });
 

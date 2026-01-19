@@ -3,9 +3,9 @@ const mongoose = require('mongoose');
 const intercityBookingSchema = new mongoose.Schema({
   bookingReference: {
     type: String,
-    required: true,
     unique: true,
-    uppercase: true
+    uppercase: true,
+    sparse: true // Allow null during creation, will be set by pre-save hook
   },
   userId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -205,29 +205,77 @@ intercityBookingSchema.virtual('outstandingAmountInNaira').get(function() {
   return ((this.totalAmount - this.amountPaid) / 100).toFixed(2);
 });
 
-// Generate booking reference
+// Generate booking reference - FIXED VERSION
 intercityBookingSchema.pre('save', async function(next) {
-  if (!this.bookingReference) {
-    const timestamp = Date.now();
-    const randomNum = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-    this.bookingReference = `IC${timestamp}${randomNum}`;
+  try {
+    // Generate booking reference if it doesn't exist
+    if (this.isNew && !this.bookingReference) {
+      let reference;
+      let isUnique = false;
+      let attempts = 0;
+      const maxAttempts = 10;
+      
+      while (!isUnique && attempts < maxAttempts) {
+        attempts++;
+        
+        // Generate format: WHL-YYYYMMDD-XXXX (e.g., WHL-20250119-A3F7)
+        const date = new Date();
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        const dateStr = `${year}${month}${day}`;
+        
+        // Generate 4 character alphanumeric code
+        const randomStr = Math.random().toString(36).substring(2, 6).toUpperCase();
+        reference = `WHL${dateStr}${randomStr}`;
+        
+        // Check if this reference already exists
+        const existing = await this.constructor.findOne({ 
+          bookingReference: reference 
+        }).lean();
+        
+        if (!existing) {
+          isUnique = true;
+        }
+      }
+      
+      if (!isUnique) {
+        // Fallback: use timestamp-based reference
+        const timestamp = Date.now().toString().slice(-8);
+        const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+        reference = `WHL${timestamp}${random}`;
+      }
+      
+      this.bookingReference = reference;
+      console.log(`✅ Generated booking reference: ${reference}`);
+    }
+    
+    // Generate QR code data if not exists
+    if (this.isNew && !this.qrCodeData && this.bookingReference) {
+      const bookingData = {
+        bookingId: this._id.toString(),
+        reference: this.bookingReference,
+        passenger: this.passengerDetails.fullName,
+        scheduleId: this.scheduleId.toString(),
+        seats: this.numberOfSeats,
+        generatedAt: new Date().toISOString()
+      };
+      this.qrCodeData = JSON.stringify(bookingData);
+      console.log(`✅ Generated QR code data for: ${this.bookingReference}`);
+    }
+    
+    next();
+  } catch (error) {
+    console.error('❌ Error in pre-save hook:', error);
+    next(error);
   }
-  
-  // Generate QR code data if not exists
-  if (!this.qrCodeData && this.bookingReference) {
-    const bookingData = {
-      bookingId: this._id.toString(),
-      reference: this.bookingReference,
-      passenger: this.passengerDetails.fullName,
-      scheduleId: this.scheduleId.toString()
-    };
-    this.qrCodeData = JSON.stringify(bookingData);
-  }
-  
-  next();
 });
 
-// Update schedule when booking is confirmed
+// IMPORTANT: Comment out the post-save hook that updates schedule
+// The schedule update should be handled in the route to avoid race conditions
+// and to work properly with transactions
+
+/*
 intercityBookingSchema.post('save', async function(doc) {
   if (doc.status === 'confirmed' && doc.numberOfSeats > 0) {
     const Schedule = mongoose.model('IntercitySchedule');
@@ -236,8 +284,9 @@ intercityBookingSchema.post('save', async function(doc) {
     });
   }
 });
+*/
 
-// Update schedule when booking is cancelled
+// Update schedule when booking is cancelled via findOneAndUpdate
 intercityBookingSchema.post('findOneAndUpdate', async function(doc) {
   if (doc && doc.status === 'cancelled' && doc.numberOfSeats > 0) {
     const Schedule = mongoose.model('IntercitySchedule');
@@ -261,6 +310,18 @@ intercityBookingSchema.methods.isRefundable = function() {
   const hoursDifference = (now - bookingDate) / (1000 * 60 * 60);
   
   return refundableStatuses.includes(this.status) && hoursDifference <= 24;
+};
+
+// Method to generate readable booking summary
+intercityBookingSchema.methods.getSummary = function() {
+  return {
+    reference: this.bookingReference,
+    passenger: this.passengerDetails.fullName,
+    seats: this.numberOfSeats,
+    amount: this.totalAmountInNaira,
+    status: this.status,
+    paymentStatus: this.paymentStatus
+  };
 };
 
 module.exports = mongoose.model('IntercityBooking', intercityBookingSchema);
