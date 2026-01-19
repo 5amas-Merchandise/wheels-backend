@@ -1,3 +1,5 @@
+// app.js - ADD THIS TO YOUR EXISTING ROUTES
+
 const express = require('express');
 const cors = require('cors');
 const requestLogger = require('./middleware/requestLogger');
@@ -21,7 +23,7 @@ app.use(defaultLimiter);
 // === Routes ===
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
-const driverRoutes = require('./routes/drivers'); // ✅ Fixed path
+const driverRoutes = require('./routes/drivers');
 const matchingRoutes = require('./routes/matching');
 const paymentsRoutes = require('./routes/payments');
 const walletRoutes = require('./routes/wallet');
@@ -32,6 +34,7 @@ const adminRoutes = require('./routes/admin');
 const notificationsRoutes = require('./routes/notifications');
 const pricingRoutes = require('./routes/pricing');
 const tripsRoutes = require('./routes/trips');
+const intercityRoutes = require('./routes/intercity.routes'); // ✅ NEW
 
 app.use('/auth', authRoutes);
 app.use('/users', userRoutes);
@@ -46,6 +49,7 @@ app.use('/admin', adminRoutes);
 app.use('/notifications', notificationsRoutes);
 app.use('/pricing', pricingRoutes);
 app.use('/trips', tripsRoutes);
+app.use('/intercity', intercityRoutes); // ✅ NEW
 
 // === 404 Handler ===
 app.use((req, res, next) => {
