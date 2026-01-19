@@ -862,7 +862,7 @@ router.get('/search', async (req, res, next) => {
   }
 });
 
-// POST /intercity/bookings - CREATE BOOKING
+// POST /intercity/bookings - CREATE BOOKING (FIXED VERSION)
 router.post('/bookings', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
   
@@ -879,10 +879,8 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
 
       console.log(`📝 Creating booking for user ${userId}, schedule ${scheduleId}`);
 
-      // Get schedule with lock
+      // Get schedule with lock (without populate in transaction)
       const schedule = await IntercitySchedule.findById(scheduleId)
-        .populate('routeId')
-        .populate('companyId')
         .session(session);
 
       if (!schedule) {
@@ -897,15 +895,15 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
         throw new Error(`Only ${schedule.availableSeats} seats available`);
       }
 
-      // Calculate total
+      // Calculate total (amount is in kobo, not naira)
       const totalAmount = schedule.pricePerSeat * numberOfSeats;
 
-      // Create booking
+      // Create booking using the IDs directly from schedule
       const booking = await IntercityBooking.create([{
         userId,
         scheduleId: schedule._id,
-        routeId: schedule.routeId._id,
-        companyId: schedule.companyId._id,
+        routeId: schedule.routeId, // Use the ObjectId directly
+        companyId: schedule.companyId, // Use the ObjectId directly
         passengerDetails,
         numberOfSeats,
         seatNumbers: seatNumbers || [],
@@ -921,7 +919,7 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
 
       // Update company stats
       await IntercityCompany.findByIdAndUpdate(
-        schedule.companyId._id,
+        schedule.companyId,
         { $inc: { totalBookings: 1 } },
         { session }
       );
@@ -929,6 +927,12 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
       const newBooking = booking[0];
 
       console.log(`✅ Booking ${newBooking.bookingReference} created successfully`);
+
+      // Fetch populated data AFTER transaction for response
+      const populatedSchedule = await IntercitySchedule.findById(schedule._id)
+        .populate('routeId')
+        .populate('companyId')
+        .lean();
 
       res.status(201).json({
         success: true,
@@ -939,14 +943,14 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
           numberOfSeats: newBooking.numberOfSeats,
           totalAmount: newBooking.totalAmount,
           totalAmountInNaira: (newBooking.totalAmount / 100).toFixed(2),
-          company: schedule.companyId.companyName,
+          company: populatedSchedule.companyId.companyName,
           route: {
-            from: `${schedule.routeId.departureCity}, ${schedule.routeId.departureState}`,
-            to: `${schedule.routeId.arrivalCity}, ${schedule.routeId.arrivalState}`
+            from: `${populatedSchedule.routeId.departureCity}, ${populatedSchedule.routeId.departureState}`,
+            to: `${populatedSchedule.routeId.arrivalCity}, ${populatedSchedule.routeId.arrivalState}`
           },
           departure: {
-            date: schedule.departureDate,
-            time: schedule.departureTime
+            date: populatedSchedule.departureDate,
+            time: populatedSchedule.departureTime
           }
         },
         message: 'Booking confirmed successfully'
@@ -973,6 +977,7 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
 
   } catch (err) {
     console.error('❌ Booking error:', err);
+    console.error('Full error details:', err.stack);
     
     let statusCode = 500;
     let errorMessage = err.message || 'Failed to create booking';
@@ -991,7 +996,6 @@ router.post('/bookings', requireAuth, async (req, res, next) => {
     await session.endSession();
   }
 });
-
 // GET /intercity/bookings - GET USER BOOKINGS
 router.get('/bookings', requireAuth, async (req, res, next) => {
   try {
