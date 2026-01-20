@@ -14,6 +14,7 @@ const { isLuxury } = require('../constants/serviceTypes');
 const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 const rateLimit = require('express-rate-limit');
+const { requireActiveSubscription } = require('../middleware/subscriptionCheck');
 
 // ==========================================
 // RATE LIMITING
@@ -559,7 +560,7 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 // POST /trips/accept - DRIVER ACCEPTS (FIXED - NO AUTO CLEANUP)
 // ==========================================
 
-router.post('/accept', requireAuth, async (req, res, next) => {
+router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, next) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   
@@ -578,7 +579,10 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     const finalIdempotencyKey = idempotencyKey || `accept_${requestId}_${driverId}_${Date.now()}`;
 
     console.log(`🤝 Driver ${driverId} attempting to accept request ${requestId}`);
-    console.log('Idempotency key:', finalIdempotencyKey);
+    console.log('✅ Subscription verified:', {
+      expiresAt: req.subscription.expiresAt,
+      vehicleType: req.subscription.vehicleType
+    });
 
     const idempotencyCollection = mongoose.connection.collection('idempotency_keys');
     const existingKey = await idempotencyCollection.findOne(
@@ -626,7 +630,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       throw new Error('Driver not found');
     }
 
-    // 🚨 FIX #6: REMOVED AUTO-FIX LOGIC - Only check availability
     if (!driver.driverProfile?.isAvailable) {
       console.log(`⚠️ Driver isAvailable: ${driver.driverProfile?.isAvailable}`);
       await idempotencyCollection.updateOne(
@@ -680,12 +683,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
         throw new Error('Trip request not found');
       }
       
-      console.log(`Current status: ${currentRequest.status}`);
-      console.log(`Assigned to: ${currentRequest.assignedDriverId}`);
-      
-      const candidate = currentRequest.candidates.find(c => c.driverId.toString() === driverId.toString());
-      console.log(`Candidate status: ${candidate?.status || 'not found'}`);
-      
       await idempotencyCollection.updateOne(
         { key: finalIdempotencyKey },
         { $set: { status: 'failed', error: 'Trip no longer available' } },
@@ -694,10 +691,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       
       if (currentRequest.assignedDriverId && currentRequest.assignedDriverId.toString() !== driverId.toString()) {
         throw new Error('Trip was already assigned to another driver');
-      } else if (currentRequest.status !== 'searching') {
-        throw new Error('Trip is no longer available');
-      } else if (!candidate || candidate.status !== 'offered') {
-        throw new Error('You were not offered this trip');
       } else {
         throw new Error('Trip is no longer available');
       }
@@ -717,7 +710,12 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       estimatedFare: tripRequest.estimatedFare || 0,
       distanceKm: tripRequest.distance || 0,
       durationMinutes: Math.round((tripRequest.duration || 0) / 60),
-      requestedAt: new Date()
+      requestedAt: new Date(),
+      metadata: {
+        subscriptionId: req.subscription.id,
+        subscriptionExpiresAt: req.subscription.expiresAt,
+        vehicleType: req.subscription.vehicleType
+      }
     }], { session });
 
     const newTrip = tripDoc[0];
@@ -756,7 +754,11 @@ router.post('/accept', requireAuth, async (req, res, next) => {
       success: true,
       tripId: newTrip._id.toString(),
       requestId: tripRequest._id.toString(),
-      driverId: driverId.toString()
+      driverId: driverId.toString(),
+      subscription: {
+        expiresAt: req.subscription.expiresAt,
+        vehicleType: req.subscription.vehicleType
+      }
     };
 
     notificationData = {
@@ -777,6 +779,7 @@ router.post('/accept', requireAuth, async (req, res, next) => {
     responseSent = true;
     console.log('✅ Response sent to driver');
 
+    // Send notifications (non-blocking)
     setImmediate(() => {
       try {
         emitter.emit('notification', {
@@ -797,13 +800,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
             pickupAddress: notificationData.pickupAddress,
             dropoffAddress: notificationData.dropoffAddress
           }
-        });
-
-        emitter.emit('trip_accepted', {
-          requestId: notificationData.requestId,
-          tripId: notificationData.tripId,
-          driverId: notificationData.driverId,
-          driverName: notificationData.driverName
         });
 
         console.log(`📨 Notifications sent for trip ${notificationData.tripId}`);
@@ -844,9 +840,6 @@ router.post('/accept', requireAuth, async (req, res, next) => {
         } else {
           errorCode = 'TRIP_UNAVAILABLE';
         }
-      } else if (errorMessage.includes('required') || errorMessage.includes('Invalid')) {
-        statusCode = 400;
-        errorCode = 'INVALID_REQUEST';
       }
 
       res.status(statusCode).json({

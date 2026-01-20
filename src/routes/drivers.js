@@ -1,8 +1,12 @@
+// routes/drivers.routes.js - COMPLETE WITH SUBSCRIPTION INTEGRATION
+
 const express = require("express");
 const router = express.Router();
 const User = require("../models/user.model");
 const TripRequest = require("../models/tripRequest.model");
+const Trip = require("../models/trip.model");
 const { requireAuth } = require("../middleware/auth");
+const { requireActiveSubscription, checkSubscriptionStatus } = require("../middleware/subscriptionCheck");
 
 const DURATION_DAYS = {
   daily: 1,
@@ -10,8 +14,12 @@ const DURATION_DAYS = {
   monthly: 30,
 };
 
-// ✅ FIX 3: CRITICAL - Update availability and always update lastSeen
-router.post("/availability", requireAuth, async (req, res, next) => {
+// ==========================================
+// SUBSCRIPTION-PROTECTED ENDPOINTS
+// ==========================================
+
+// ✅ UPDATE: Availability endpoint now checks subscription
+router.post("/availability", requireAuth, requireActiveSubscription, async (req, res, next) => {
   try {
     const userId = req.user && req.user.sub;
     if (!userId)
@@ -23,6 +31,7 @@ router.post("/availability", requireAuth, async (req, res, next) => {
       userId,
       isAvailable,
       hasLocation: !!location,
+      subscriptionExpiresAt: req.subscription?.expiresAt,
       timestamp: new Date().toISOString()
     });
 
@@ -75,12 +84,18 @@ router.post("/availability", requireAuth, async (req, res, next) => {
     console.log('✅ Driver availability updated:', {
       userId,
       isAvailable: user.driverProfile?.isAvailable,
-      lastSeen: user.driverProfile?.lastSeen
+      lastSeen: user.driverProfile?.lastSeen,
+      hasActiveSubscription: !!req.subscription
     });
 
     res.json({ 
       success: true,
-      driverProfile: user.driverProfile 
+      driverProfile: user.driverProfile,
+      subscription: {
+        expiresAt: req.subscription.expiresAt,
+        vehicleType: req.subscription.vehicleType,
+        plan: req.subscription.plan
+      }
     });
   } catch (err) {
     console.error('❌ Availability update error:', err);
@@ -88,9 +103,8 @@ router.post("/availability", requireAuth, async (req, res, next) => {
   }
 });
 
-// ✅✅✅ CRITICAL FIX: Get offered request with $elemMatch - FIXED VERSION
-// ✅✅✅ CRITICAL FIX: Get offered request with $elemMatch - COMPLETELY FIXED VERSION
-router.get("/offered-request", requireAuth, async (req, res, next) => {
+// ✅ Get offered request - requires active subscription
+router.get("/offered-request", requireAuth, requireActiveSubscription, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     console.log(`🔍 Driver ${driverId} checking for offered requests`);
@@ -120,6 +134,11 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
       
       return res.status(404).json({ 
         message: "No active offer",
+        subscriptionStatus: {
+          hasActiveSubscription: true,
+          expiresAt: req.subscription.expiresAt,
+          vehicleType: req.subscription.vehicleType
+        },
         debug: { 
           driverId, 
           timestamp: now.toISOString(),
@@ -199,6 +218,11 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
           driverName: candidate.driverName
         }
       },
+      subscription: {
+        expiresAt: req.subscription.expiresAt,
+        vehicleType: req.subscription.vehicleType,
+        plan: req.subscription.plan
+      }
     };
     
     res.json(response);
@@ -208,56 +232,67 @@ router.get("/offered-request", requireAuth, async (req, res, next) => {
   }
 });
 
-// ✅ NEW: Debug endpoint to see all trips where driver is a candidate
-router.get("/debug/my-offers", requireAuth, async (req, res, next) => {
+// ✅ Endpoint for driver to check pending/offered trips (with subscription check)
+router.get("/pending-offers", requireAuth, requireActiveSubscription, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
+    const now = new Date();
     
-    const trips = await TripRequest.find({
+    const offeredTrips = await TripRequest.find({
       candidates: {
-        $elemMatch: { driverId: driverId }
+        $elemMatch: {
+          driverId: driverId,
+          status: { $in: ['offered', 'pending'] },
+          rejectedAt: null
+        }
       },
-      createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) }
+      status: 'searching', // ONLY searching trips!
+      expiresAt: { $gt: now }, // NOT expired
+      createdAt: { $gte: new Date(now.getTime() - 10 * 60 * 1000) }
     })
-    .populate("passengerId", "name phone")
-    .select('_id status serviceType estimatedFare pickup dropoff candidates createdAt')
-    .sort({ createdAt: -1 })
+    .select('_id status serviceType pickup dropoff estimatedFare candidates expiresAt')
     .lean();
     
-    const formatted = trips.map(trip => {
-      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
+    const formatted = offeredTrips.map(trip => {
+      const candidate = trip.candidates.find(c => 
+        c.driverId.toString() === driverId && 
+        ['offered', 'pending'].includes(c.status) &&
+        !c.rejectedAt
+      );
       return {
         requestId: trip._id,
-        passengerName: trip.passengerId?.name,
-        serviceType: trip.serviceType,
-        estimatedFare: trip.estimatedFare,
-        tripStatus: trip.status,
+        status: trip.status,
         candidateStatus: candidate?.status,
+        serviceType: trip.serviceType,
+        pickup: trip.pickup,
+        dropoff: trip.dropoff,
+        estimatedFare: trip.estimatedFare,
         offeredAt: candidate?.offeredAt,
-        rejectedAt: candidate?.rejectedAt,
-        createdAt: trip.createdAt,
-        allCandidates: trip.candidates.map(c => ({
-          driverId: c.driverId,
-          status: c.status,
-          offeredAt: c.offeredAt
-        }))
+        expiresAt: trip.expiresAt,
+        timeUntilExpiry: Math.max(0, trip.expiresAt - now)
       };
-    });
+    }).filter(offer => offer.candidateStatus); // Remove if no matching candidate
     
     res.json({
-      driverId,
-      tripCount: formatted.length,
-      trips: formatted,
-      timestamp: new Date().toISOString()
+      count: formatted.length,
+      offers: formatted,
+      subscription: {
+        expiresAt: req.subscription.expiresAt,
+        vehicleType: req.subscription.vehicleType
+      }
     });
   } catch (err) {
-    console.error('Error in /debug/my-offers:', err);
+    console.error('Error in /pending-offers:', err);
     next(err);
   }
 });
 
+// ==========================================
+// LOCATION ENDPOINTS (with subscription check)
+// ==========================================
+
 // Driver location update endpoint
-router.post('/location', requireAuth, async (req, res, next) => {
+router.post('/location', requireAuth, requireActiveSubscription, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const { latitude, longitude, heading } = req.body;
@@ -301,6 +336,10 @@ router.post('/location', requireAuth, async (req, res, next) => {
         latitude,
         longitude,
         heading: heading || 0
+      },
+      subscription: {
+        expiresAt: req.subscription.expiresAt,
+        vehicleType: req.subscription.vehicleType
       }
     });
   } catch (err) {
@@ -336,58 +375,29 @@ router.get('/location', requireAuth, async (req, res, next) => {
   }
 });
 
-// Subscribe or renew subscription
-router.post("/subscribe", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    const { type } = req.body;
-    if (!type || !DURATION_DAYS[type])
-      return res
-        .status(400)
-        .json({ error: { message: "Invalid subscription type" } });
-    const user = await User.findById(userId);
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    const now = new Date();
-    const days = DURATION_DAYS[type];
-    const expiresAt = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
-    user.subscription = { type, startedAt: now, expiresAt };
-    user.roles = user.roles || {};
-    user.roles.isDriver = true;
-    await user.save();
-    res.json({ ok: true, subscription: user.subscription });
-  } catch (err) {
-    next(err);
-  }
-});
+// ==========================================
+// PROFILE ENDPOINTS (with subscription status)
+// ==========================================
 
-// Get subscription status
-router.get("/subscription", requireAuth, async (req, res, next) => {
+// Get driver profile - includes subscription status
+router.get("/me", requireAuth, checkSubscriptionStatus, async (req, res, next) => {
   try {
     const userId = req.user && req.user.sub;
     if (!userId)
       return res.status(401).json({ error: { message: "Unauthorized" } });
+    
     const user = await User.findById(userId).lean();
     if (!user)
       return res.status(404).json({ error: { message: "User not found" } });
-    res.json({ subscription: user.subscription || null });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Get driver profile
-router.get("/me", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    const user = await User.findById(userId).lean();
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    res.json({ driverProfile: user.driverProfile, roles: user.roles });
+    
+    res.json({ 
+      driverProfile: user.driverProfile, 
+      roles: user.roles,
+      subscriptionStatus: req.subscriptionStatus || {
+        hasSubscription: false,
+        isActive: false
+      }
+    });
   } catch (err) {
     next(err);
   }
@@ -437,7 +447,11 @@ router.post("/profile", requireAuth, async (req, res, next) => {
       { $set: update },
       { new: true }
     ).lean();
-    res.json({ driverProfile: user.driverProfile });
+    
+    res.json({ 
+      success: true,
+      driverProfile: user.driverProfile 
+    });
   } catch (err) {
     next(err);
   }
@@ -449,24 +463,35 @@ router.post("/service-categories", requireAuth, async (req, res, next) => {
     const userId = req.user && req.user.sub;
     if (!userId)
       return res.status(401).json({ error: { message: "Unauthorized" } });
+    
     const { add = [], remove = [] } = req.body;
+    
     if (!Array.isArray(add) || !Array.isArray(remove))
       return res
         .status(400)
         .json({ error: { message: "add and remove must be arrays" } });
+    
     const user = await User.findById(userId);
     if (!user)
       return res.status(404).json({ error: { message: "User not found" } });
+    
     user.driverProfile.serviceCategories =
       user.driverProfile.serviceCategories || [];
+    
     for (const s of add) {
       if (!user.driverProfile.serviceCategories.includes(s))
         user.driverProfile.serviceCategories.push(s);
     }
+    
     user.driverProfile.serviceCategories =
       user.driverProfile.serviceCategories.filter((s) => !remove.includes(s));
+    
     await user.save();
-    res.json({ serviceCategories: user.driverProfile.serviceCategories });
+    
+    res.json({ 
+      success: true,
+      serviceCategories: user.driverProfile.serviceCategories 
+    });
   } catch (err) {
     next(err);
   }
@@ -592,6 +617,54 @@ router.put("/request-verification", requireAuth, async (req, res, next) => {
   }
 });
 
+// ==========================================
+// LEGACY SUBSCRIPTION ENDPOINTS (DEPRECATED - kept for backward compatibility)
+// ==========================================
+
+// ⚠️ DEPRECATED: Use /subscriptions/subscribe instead
+router.post("/subscribe", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    
+    // Redirect to new subscription system
+    return res.status(410).json({ 
+      error: { 
+        message: "This endpoint is deprecated. Please use POST /subscriptions/subscribe",
+        code: "ENDPOINT_DEPRECATED",
+        newEndpoint: "/subscriptions/subscribe"
+      } 
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ⚠️ DEPRECATED: Use /subscriptions/current instead
+router.get("/subscription", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    
+    // Redirect to new subscription system
+    return res.status(410).json({ 
+      error: { 
+        message: "This endpoint is deprecated. Please use GET /subscriptions/current",
+        code: "ENDPOINT_DEPRECATED",
+        newEndpoint: "/subscriptions/current"
+      } 
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// TRIP STATUS ENDPOINTS
+// ==========================================
+
 // Get driver's current trip status
 router.get("/current-trip", requireAuth, async (req, res, next) => {
   try {
@@ -602,10 +675,14 @@ router.get("/current-trip", requireAuth, async (req, res, next) => {
       .lean();
     
     if (!user || !user.driverProfile?.currentTripId) {
-      return res.json({ hasCurrentTrip: false });
+      return res.json({ 
+        success: true,
+        hasCurrentTrip: false 
+      });
     }
     
     res.json({
+      success: true,
       hasCurrentTrip: true,
       tripId: user.driverProfile.currentTripId
     });
@@ -614,108 +691,12 @@ router.get("/current-trip", requireAuth, async (req, res, next) => {
   }
 });
 
-// Endpoint for driver to check pending/offered trips
-router.get("/pending-offers", requireAuth, async (req, res, next) => {
-  try {
-    const driverId = req.user.sub;
-    const now = new Date();
-    
-    const offeredTrips = await TripRequest.find({
-      candidates: {
-        $elemMatch: {
-          driverId: driverId,
-          status: { $in: ['offered', 'pending'] },
-          rejectedAt: null
-        }
-      },
-      status: 'searching', // ONLY searching trips!
-      expiresAt: { $gt: now }, // NOT expired
-      createdAt: { $gte: new Date(now.getTime() - 10 * 60 * 1000) }
-    })
-    .select('_id status serviceType pickup dropoff estimatedFare candidates expiresAt')
-    .lean();
-    
-    const formatted = offeredTrips.map(trip => {
-      const candidate = trip.candidates.find(c => 
-        c.driverId.toString() === driverId && 
-        ['offered', 'pending'].includes(c.status) &&
-        !c.rejectedAt
-      );
-      return {
-        requestId: trip._id,
-        status: trip.status,
-        candidateStatus: candidate?.status,
-        serviceType: trip.serviceType,
-        pickup: trip.pickup,
-        dropoff: trip.dropoff,
-        estimatedFare: trip.estimatedFare,
-        offeredAt: candidate?.offeredAt,
-        expiresAt: trip.expiresAt,
-        timeUntilExpiry: Math.max(0, trip.expiresAt - now)
-      };
-    }).filter(offer => offer.candidateStatus); // Remove if no matching candidate
-    
-    res.json({
-      count: formatted.length,
-      offers: formatted
-    });
-  } catch (err) {
-    console.error('Error in /pending-offers:', err);
-    next(err);
-  }
-});
-
-// DEBUG: Get all currently online drivers
-router.get('/debug/online', async (req, res) => {
-  try {
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-
-    const onlineDrivers = await User.find({
-      'roles.isDriver': true,
-      'driverProfile.isAvailable': true,
-      'driverProfile.verified': true,
-      'driverProfile.verificationState': 'approved',
-      'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
-    })
-      .select('name phone driverProfile.location driverProfile.lastSeen driverProfile.vehicleModel driverProfile.serviceCategories')
-      .lean();
-
-    const formatted = onlineDrivers.map(driver => ({
-      driverId: driver._id.toString(),
-      name: driver.name || 'Unknown Driver',
-      phone: driver.phone || 'Not set',
-      vehicle: driver.driverProfile?.vehicleModel || 'No vehicle',
-      serviceCategories: driver.driverProfile?.serviceCategories || [],
-      location: driver.driverProfile?.location?.coordinates
-        ? {
-            latitude: driver.driverProfile.location.coordinates[1],
-            longitude: driver.driverProfile.location.coordinates[0]
-          }
-        : null,
-      lastSeen: driver.driverProfile?.lastSeen?.toISOString() || null,
-      isOnline: true
-    }));
-
-    res.json({
-      success: true,
-      count: formatted.length,
-      drivers: formatted,
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    console.error('Error in /debug/online:', err);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch online drivers',
-      message: err.message
-    });
-  }
-});
-
 // ==========================================
-// GET /drivers/current-state - Get driver state for cleanup checks
+// STATE MANAGEMENT ENDPOINTS
 // ==========================================
-router.get('/current-state', requireAuth, async (req, res) => {
+
+// Get driver state for cleanup checks
+router.get('/current-state', requireAuth, checkSubscriptionStatus, async (req, res) => {
   try {
     const driverId = req.user.sub;
     
@@ -735,6 +716,7 @@ router.get('/current-state', requireAuth, async (req, res) => {
     }
 
     res.json({
+      success: true,
       driverId,
       name: driver.name,
       isAvailable: driver.driverProfile?.isAvailable,
@@ -748,7 +730,8 @@ router.get('/current-state', requireAuth, async (req, res) => {
         cancelledAt: currentTrip.cancelledAt
       } : null,
       needsCleanup: driver.driverProfile?.currentTripId && 
-                    (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status))
+                    (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status)),
+      subscriptionStatus: req.subscriptionStatus
     });
 
   } catch (err) {
@@ -757,9 +740,7 @@ router.get('/current-state', requireAuth, async (req, res) => {
   }
 });
 
-// ==========================================
-// POST /drivers/cleanup-state - Cleanup stale driver state
-// ==========================================
+// Cleanup stale driver state
 router.post('/cleanup-state', requireAuth, async (req, res) => {
   try {
     const driverId = req.user.sub;
@@ -818,6 +799,106 @@ router.post('/cleanup-state', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Cleanup error:', err);
     res.status(500).json({ error: { message: 'Cleanup failed' } });
+  }
+});
+
+// ==========================================
+// DEBUG ENDPOINTS
+// ==========================================
+
+// Debug: Get all trips where driver is a candidate
+router.get("/debug/my-offers", requireAuth, async (req, res, next) => {
+  try {
+    const driverId = req.user.sub;
+    
+    const trips = await TripRequest.find({
+      candidates: {
+        $elemMatch: { driverId: driverId }
+      },
+      createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) }
+    })
+    .populate("passengerId", "name phone")
+    .select('_id status serviceType estimatedFare pickup dropoff candidates createdAt')
+    .sort({ createdAt: -1 })
+    .lean();
+    
+    const formatted = trips.map(trip => {
+      const candidate = trip.candidates.find(c => c.driverId.toString() === driverId);
+      return {
+        requestId: trip._id,
+        passengerName: trip.passengerId?.name,
+        serviceType: trip.serviceType,
+        estimatedFare: trip.estimatedFare,
+        tripStatus: trip.status,
+        candidateStatus: candidate?.status,
+        offeredAt: candidate?.offeredAt,
+        rejectedAt: candidate?.rejectedAt,
+        createdAt: trip.createdAt,
+        allCandidates: trip.candidates.map(c => ({
+          driverId: c.driverId,
+          status: c.status,
+          offeredAt: c.offeredAt
+        }))
+      };
+    });
+    
+    res.json({
+      success: true,
+      driverId,
+      tripCount: formatted.length,
+      trips: formatted,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Error in /debug/my-offers:', err);
+    next(err);
+  }
+});
+
+// DEBUG: Get all currently online drivers
+router.get('/debug/online', async (req, res) => {
+  try {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+    const onlineDrivers = await User.find({
+      'roles.isDriver': true,
+      'driverProfile.isAvailable': true,
+      'driverProfile.verified': true,
+      'driverProfile.verificationState': 'approved',
+      'driverProfile.lastSeen': { $gte: fiveMinutesAgo }
+    })
+      .select('name phone driverProfile.location driverProfile.lastSeen driverProfile.vehicleModel driverProfile.serviceCategories')
+      .lean();
+
+    const formatted = onlineDrivers.map(driver => ({
+      driverId: driver._id.toString(),
+      name: driver.name || 'Unknown Driver',
+      phone: driver.phone || 'Not set',
+      vehicle: driver.driverProfile?.vehicleModel || 'No vehicle',
+      serviceCategories: driver.driverProfile?.serviceCategories || [],
+      location: driver.driverProfile?.location?.coordinates
+        ? {
+            latitude: driver.driverProfile.location.coordinates[1],
+            longitude: driver.driverProfile.location.coordinates[0]
+          }
+        : null,
+      lastSeen: driver.driverProfile?.lastSeen?.toISOString() || null,
+      isOnline: true
+    }));
+
+    res.json({
+      success: true,
+      count: formatted.length,
+      drivers: formatted,
+      timestamp: new Date().toISOString()
+    });
+  } catch (err) {
+    console.error('Error in /debug/online:', err);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch online drivers',
+      message: err.message
+    });
   }
 });
 
