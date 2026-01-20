@@ -1,5 +1,3 @@
-// routes/subscriptions.routes.js
-
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -198,18 +196,12 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
 
       console.log(`💰 Subscription price: ₦${priceNaira} (${priceKobo} kobo)`);
 
-      // Check wallet balance
-      let wallet = await Wallet.findOne({ userId: driverId }).session(session);
-      
-      if (!wallet) {
-        // Create wallet if it doesn't exist
-        wallet = await Wallet.create([{
-          userId: driverId,
-          balance: 0,
-          currency: 'NGN'
-        }], { session });
-        wallet = wallet[0];
-      }
+      // Get or create wallet using atomic upsert
+      let wallet = await Wallet.findOneAndUpdate(
+        { owner: driverId },
+        { $setOnInsert: { owner: driverId, balance: 0, currency: 'NGN' } },
+        { new: true, upsert: true, session }
+      );
 
       if (wallet.balance < priceKobo) {
         throw new Error(`Insufficient wallet balance. Required: ₦${priceNaira}, Available: ₦${(wallet.balance / 100).toFixed(2)}`);

@@ -1,4 +1,3 @@
-// routes/wallet.routes.js - COMPLETE CORRECTED VERSION
 const express = require('express');
 const router = express.Router();
 const mongoose = require('mongoose');
@@ -62,17 +61,12 @@ router.post('/admin/update', async (req, res, next) => {
       // Convert to kobo
       const amountKobo = Math.round(absoluteAmount * 100);
 
-      // Get or create wallet
-      let wallet = await Wallet.findOne({ owner: driverId }).session(session);
-      
-      if (!wallet) {
-        wallet = await Wallet.create([{
-          owner: driverId,
-          balance: 0,
-          currency: 'NGN'
-        }], { session });
-        wallet = wallet[0];
-      }
+      // Get or create wallet using atomic upsert
+      let wallet = await Wallet.findOneAndUpdate(
+        { owner: driverId },
+        { $setOnInsert: { owner: driverId, balance: 0, currency: 'NGN' } },
+        { new: true, upsert: true, session }
+      );
 
       const balanceBefore = wallet.balance;
 
@@ -185,15 +179,12 @@ router.get('/', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
 
-    let wallet = await Wallet.findOne({ owner: userId }).lean();
-
-    if (!wallet) {
-      wallet = await Wallet.create({
-        owner: userId,
-        balance: 0,
-        currency: 'NGN'
-      });
-    }
+    // Use atomic upsert to ensure wallet exists
+    let wallet = await Wallet.findOneAndUpdate(
+      { owner: userId },
+      { $setOnInsert: { owner: userId, balance: 0, currency: 'NGN' } },
+      { new: true, upsert: true }
+    ).lean();
 
     res.json({
       success: true,

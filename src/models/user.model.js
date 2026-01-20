@@ -193,13 +193,8 @@ const UserSchema = new mongoose.Schema({
       sms: { type: Boolean, default: true },
       push: { type: Boolean, default: true }
     }
-  },
-  
-  // Wallet
-  wallet: {
-    balance: { type: Number, default: 0 },
-    currency: { type: String, default: 'NGN' }
   }
+  // NOTE: Wallet field has been removed - use separate Wallet model
 }, {
   timestamps: true
 });
