@@ -5,7 +5,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const User = require('../models/user.model');
 const Wallet = require('../models/wallet.model');
-const Transaction = require('../models/transaction.model'); // Import directly
+const Transaction = require('../models/transaction.model');
 const { requireAuth } = require('../middleware/auth');
 
 // Paystack configuration
@@ -42,13 +42,16 @@ router.post('/admin/update', async (req, res, next) => {
         throw new Error('Invalid Driver ID format');
       }
 
+      // Convert to ObjectId
+      const driverObjectId = new mongoose.Types.ObjectId(driverId);
+
       // Determine transaction type
       const transactionType = type || (amount > 0 ? 'credit' : 'debit');
       const isCredit = transactionType === 'credit';
       const absoluteAmount = Math.abs(amount);
 
       // Verify driver exists
-      const driver = await User.findById(driverId)
+      const driver = await User.findById(driverObjectId)
         .select('name phone email roles')
         .session(session);
 
@@ -61,12 +64,19 @@ router.post('/admin/update', async (req, res, next) => {
       // Convert to kobo
       const amountKobo = Math.round(absoluteAmount * 100);
 
-      // Get or create wallet using atomic upsert
-      let wallet = await Wallet.findOneAndUpdate(
-        { owner: driverId },
-        { $setOnInsert: { owner: driverId, balance: 0, currency: 'NGN' } },
-        { new: true, upsert: true, session }
-      );
+      // Get or create wallet
+      let wallet = await Wallet.findOne({ owner: driverObjectId }).session(session);
+      
+      if (!wallet) {
+        console.log(`Creating new wallet for driver ${driverId}`);
+        wallet = await Wallet.create([{
+          owner: driverObjectId,
+          balance: 0,
+          currency: 'NGN'
+        }], { session });
+        wallet = wallet[0];
+        console.log(`✅ New wallet created: ${wallet._id}`);
+      }
 
       const balanceBefore = wallet.balance;
 
@@ -98,7 +108,7 @@ router.post('/admin/update', async (req, res, next) => {
 
       // Create transaction record
       const transaction = await Transaction.create([{
-        userId: driverId,
+        userId: driverObjectId,
         type: transactionType,
         amount: amountKobo,
         description: `Admin ${transactionType}: ${reason}`,
@@ -178,13 +188,19 @@ router.post('/admin/update', async (req, res, next) => {
 router.get('/', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
+    const userObjectId = new mongoose.Types.ObjectId(userId);
 
-    // Use atomic upsert to ensure wallet exists
-    let wallet = await Wallet.findOneAndUpdate(
-      { owner: userId },
-      { $setOnInsert: { owner: userId, balance: 0, currency: 'NGN' } },
-      { new: true, upsert: true }
-    ).lean();
+    let wallet = await Wallet.findOne({ owner: userObjectId }).lean();
+
+    if (!wallet) {
+      console.log(`Creating new wallet for user ${userId}`);
+      wallet = await Wallet.create({
+        owner: userObjectId,
+        balance: 0,
+        currency: 'NGN'
+      });
+      console.log(`✅ New wallet created: ${wallet._id}`);
+    }
 
     res.json({
       success: true,
@@ -213,6 +229,7 @@ router.get('/', requireAuth, async (req, res, next) => {
 router.post('/fund/initialize', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
+    const userObjectId = new mongoose.Types.ObjectId(userId);
     const { amount, email } = req.body;
 
     console.log(`💰 Initializing wallet funding for user ${userId}`);
@@ -249,7 +266,7 @@ router.post('/fund/initialize', requireAuth, async (req, res, next) => {
     }
 
     // Get user
-    const user = await User.findById(userId).select('name phone email');
+    const user = await User.findById(userObjectId).select('name phone email');
     if (!user) {
       return res.status(404).json({
         success: false,
@@ -268,7 +285,7 @@ router.post('/fund/initialize', requireAuth, async (req, res, next) => {
 
     // Create pending transaction
     const transaction = await Transaction.create({
-      userId,
+      userId: userObjectId,
       type: 'deposit',
       amount: amountKobo,
       description: `Wallet funding - ₦${amount.toLocaleString()}`,
@@ -369,6 +386,7 @@ router.post('/fund/verify', requireAuth, async (req, res, next) => {
   try {
     await session.withTransaction(async () => {
       const userId = req.user.sub;
+      const userObjectId = new mongoose.Types.ObjectId(userId);
       const { reference } = req.body;
 
       console.log(`🔍 Verifying payment: ${reference}`);
@@ -379,7 +397,7 @@ router.post('/fund/verify', requireAuth, async (req, res, next) => {
 
       // Find pending transaction
       const transaction = await Transaction.findOne({
-        userId,
+        userId: userObjectId,
         paymentReference: reference,
         status: 'pending'
       }).session(session);
@@ -412,14 +430,16 @@ router.post('/fund/verify', requireAuth, async (req, res, next) => {
         console.log(`✅ Paystack verification successful for reference: ${reference}`);
 
         // Get or create wallet
-        let wallet = await Wallet.findOne({ owner: userId }).session(session);
+        let wallet = await Wallet.findOne({ owner: userObjectId }).session(session);
         if (!wallet) {
+          console.log(`Creating new wallet for user ${userId}`);
           wallet = await Wallet.create([{
-            owner: userId,
+            owner: userObjectId,
             balance: 0,
             currency: 'NGN'
           }], { session });
           wallet = wallet[0];
+          console.log(`✅ New wallet created: ${wallet._id}`);
         }
 
         const balanceBefore = wallet.balance;
@@ -552,12 +572,14 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
           // Get wallet
           let wallet = await Wallet.findOne({ owner: transaction.userId }).session(session);
           if (!wallet) {
+            console.log(`Creating new wallet for user ${transaction.userId}`);
             wallet = await Wallet.create([{
               owner: transaction.userId,
               balance: 0,
               currency: 'NGN'
             }], { session });
             wallet = wallet[0];
+            console.log(`✅ New wallet created: ${wallet._id}`);
           }
 
           const balanceBefore = wallet.balance;
@@ -611,6 +633,8 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
 router.get('/transactions', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    
     const { 
       limit = 20, 
       offset = 0,
@@ -623,7 +647,7 @@ router.get('/transactions', requireAuth, async (req, res, next) => {
     const parsedLimit = Math.min(parseInt(limit), 100);
     const parsedOffset = parseInt(offset) || 0;
 
-    const filter = { userId };
+    const filter = { userId: userObjectId };
     
     if (type !== 'all') {
       filter.type = type;
@@ -694,6 +718,7 @@ router.get('/transactions', requireAuth, async (req, res, next) => {
 router.get('/transactions/:id', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
+    const userObjectId = new mongoose.Types.ObjectId(userId);
     const transactionId = req.params.id;
 
     if (!mongoose.Types.ObjectId.isValid(transactionId)) {
@@ -705,7 +730,7 @@ router.get('/transactions/:id', requireAuth, async (req, res, next) => {
 
     const transaction = await Transaction.findOne({
       _id: transactionId,
-      userId
+      userId: userObjectId
     }).lean();
 
     if (!transaction) {
@@ -841,9 +866,11 @@ router.get('/admin/debug/wallet/:userId', async (req, res) => {
       });
     }
 
-    const user = await User.findById(userId).select('name email phone');
-    const wallet = await Wallet.findOne({ owner: userId });
-    const transactions = await Transaction.find({ userId }).limit(5).sort({ createdAt: -1 });
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    
+    const user = await User.findById(userObjectId).select('name email phone');
+    const wallet = await Wallet.findOne({ owner: userObjectId });
+    const transactions = await Transaction.find({ userId: userObjectId }).limit(5).sort({ createdAt: -1 });
 
     res.json({
       success: true,

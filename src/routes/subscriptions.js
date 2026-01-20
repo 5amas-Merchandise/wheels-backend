@@ -141,6 +141,10 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
   try {
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
+      
+      // Convert driverId to ObjectId
+      const driverObjectId = new mongoose.Types.ObjectId(driverId);
+      
       const { vehicleType, duration, autoRenew = false } = req.body;
 
       console.log(`💳 Driver ${driverId} attempting to subscribe:`, {
@@ -163,7 +167,7 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
       }
 
       // Get driver
-      const driver = await User.findById(driverId)
+      const driver = await User.findById(driverObjectId)
         .select('name phone roles driverProfile')
         .session(session);
 
@@ -181,7 +185,7 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
 
       // Check for existing active subscription
       const existingSubscription = await Subscription.findOne({
-        driverId,
+        driverId: driverObjectId,
         status: 'active',
         expiresAt: { $gt: new Date() }
       }).session(session);
@@ -196,12 +200,22 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
 
       console.log(`💰 Subscription price: ₦${priceNaira} (${priceKobo} kobo)`);
 
-      // Get or create wallet using atomic upsert
-      let wallet = await Wallet.findOneAndUpdate(
-        { owner: driverId },
-        { $setOnInsert: { owner: driverId, balance: 0, currency: 'NGN' } },
-        { new: true, upsert: true, session }
-      );
+      // Get or create wallet
+      let wallet = await Wallet.findOne({ owner: driverObjectId }).session(session);
+      
+      if (!wallet) {
+        // Create wallet if it doesn't exist
+        console.log(`Creating new wallet for driver ${driverId}`);
+        wallet = await Wallet.create([{
+          owner: driverObjectId,
+          balance: 0,
+          currency: 'NGN'
+        }], { session });
+        wallet = wallet[0];
+        console.log(`✅ New wallet created: ${wallet._id}`);
+      }
+
+      console.log(`💰 Current wallet balance: ₦${(wallet.balance / 100).toFixed(2)}`);
 
       if (wallet.balance < priceKobo) {
         throw new Error(`Insufficient wallet balance. Required: ₦${priceNaira}, Available: ₦${(wallet.balance / 100).toFixed(2)}`);
@@ -222,7 +236,7 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
 
       // Create subscription record
       const subscription = await Subscription.create([{
-        driverId,
+        driverId: driverObjectId,
         vehicleType,
         plan: {
           duration,
@@ -242,13 +256,48 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
 
       const newSubscription = subscription[0];
 
+      // DEBUG: Check Transaction schema categories
+      console.log('🔍 Checking Transaction schema categories...');
+      const categoryPath = Transaction.schema.path('category');
+      if (categoryPath && categoryPath.enumValues) {
+        console.log('✅ Valid Transaction categories:', categoryPath.enumValues);
+      }
+
+      // Try different category values - check which one is valid
+      let category = 'subscription_fee'; // Default
+      if (categoryPath && categoryPath.enumValues) {
+        // Check if 'subscription' is valid
+        if (categoryPath.enumValues.includes('subscription')) {
+          category = 'subscription';
+        } 
+        // Check if 'subscription_fee' is valid
+        else if (categoryPath.enumValues.includes('subscription_fee')) {
+          category = 'subscription_fee';
+        }
+        // Check if 'payment' is valid
+        else if (categoryPath.enumValues.includes('payment')) {
+          category = 'payment';
+        }
+        // Check if 'service' is valid
+        else if (categoryPath.enumValues.includes('service')) {
+          category = 'service';
+        }
+        // Use first available category as fallback
+        else if (categoryPath.enumValues.length > 0) {
+          category = categoryPath.enumValues[0];
+          console.log(`⚠️ Using fallback category: ${category}`);
+        }
+      }
+
+      console.log(`✅ Using transaction category: ${category}`);
+
       // Create transaction record
       const transaction = await Transaction.create([{
-        userId: driverId,
+        userId: driverObjectId,
         type: 'debit',
         amount: priceKobo,
         description: `Subscription: ${duration} plan for ${vehicleType}`,
-        category: 'subscription',
+        category: category,
         status: 'completed',
         balanceBefore: wallet.balance + priceKobo,
         balanceAfter: wallet.balance,
@@ -256,7 +305,8 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
           subscriptionId: newSubscription._id,
           vehicleType,
           duration,
-          expiresAt
+          expiresAt,
+          subscriptionType: 'driver_subscription'
         }
       }], { session });
 
@@ -265,10 +315,11 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
       await newSubscription.save({ session });
 
       console.log(`✅ Subscription created successfully: ${newSubscription._id}`);
+      console.log(`✅ Transaction recorded: ${transaction[0]._id}`);
 
       // Update driver's subscription reference in User model
       await User.findByIdAndUpdate(
-        driverId,
+        driverObjectId,
         {
           $set: {
             'driverProfile.currentSubscriptionId': newSubscription._id,
@@ -303,13 +354,15 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
         transaction: {
           id: transaction[0]._id,
           amount: priceNaira,
-          description: transaction[0].description
+          description: transaction[0].description,
+          category: transaction[0].category
         }
       });
     });
 
   } catch (error) {
     console.error('❌ Subscription error:', error.message);
+    console.error('❌ Error details:', error);
 
     let statusCode = 500;
     let errorCode = 'SUBSCRIPTION_FAILED';
@@ -329,13 +382,17 @@ router.post('/subscribe', requireAuth, async (req, res, next) => {
     } else if (error.message.includes('verified')) {
       statusCode = 403;
       errorCode = 'NOT_VERIFIED';
+    } else if (error.message.includes('Transaction validation failed')) {
+      statusCode = 400;
+      errorCode = 'TRANSACTION_VALIDATION_ERROR';
     }
 
     res.status(statusCode).json({
       success: false,
       error: {
         message: error.message,
-        code: errorCode
+        code: errorCode,
+        details: error.errors ? Object.keys(error.errors) : undefined
       }
     });
 
@@ -587,6 +644,54 @@ router.post('/admin/expire-subscriptions', requireAuth, async (req, res) => {
     res.status(500).json({
       success: false,
       error: { message: 'Failed to expire subscriptions' }
+    });
+  }
+});
+
+// ==========================================
+// DEBUG ENDPOINT: Get Transaction Schema Info
+// ==========================================
+
+router.get('/admin/debug/transaction-categories', requireAuth, async (req, res) => {
+  try {
+    // Check if user is admin
+    const user = await User.findById(req.user.sub).select('roles');
+    if (!user?.roles?.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: { message: 'Admin access required' }
+      });
+    }
+
+    // Check if Transaction model exists and has schema
+    if (!Transaction || !Transaction.schema) {
+      return res.json({
+        success: false,
+        error: { message: 'Transaction model not found' }
+      });
+    }
+    
+    const categoryPath = Transaction.schema.path('category');
+    if (!categoryPath) {
+      return res.json({
+        success: false,
+        error: { message: 'Category path not found in Transaction schema' }
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        categoryEnumValues: categoryPath.enumValues || [],
+        categoryOptions: categoryPath.options || {},
+        schemaTree: Transaction.schema.tree.category || {}
+      }
+    });
+  } catch (error) {
+    console.error('Debug categories error:', error);
+    res.status(500).json({
+      success: false,
+      error: { message: error.message }
     });
   }
 });
