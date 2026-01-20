@@ -1,4 +1,4 @@
-// routes/drivers.routes.js - COMPLETE WITH SUBSCRIPTION INTEGRATION
+// routes/drivers.routes.js - COMPLETE MERGED VERSION WITH ALL FEATURES
 
 const express = require("express");
 const router = express.Router();
@@ -13,6 +13,502 @@ const DURATION_DAYS = {
   weekly: 7,
   monthly: 30,
 };
+
+// ==========================================
+// DRIVER PROFILE & VERIFICATION ENDPOINTS
+// ==========================================
+
+// GET /drivers/me - GET DRIVER PROFILE (with subscription status)
+router.get("/me", requireAuth, checkSubscriptionStatus, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+
+    console.log(`📊 Fetching driver profile for: ${userId}`);
+
+    const user = await User.findById(userId)
+      .select('-passwordHash -otpCode -otpExpiresAt')
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'User not found' }
+      });
+    }
+
+    // Ensure driverProfile exists
+    if (!user.driverProfile) {
+      user.driverProfile = {
+        verified: false,
+        verificationState: 'pending'
+      };
+    }
+
+    res.json({ 
+      success: true,
+      user: user,
+      subscriptionStatus: req.subscriptionStatus || {
+        hasSubscription: false,
+        isActive: false
+      }
+    });
+  } catch (err) {
+    console.error('Get driver profile error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// PUT /drivers/request-verification - SUBMIT VERIFICATION
+// ==========================================
+
+router.put('/request-verification', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const {
+      name,
+      vehicleMake,
+      vehicleModel,
+      vehicleNumber,
+      vehicleYear,
+      vehicleColor,
+      nin,
+      licenseNumber,
+      driverLicenseClass,
+      serviceCategories,
+      profilePicUrl,
+      carPicUrl,
+      ninImageUrl,
+      licenseImageUrl,
+      vehicleRegistrationUrl,
+      insuranceUrl,
+      roadWorthinessUrl
+    } = req.body;
+
+    console.log(`📝 Driver verification request from: ${userId}`);
+    console.log('📦 Received data:', JSON.stringify(req.body, null, 2));
+
+    // Validation
+    const requiredFields = [
+      'name', 'vehicleMake', 'vehicleModel', 'vehicleNumber',
+      'nin', 'licenseNumber', 'serviceCategories'
+    ];
+    
+    const missingFields = requiredFields.filter(field => !req.body[field]);
+    if (missingFields.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'Missing required fields',
+          details: missingFields
+        }
+      });
+    }
+
+    // Validate NIN format (11 digits)
+    if (!/^\d{11}$/.test(nin)) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'NIN must be exactly 11 digits'
+        }
+      });
+    }
+
+    // Validate service categories (convert to array if needed)
+    let serviceCategoriesArray = serviceCategories;
+    if (!Array.isArray(serviceCategoriesArray)) {
+      serviceCategoriesArray = [serviceCategoriesArray].filter(Boolean);
+    }
+
+    // Allowed service categories based on backend schema
+    const allowedCategories = [
+      'CITY_CAR', 'BIKE', 'TRUCK', 'LUXURY', 'VAN', 'INTERSTATE',
+      'DELIVERY', 'LOGISTICS', 'KEKE', 'CITY_RIDE', 'TRUCK_LOGISTICS',
+      'INTERSTATE_TRAVEL', 'LUXURY_RENTAL'
+    ];
+
+    // Filter and validate service categories
+    const validCategories = serviceCategoriesArray
+      .filter(cat => allowedCategories.includes(cat))
+      .slice(0, 3); // Limit to 3 categories max
+
+    if (validCategories.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'No valid service categories provided',
+          allowedCategories: allowedCategories
+        }
+      });
+    }
+
+    // Required document URLs
+    const requiredDocs = [
+      profilePicUrl,
+      carPicUrl,
+      ninImageUrl,
+      licenseImageUrl,
+      vehicleRegistrationUrl
+    ];
+
+    const missingDocs = [];
+    if (!profilePicUrl) missingDocs.push('profilePicUrl');
+    if (!carPicUrl) missingDocs.push('carPicUrl');
+    if (!ninImageUrl) missingDocs.push('ninImageUrl');
+    if (!licenseImageUrl) missingDocs.push('licenseImageUrl');
+    if (!vehicleRegistrationUrl) missingDocs.push('vehicleRegistrationUrl');
+
+    if (missingDocs.length > 0) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'Missing required documents',
+          details: missingDocs
+        }
+      });
+    }
+
+    // Find user
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'User not found' }
+      });
+    }
+
+    // Update user name if provided
+    if (name) {
+      user.name = name.trim();
+    }
+
+    // Ensure driver role is set
+    if (!user.roles.isDriver) {
+      user.roles.isDriver = true;
+    }
+
+    // Update driver profile
+    user.driverProfile = {
+      ...user.driverProfile,
+      vehicleMake: vehicleMake.trim(),
+      vehicleModel: vehicleModel.trim(),
+      vehicleNumber: vehicleNumber.trim().toUpperCase(),
+      vehicleColor: vehicleColor?.trim() || user.driverProfile?.vehicleColor || '',
+      vehicleYear: vehicleYear || user.driverProfile?.vehicleYear || null,
+      serviceCategories: validCategories,
+      nin: nin,
+      licenseNumber: licenseNumber.trim(),
+      driverLicenseClass: driverLicenseClass || user.driverProfile?.driverLicenseClass || '',
+      profilePicUrl: profilePicUrl,
+      carPicUrl: carPicUrl,
+      ninImageUrl: ninImageUrl,
+      licenseImageUrl: licenseImageUrl,
+      vehicleRegistrationUrl: vehicleRegistrationUrl,
+      insuranceUrl: insuranceUrl || user.driverProfile?.insuranceUrl || null,
+      roadWorthinessUrl: roadWorthinessUrl || user.driverProfile?.roadWorthinessUrl || null,
+      verified: false,
+      verificationState: 'pending',
+      isAvailable: false // Not available until verified
+    };
+
+    await user.save();
+
+    // Get updated user for response
+    const updatedUser = await User.findById(userId)
+      .select('-passwordHash -otpCode -otpExpiresAt')
+      .lean();
+
+    console.log(`✅ Driver verification submitted for: ${userId}`);
+    console.log('📊 Updated profile:', {
+      name: updatedUser.name,
+      vehicleMake: updatedUser.driverProfile?.vehicleMake,
+      vehicleModel: updatedUser.driverProfile?.vehicleModel,
+      serviceCategories: updatedUser.driverProfile?.serviceCategories,
+      verificationState: updatedUser.driverProfile?.verificationState
+    });
+
+    res.json({
+      success: true,
+      message: 'Verification request submitted successfully',
+      data: {
+        userId: updatedUser._id,
+        name: updatedUser.name,
+        verificationState: updatedUser.driverProfile?.verificationState || 'pending',
+        submittedAt: new Date().toISOString()
+      },
+      debug: {
+        hasDriverProfile: !!updatedUser.driverProfile,
+        profileKeys: Object.keys(updatedUser.driverProfile || {}),
+        vehicleMake: updatedUser.driverProfile?.vehicleMake,
+        serviceCategories: updatedUser.driverProfile?.serviceCategories
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Verification request error:', err);
+    
+    if (err.name === 'ValidationError') {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'Validation error',
+          details: Object.values(err.errors).map(e => e.message)
+        }
+      });
+    }
+
+    res.status(500).json({
+      success: false,
+      error: {
+        message: 'Failed to submit verification request',
+        details: err.message
+      }
+    });
+  }
+});
+
+// ==========================================
+// GET /drivers/pending - GET PENDING VERIFICATIONS (ADMIN)
+// ==========================================
+
+router.get('/pending', requireAuth, async (req, res, next) => {
+  try {
+    // Check if user is admin
+    const user = await User.findById(req.user.sub).select('roles');
+    if (!user?.roles?.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: { message: 'Admin access required' }
+      });
+    }
+
+    console.log('🔍 Admin fetching pending driver verifications');
+
+    const pendingDrivers = await User.find({
+      'roles.isDriver': true,
+      'driverProfile.verificationState': 'pending'
+    })
+    .select('name phone email driverProfile createdAt')
+    .sort({ createdAt: -1 })
+    .lean();
+
+    console.log(`✅ Found ${pendingDrivers.length} pending drivers`);
+
+    const formattedDrivers = pendingDrivers.map(driver => ({
+      id: driver._id,
+      name: driver.name,
+      phone: driver.phone,
+      email: driver.email || 'No email',
+      vehicleMake: driver.driverProfile?.vehicleMake || 'Not provided',
+      vehicleModel: driver.driverProfile?.vehicleModel || 'Not provided',
+      vehicleNumber: driver.driverProfile?.vehicleNumber || 'Not provided',
+      serviceCategories: driver.driverProfile?.serviceCategories || [],
+      profilePicUrl: driver.driverProfile?.profilePicUrl,
+      carPicUrl: driver.driverProfile?.carPicUrl,
+      ninImageUrl: driver.driverProfile?.ninImageUrl,
+      licenseImageUrl: driver.driverProfile?.licenseImageUrl,
+      vehicleRegistrationUrl: driver.driverProfile?.vehicleRegistrationUrl,
+      submittedAt: driver.driverProfile?.updatedAt || driver.createdAt,
+      verificationState: driver.driverProfile?.verificationState || 'pending'
+    }));
+
+    res.json({
+      success: true,
+      total: formattedDrivers.length,
+      drivers: formattedDrivers
+    });
+
+  } catch (err) {
+    console.error('Get pending drivers error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// PUT /drivers/:id/verify - APPROVE/REJECT VERIFICATION (ADMIN)
+// ==========================================
+
+router.put('/:id/verify', requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { action, reason } = req.body;
+
+    console.log(`🔄 Admin verification action: ${action} for driver ${id}`);
+
+    // Check if user is admin
+    const adminUser = await User.findById(req.user.sub).select('roles');
+    if (!adminUser?.roles?.isAdmin) {
+      return res.status(403).json({
+        success: false,
+        error: { message: 'Admin access required' }
+      });
+    }
+
+    // Validate action
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Action must be either "approve" or "reject"' }
+      });
+    }
+
+    // Find driver
+    const driver = await User.findById(id);
+    if (!driver) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Driver not found' }
+      });
+    }
+
+    if (!driver.roles?.isDriver) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'User is not a driver' }
+      });
+    }
+
+    // Update verification status
+    const newState = action === 'approve' ? 'approved' : 'rejected';
+    
+    driver.driverProfile = {
+      ...driver.driverProfile,
+      verificationState: newState,
+      verified: newState === 'approved',
+      isAvailable: newState === 'approved' // Make available if approved
+    };
+
+    if (action === 'reject' && reason) {
+      driver.driverProfile.rejectionReason = reason;
+    }
+
+    await driver.save();
+
+    console.log(`✅ Driver ${id} verification status updated to: ${newState}`);
+
+    res.json({
+      success: true,
+      message: `Driver verification ${action}d successfully`,
+      data: {
+        driverId: driver._id,
+        name: driver.name,
+        verificationState: driver.driverProfile.verificationState,
+        verified: driver.driverProfile.verified,
+        isAvailable: driver.driverProfile.isAvailable,
+        updatedAt: driver.updatedAt
+      }
+    });
+
+  } catch (err) {
+    console.error('Verify driver error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /drivers/check-user/:id - CHECK USER STATUS (DEBUG)
+// ==========================================
+
+router.get('/check-user/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    console.log(`🔍 Checking user status for: ${id}`);
+
+    const user = await User.findById(id)
+      .select('name phone email roles driverProfile createdAt')
+      .lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'User not found' }
+      });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        name: user.name,
+        phone: user.phone,
+        email: user.email || 'No email',
+        roles: user.roles,
+        hasDriverProfile: !!user.driverProfile,
+        driverProfile: user.driverProfile || {},
+        driverProfileKeys: user.driverProfile ? Object.keys(user.driverProfile) : [],
+        createdAt: user.createdAt
+      }
+    });
+
+  } catch (err) {
+    console.error('Check user error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /drivers/verified - GET VERIFIED DRIVERS
+// ==========================================
+
+router.get('/verified', async (req, res, next) => {
+  try {
+    const { limit = 20, offset = 0 } = req.query;
+
+    const verifiedDrivers = await User.find({
+      'roles.isDriver': true,
+      'driverProfile.verificationState': 'approved',
+      'driverProfile.isAvailable': true
+    })
+    .select('name phone driverProfile location rating totalTrips totalEarnings')
+    .sort({ 'driverProfile.rating': -1, 'driverProfile.totalTrips': -1 })
+    .limit(parseInt(limit))
+    .skip(parseInt(offset))
+    .lean();
+
+    const formattedDrivers = verifiedDrivers.map(driver => ({
+      id: driver._id,
+      name: driver.name,
+      phone: driver.phone,
+      profilePicUrl: driver.driverProfile?.profilePicUrl,
+      vehicleMake: driver.driverProfile?.vehicleMake,
+      vehicleModel: driver.driverProfile?.vehicleModel,
+      vehicleNumber: driver.driverProfile?.vehicleNumber,
+      serviceCategories: driver.driverProfile?.serviceCategories || [],
+      rating: driver.driverProfile?.rating || 0,
+      totalTrips: driver.driverProfile?.totalTrips || 0,
+      totalEarnings: driver.driverProfile?.totalEarnings || 0,
+      location: driver.driverProfile?.location,
+      isAvailable: driver.driverProfile?.isAvailable || false
+    }));
+
+    const total = await User.countDocuments({
+      'roles.isDriver': true,
+      'driverProfile.verificationState': 'approved',
+      'driverProfile.isAvailable': true
+    });
+
+    res.json({
+      success: true,
+      data: {
+        drivers: formattedDrivers,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+          hasMore: total > parseInt(offset) + parseInt(limit)
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Get verified drivers error:', err);
+    next(err);
+  }
+});
 
 // ==========================================
 // SUBSCRIPTION-PROTECTED ENDPOINTS
@@ -376,32 +872,8 @@ router.get('/location', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// PROFILE ENDPOINTS (with subscription status)
+// PROFILE MANAGEMENT ENDPOINTS
 // ==========================================
-
-// Get driver profile - includes subscription status
-router.get("/me", requireAuth, checkSubscriptionStatus, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    
-    const user = await User.findById(userId).lean();
-    if (!user)
-      return res.status(404).json({ error: { message: "User not found" } });
-    
-    res.json({ 
-      driverProfile: user.driverProfile, 
-      roles: user.roles,
-      subscriptionStatus: req.subscriptionStatus || {
-        hasSubscription: false,
-        isActive: false
-      }
-    });
-  } catch (err) {
-    next(err);
-  }
-});
 
 // Update basic driver profile
 router.post("/profile", requireAuth, async (req, res, next) => {
@@ -491,170 +963,6 @@ router.post("/service-categories", requireAuth, async (req, res, next) => {
     res.json({ 
       success: true,
       serviceCategories: user.driverProfile.serviceCategories 
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// Driver requests verification
-router.put("/request-verification", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user?.sub;
-
-    if (!userId) {
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    }
-
-    const existingUser = await User.findById(userId);
-    if (!existingUser) {
-      return res.status(404).json({ error: { message: "User not found" } });
-    }
-
-    const {
-      name,
-      vehicleMake,
-      vehicleModel,
-      vehicleNumber,
-      nin,
-      licenseNumber,
-      serviceCategories,
-      profilePicUrl,
-      carPicUrl,
-      ninImageUrl,
-      licenseImageUrl,
-      vehicleRegistrationUrl,
-    } = req.body;
-
-    // Validate required fields
-    if (
-      !name ||
-      !vehicleMake ||
-      !vehicleModel ||
-      !vehicleNumber ||
-      !nin ||
-      !licenseNumber
-    ) {
-      return res.status(400).json({
-        error: { message: "Missing required fields" },
-      });
-    }
-
-    if (
-      !serviceCategories ||
-      !Array.isArray(serviceCategories) ||
-      serviceCategories.length === 0
-    ) {
-      return res.status(400).json({
-        error: { message: "Service category is required" },
-      });
-    }
-
-    if (nin.length !== 11) {
-      return res.status(400).json({
-        error: { message: "NIN must be exactly 11 digits" },
-      });
-    }
-
-    if (
-      !profilePicUrl ||
-      !carPicUrl ||
-      !ninImageUrl ||
-      !licenseImageUrl ||
-      !vehicleRegistrationUrl
-    ) {
-      return res.status(400).json({
-        error: { message: "All document images are required" },
-      });
-    }
-
-    const updateData = {
-      $set: {
-        name: name.trim(),
-        "roles.isDriver": true,
-        "roles.isUser": true,
-        "driverProfile.vehicleMake": vehicleMake.trim(),
-        "driverProfile.vehicleModel": vehicleModel.trim(),
-        "driverProfile.vehicleNumber": vehicleNumber.trim().toUpperCase(),
-        "driverProfile.nin": nin.trim(),
-        "driverProfile.licenseNumber": licenseNumber.trim(),
-        "driverProfile.serviceCategories": serviceCategories,
-        "driverProfile.profilePicUrl": profilePicUrl,
-        "driverProfile.carPicUrl": carPicUrl,
-        "driverProfile.ninImageUrl": ninImageUrl,
-        "driverProfile.licenseImageUrl": licenseImageUrl,
-        "driverProfile.vehicleRegistrationUrl": vehicleRegistrationUrl,
-        "driverProfile.verified": false,
-        "driverProfile.verificationState": "pending",
-        "driverProfile.submittedAt": new Date(),
-      },
-    };
-
-    const updatedUser = await User.findOneAndUpdate(
-      { _id: userId },
-      updateData,
-      { new: true }
-    ).select("name phone roles driverProfile");
-
-    if (!updatedUser) {
-      return res.status(500).json({
-        error: { message: "Failed to update user profile" },
-      });
-    }
-
-    res.json({
-      success: true,
-      message: "Driver verification request submitted successfully",
-      data: {
-        userId: updatedUser._id,
-        name: updatedUser.name,
-        verificationState: updatedUser.driverProfile?.verificationState || "pending",
-      }
-    });
-  } catch (err) {
-    console.error("❌ Verification request error:", err);
-    next(err);
-  }
-});
-
-// ==========================================
-// LEGACY SUBSCRIPTION ENDPOINTS (DEPRECATED - kept for backward compatibility)
-// ==========================================
-
-// ⚠️ DEPRECATED: Use /subscriptions/subscribe instead
-router.post("/subscribe", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    
-    // Redirect to new subscription system
-    return res.status(410).json({ 
-      error: { 
-        message: "This endpoint is deprecated. Please use POST /subscriptions/subscribe",
-        code: "ENDPOINT_DEPRECATED",
-        newEndpoint: "/subscriptions/subscribe"
-      } 
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ⚠️ DEPRECATED: Use /subscriptions/current instead
-router.get("/subscription", requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user && req.user.sub;
-    if (!userId)
-      return res.status(401).json({ error: { message: "Unauthorized" } });
-    
-    // Redirect to new subscription system
-    return res.status(410).json({ 
-      error: { 
-        message: "This endpoint is deprecated. Please use GET /subscriptions/current",
-        code: "ENDPOINT_DEPRECATED",
-        newEndpoint: "/subscriptions/current"
-      } 
     });
   } catch (err) {
     next(err);
@@ -799,6 +1107,50 @@ router.post('/cleanup-state', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Cleanup error:', err);
     res.status(500).json({ error: { message: 'Cleanup failed' } });
+  }
+});
+
+// ==========================================
+// LEGACY SUBSCRIPTION ENDPOINTS (DEPRECATED - kept for backward compatibility)
+// ==========================================
+
+// ⚠️ DEPRECATED: Use /subscriptions/subscribe instead
+router.post("/subscribe", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    
+    // Redirect to new subscription system
+    return res.status(410).json({ 
+      error: { 
+        message: "This endpoint is deprecated. Please use POST /subscriptions/subscribe",
+        code: "ENDPOINT_DEPRECATED",
+        newEndpoint: "/subscriptions/subscribe"
+      } 
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ⚠️ DEPRECATED: Use /subscriptions/current instead
+router.get("/subscription", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && req.user.sub;
+    if (!userId)
+      return res.status(401).json({ error: { message: "Unauthorized" } });
+    
+    // Redirect to new subscription system
+    return res.status(410).json({ 
+      error: { 
+        message: "This endpoint is deprecated. Please use GET /subscriptions/current",
+        code: "ENDPOINT_DEPRECATED",
+        newEndpoint: "/subscriptions/current"
+      } 
+    });
+  } catch (err) {
+    next(err);
   }
 });
 
