@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
+const mongoose = require('mongoose');
 
 const User = require('../models/user.model');
 const Wallet = require('../models/wallet.model');
@@ -30,10 +31,19 @@ router.post('/request-otp', authLimiter, async (req, res, next) => {
       return res.status(400).json({ error: { message: 'Invalid phone format' } });
     }
 
-    // Find existing user
+    // Find existing user (including suspended accounts)
     let user = null;
     if (phone) user = await User.findOne({ phone });
     if (!user && email) user = await User.findOne({ email });
+
+    // Check if account is suspended
+    if (user && !user.isActive) {
+      return res.status(403).json({ 
+        error: { 
+          message: 'This account has been suspended. Please contact support.' 
+        } 
+      });
+    }
 
     // Create new user if not found
     if (!user) {
@@ -107,6 +117,15 @@ router.post('/verify-otp', authLimiter, async (req, res, next) => {
       return res.status(400).json({ error: { message: 'User not found' } });
     }
     
+    // Check if account is suspended
+    if (!user.isActive) {
+      return res.status(403).json({ 
+        error: { 
+          message: 'This account has been suspended. Please contact support.' 
+        } 
+      });
+    }
+    
     if (!user.otpCode || !user.otpExpiresAt) {
       return res.status(400).json({ error: { message: 'No OTP requested' } });
     }
@@ -152,10 +171,18 @@ router.post('/signup', authLimiter, async (req, res, next) => {
       return res.status(400).json({ error: { message: 'Invalid phone format' } });
     }
 
-    // Check for duplicates
+    // Check for duplicates (including suspended accounts)
     if (phone) {
       const existing = await User.findOne({ phone });
       if (existing) {
+        // Check if the account is suspended
+        if (!existing.isActive) {
+          return res.status(403).json({ 
+            error: { 
+              message: 'This phone number is associated with a suspended account. Please contact support.' 
+            } 
+          });
+        }
         return res.status(400).json({ error: { message: 'phone already in use' } });
       }
     }
@@ -163,6 +190,14 @@ router.post('/signup', authLimiter, async (req, res, next) => {
     if (email) {
       const existing = await User.findOne({ email });
       if (existing) {
+        // Check if the account is suspended
+        if (!existing.isActive) {
+          return res.status(403).json({ 
+            error: { 
+              message: 'This email is associated with a suspended account. Please contact support.' 
+            } 
+          });
+        }
         return res.status(400).json({ error: { message: 'email already in use' } });
       }
     }
@@ -245,6 +280,15 @@ router.post('/login', authLimiter, async (req, res, next) => {
       return res.status(400).json({ error: { message: 'Invalid credentials' } });
     }
 
+    // Check if account is suspended
+    if (!user.isActive) {
+      return res.status(403).json({ 
+        error: { 
+          message: 'This account has been suspended. Please contact support.' 
+        } 
+      });
+    }
+
     // Compare password
     const isMatch = await bcrypt.compare(password, user.passwordHash);
     
@@ -261,6 +305,246 @@ router.post('/login', authLimiter, async (req, res, next) => {
     // Return user without password
     return res.json({ token, user: user.toJSON() });
   } catch (err) {
+    next(err);
+  }
+});
+
+// ==============================
+// ACCOUNT MANAGEMENT ROUTES
+// ==============================
+
+// Delete/Suspend Account
+router.delete('/delete-account', authLimiter, async (req, res, next) => {
+  try {
+    await db.connect();
+
+    const { userId, phone, email, reason, adminOverride } = req.body;
+    
+    // Check for required parameters
+    if (!userId && !phone && !email) {
+      return res.status(400).json({ 
+        error: { message: 'userId, phone, or email is required' } 
+      });
+    }
+
+    // Find the user
+    let user = null;
+    if (userId) {
+      user = await User.findById(userId);
+    } else if (phone) {
+      user = await User.findOne({ phone });
+    } else if (email) {
+      user = await User.findOne({ email: email.toLowerCase() });
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: { message: 'User not found' } });
+    }
+
+    // Check if user is already suspended
+    if (!user.isActive) {
+      return res.status(400).json({ 
+        error: { message: 'Account is already suspended' } 
+      });
+    }
+
+    // Additional checks for drivers (optional)
+    if (user.roles?.isDriver) {
+      // Check for active rides
+      const Ride = require('../models/ride.model');
+      const activeRides = await Ride.find({
+        driver: user._id,
+        status: { $in: ['accepted', 'picked_up', 'ongoing'] }
+      });
+
+      if (activeRides.length > 0 && !adminOverride) {
+        return res.status(400).json({ 
+          error: { 
+            message: 'Cannot suspend account while having active rides. Please complete or cancel all rides first.' 
+          } 
+        });
+      }
+
+      // Check for pending earnings (optional)
+      const wallet = await Wallet.findOne({ owner: user._id });
+      if (wallet && wallet.balance > 0 && !adminOverride) {
+        return res.status(400).json({ 
+          error: { 
+            message: 'Please withdraw your remaining balance before suspending your account.' 
+          } 
+        });
+      }
+
+      // If driver, set them as unavailable
+      user.driverProfile.isAvailable = false;
+      user.driverProfile.lastSeen = new Date();
+    }
+
+    // Suspend the account
+    user.isActive = false;
+    
+    // Add suspension metadata
+    user.suspendedAt = new Date();
+    user.suspensionReason = reason || 'User requested account deletion';
+    user.suspendedBy = 'self'; // or 'admin' if admin is doing it
+    
+    // Clear sensitive data (optional)
+    user.otpCode = undefined;
+    user.otpExpiresAt = undefined;
+    
+    // Set phone and email as unusable for new registrations
+    // We'll mark them with a suffix to prevent reuse
+    const timestamp = Date.now();
+    user.phone = `suspended_${timestamp}_${user.phone}`;
+    if (user.email) {
+      user.email = `suspended_${timestamp}_${user.email}`;
+    }
+
+    await user.save();
+
+    // Log the suspension
+    console.log(`Account suspended: User ${user._id} (${user.roles.isDriver ? 'Driver' : 'User'}) at ${new Date().toISOString()}`);
+    
+    return res.json({ 
+      ok: true, 
+      message: 'Account has been suspended successfully',
+      details: {
+        userId: user._id,
+        suspendedAt: user.suspendedAt,
+        canReactivate: true, // Indicate that account can be reactivated
+        note: 'Phone and email have been marked as suspended and cannot be used for new registrations.'
+      }
+    });
+  } catch (err) {
+    console.error('Error suspending account:', err);
+    next(err);
+  }
+});
+
+// Reactivate Account (Optional - for admin use)
+router.post('/reactivate-account', authLimiter, async (req, res, next) => {
+  try {
+    await db.connect();
+
+    const { userId, phone, email } = req.body;
+    
+    if (!userId && !phone && !email) {
+      return res.status(400).json({ 
+        error: { message: 'userId, phone, or email is required' } 
+      });
+    }
+
+    let user = null;
+    if (userId) {
+      user = await User.findById(userId);
+    } else if (phone) {
+      user = await User.findOne({ phone: new RegExp(`^suspended_.*_${phone}$`) });
+    } else if (email) {
+      user = await User.findOne({ email: new RegExp(`^suspended_.*_${email}$`) });
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: { message: 'Suspended account not found' } });
+    }
+
+    // Check if account is already active
+    if (user.isActive) {
+      return res.status(400).json({ 
+        error: { message: 'Account is already active' } 
+      });
+    }
+
+    // Restore original phone and email
+    const phoneMatch = user.phone.match(/^suspended_\d+_(.+)$/);
+    const emailMatch = user.email ? user.email.match(/^suspended_\d+_(.+)$/) : null;
+    
+    if (phoneMatch) {
+      user.phone = phoneMatch[1];
+    }
+    
+    if (emailMatch) {
+      user.email = emailMatch[1];
+    }
+
+    // Reactivate account
+    user.isActive = true;
+    user.suspendedAt = undefined;
+    user.suspensionReason = undefined;
+    user.suspendedBy = undefined;
+    user.reactivatedAt = new Date();
+
+    await user.save();
+
+    return res.json({ 
+      ok: true, 
+      message: 'Account has been reactivated successfully',
+      details: {
+        userId: user._id,
+        reactivatedAt: user.reactivatedAt,
+        phone: user.phone,
+        email: user.email
+      }
+    });
+  } catch (err) {
+    console.error('Error reactivating account:', err);
+    next(err);
+  }
+});
+
+// Check Account Status
+router.get('/account-status', authLimiter, async (req, res, next) => {
+  try {
+    await db.connect();
+
+    const { userId, phone, email } = req.query;
+    
+    if (!userId && !phone && !email) {
+      return res.status(400).json({ 
+        error: { message: 'userId, phone, or email is required' } 
+      });
+    }
+
+    let user = null;
+    if (userId) {
+      user = await User.findById(userId);
+    } else if (phone) {
+      // Try to find by original phone or suspended phone
+      user = await User.findOne({ 
+        $or: [
+          { phone: phone },
+          { phone: new RegExp(`^suspended_.*_${phone}$`) }
+        ]
+      });
+    } else if (email) {
+      user = await User.findOne({ 
+        $or: [
+          { email: email.toLowerCase() },
+          { email: new RegExp(`^suspended_.*_${email.toLowerCase()}$`) }
+        ]
+      });
+    }
+
+    if (!user) {
+      return res.status(404).json({ error: { message: 'Account not found' } });
+    }
+
+    return res.json({
+      ok: true,
+      status: user.isActive ? 'active' : 'suspended',
+      details: {
+        userId: user._id,
+        phone: user.phone.replace(/^suspended_\d+_/, ''),
+        email: user.email ? user.email.replace(/^suspended_\d+_/, '') : null,
+        roles: user.roles,
+        isActive: user.isActive,
+        suspendedAt: user.suspendedAt,
+        suspensionReason: user.suspensionReason,
+        createdAt: user.createdAt,
+        lastLogin: user.lastLogin
+      }
+    });
+  } catch (err) {
+    console.error('Error checking account status:', err);
     next(err);
   }
 });
