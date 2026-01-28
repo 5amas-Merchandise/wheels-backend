@@ -36,7 +36,8 @@ router.get('/states', (req, res) => {
 // COMPANY REGISTRATION & MANAGEMENT
 // ==========================================
 
-// POST /intercity/company/register - REGISTER TRANSPORT COMPANY (WITH USER CREATION)
+
+// POST /intercity/company/register - REGISTER NEW TRANSPORT COMPANY
 router.post('/company/register', async (req, res, next) => {
   try {
     const {
@@ -81,19 +82,33 @@ router.post('/company/register', async (req, res, next) => {
       });
     }
 
+    // Check if phone is already used
+    const existingPhone = await User.findOne({ phone: ownerPhone || contactPhone });
+    if (existingPhone) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Phone number already registered' }
+      });
+    }
+
+    // Hash the password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(ownerPassword, saltRounds);
+
     // Create user account for company owner
+    // IMPORTANT: Use 'passwordHash' field as defined in the User schema
     const user = await User.create({
       email: ownerEmail,
-      password: ownerPassword,
+      passwordHash: hashedPassword, // Changed from 'password' to 'passwordHash'
       name: ownerName,
       phone: ownerPhone || contactPhone,
       roles: {
+        isUser: true,
         isTransportCompany: true,
         isDriver: false,
-        isPassenger: false,
         isAdmin: false
       },
-      profile: {
+      transportCompanyProfile: {
         companyName: companyName,
         companyRcNumber: rcNumber
       }
@@ -151,9 +166,10 @@ router.post('/company/register', async (req, res, next) => {
     
     // Handle duplicate email error
     if (err.code === 11000) {
+      const field = Object.keys(err.keyPattern)[0];
       return res.status(400).json({
         success: false,
-        error: { message: 'Email already registered' }
+        error: { message: `${field} already registered` }
       });
     }
 
@@ -182,8 +198,10 @@ router.post('/company/login', async (req, res, next) => {
       });
     }
 
-    // Find user
-    const user = await User.findOne({ email }).select('+password');
+    // Find user and explicitly select the passwordHash field
+    // IMPORTANT: Use .select('+passwordHash') because it has select: false in schema
+    const user = await User.findOne({ email }).select('+passwordHash');
+    
     if (!user) {
       return res.status(401).json({
         success: false,
@@ -191,8 +209,10 @@ router.post('/company/login', async (req, res, next) => {
       });
     }
 
-    // Check password
+    // Check password using the comparePassword method from User schema
+    // The method expects this.passwordHash to exist
     const isPasswordValid = await user.comparePassword(password);
+    
     if (!isPasswordValid) {
       return res.status(401).json({
         success: false,
@@ -210,6 +230,7 @@ router.post('/company/login', async (req, res, next) => {
 
     // Find company
     const company = await IntercityCompany.findOne({ userId: user._id });
+    
     if (!company) {
       return res.status(404).json({
         success: false,
@@ -251,6 +272,8 @@ router.post('/company/login', async (req, res, next) => {
     next(err);
   }
 });
+
+
 
 // GET /intercity/company/profile - GET COMPANY PROFILE
 router.get('/company/profile', requireAuth, async (req, res, next) => {
