@@ -1,21 +1,25 @@
+// routes/users.js
 const express = require('express');
 const router = express.Router();
 const User = require('../models/user.model');
+const Referral = require('../models/referral.model');
 const { requireAuth } = require('../middleware/auth');
 
-// Get current user profile - FIXED VERSION
+// ==========================================
+// GET /users/me
+// ==========================================
+
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
-    console.log('User from token:', req.user); // Debug log
-    
-    // Use the standardized _id from middleware
+    console.log('User from token:', req.user);
+
     const userId = req.user._id;
-    
+
     if (!userId) {
       console.error('No user ID found in token');
-      return res.status(401).json({ 
+      return res.status(401).json({
         success: false,
-        error: { message: 'Invalid token payload: No user ID' } 
+        error: { message: 'Invalid token payload: No user ID' }
       });
     }
 
@@ -24,23 +28,58 @@ router.get('/me', requireAuth, async (req, res, next) => {
       .lean();
 
     if (!user) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         success: false,
-        error: { message: 'User not found' } 
+        error: { message: 'User not found' }
       });
     }
 
-    // Ensure consistent response structure
+    // Ensure referral code exists (backfill for old accounts)
+    if (!user.referralCode) {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+      let code = '';
+      for (let i = 0; i < 8; i++) {
+        code += chars[Math.floor(Math.random() * chars.length)];
+      }
+      await User.findByIdAndUpdate(userId, { referralCode: code });
+      user.referralCode = code;
+    }
+
+    // Fetch a quick referral summary to include in the profile response
+    const referralStats = await Referral.aggregate([
+      { $match: { referrerId: user._id } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          rewarded: {
+            $sum: { $cond: [{ $eq: ['$status', 'rewarded'] }, 1, 0] }
+          },
+          totalEarned: {
+            $sum: { $cond: [{ $eq: ['$status', 'rewarded'] }, '$referrerReward', 0] }
+          }
+        }
+      }
+    ]);
+
+    const stats = referralStats[0] || { total: 0, rewarded: 0, totalEarned: 0 };
+
     const responseUser = {
       ...user,
-      // Make sure driverProfile exists
       driverProfile: user.driverProfile || {
         verified: false,
         verificationState: 'pending'
+      },
+      referral: {
+        code: user.referralCode,
+        shareLink: `https://yourapp.com/signup?ref=${user.referralCode}`,
+        totalReferrals: stats.total,
+        rewardedReferrals: stats.rewarded,
+        totalEarnedNaira: (stats.totalEarned / 100).toFixed(2)
       }
     };
 
-    res.json({ 
+    res.json({
       success: true,
       user: responseUser
     });
@@ -50,7 +89,10 @@ router.get('/me', requireAuth, async (req, res, next) => {
   }
 });
 
-// Update user profile
+// ==========================================
+// PUT /users/me
+// ==========================================
+
 router.put('/me', requireAuth, async (req, res, next) => {
   try {
     const userId = req.user._id;
@@ -63,10 +105,10 @@ router.put('/me', requireAuth, async (req, res, next) => {
     const updatedUser = await User.findByIdAndUpdate(
       userId,
       { $set: updateData },
-      { 
-        new: true, 
+      {
+        new: true,
         runValidators: true,
-        select: '-passwordHash -otpCode -otpExpiresAt' 
+        select: '-passwordHash -otpCode -otpExpiresAt'
       }
     ).lean();
 
@@ -84,14 +126,12 @@ router.put('/me', requireAuth, async (req, res, next) => {
     });
   } catch (err) {
     console.error('Update profile error:', err);
-    
     if (err.name === 'ValidationError') {
       return res.status(400).json({
         success: false,
         error: { message: err.message }
       });
     }
-    
     next(err);
   }
 });

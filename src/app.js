@@ -1,4 +1,4 @@
-// app.js - COMPLETE WITH ALL SUBSCRIPTION UPDATES
+// app.js - COMPLETE WITH ALL SUBSCRIPTION + REFERRAL UPDATES
 
 const express = require('express');
 const cors = require('cors');
@@ -13,14 +13,9 @@ const app = express();
 // MIDDLEWARE
 // ==========================================
 
-// CORS
 app.use(cors());
-
-// Parse JSON bodies (increase limit for file uploads if needed)
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Custom middleware
 app.use(requestLogger);
 app.use(optionalAuth);
 app.use(defaultLimiter);
@@ -35,7 +30,7 @@ const driverRoutes = require('./routes/drivers');
 const matchingRoutes = require('./routes/matching');
 const paymentsRoutes = require('./routes/payments');
 const walletRoutes = require('./routes/wallet');
-const subscriptionsRoutes = require('./routes/subscriptions'); // ✅ NEW SUBSCRIPTION SYSTEM
+const subscriptionsRoutes = require('./routes/subscriptions');
 const payoutsRoutes = require('./routes/payouts');
 const transactionsRoutes = require('./routes/transactions');
 const adminRoutes = require('./routes/admin');
@@ -43,22 +38,24 @@ const notificationsRoutes = require('./routes/notifications');
 const pricingRoutes = require('./routes/pricing');
 const tripsRoutes = require('./routes/trips');
 const intercityRoutes = require('./routes/intercity.routes');
+const referralRoutes = require('./routes/referral'); // ✅ NEW
 
 // Mount routes
 app.use('/auth', authRoutes);
 app.use('/users', userRoutes);
-app.use('/drivers', driverRoutes); // ✅ UPDATED with subscription checks
+app.use('/drivers', driverRoutes);
 app.use('/matching', matchingRoutes);
 app.use('/payments', paymentsRoutes);
-app.use('/wallet', walletRoutes); // ✅ UPDATED with Paystack integration
-app.use('/subscriptions', subscriptionsRoutes); // ✅ NEW - Driver subscription management
+app.use('/wallet', walletRoutes);
+app.use('/subscriptions', subscriptionsRoutes);
 app.use('/payouts', payoutsRoutes);
 app.use('/transactions', transactionsRoutes);
 app.use('/admin', adminRoutes);
 app.use('/notifications', notificationsRoutes);
 app.use('/pricing', pricingRoutes);
-app.use('/trips', tripsRoutes); // ✅ UPDATED with subscription checks
+app.use('/trips', tripsRoutes);
 app.use('/intercity', intercityRoutes);
+app.use('/referrals', referralRoutes); // ✅ NEW
 
 // ==========================================
 // HEALTH CHECK
@@ -73,7 +70,8 @@ app.get('/health', (req, res) => {
     features: {
       subscriptionSystem: true,
       paystackIntegration: true,
-      walletFunding: true
+      walletFunding: true,
+      referralSystem: true // ✅ NEW
     }
   });
 });
@@ -85,14 +83,15 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'Ride Hailing API',
-    version: '2.0.0',
+    version: '2.1.0',
     status: 'running',
     features: [
       'Driver Subscriptions',
       'Wallet Management',
       'Paystack Integration',
       'Trip Management',
-      'Real-time Matching'
+      'Real-time Matching',
+      'Referral System' // ✅ NEW
     ],
     endpoints: {
       auth: '/auth',
@@ -101,9 +100,9 @@ app.get('/', (req, res) => {
       subscriptions: '/subscriptions',
       wallet: '/wallet',
       trips: '/trips',
+      referrals: '/referrals', // ✅ NEW
       admin: '/admin'
-    },
-    documentation: '/api/docs' // If you have API docs
+    }
   });
 });
 
@@ -123,15 +122,10 @@ app.use((req, res, next) => {
 
 app.use(errorHandler);
 
-// ==========================================
-// GRACEFUL SHUTDOWN
-// ==========================================
-
 process.on('SIGTERM', () => {
   console.log('SIGTERM signal received: closing HTTP server');
   server.close(() => {
     console.log('HTTP server closed');
-    // Close database connections here if needed
     process.exit(0);
   });
 });

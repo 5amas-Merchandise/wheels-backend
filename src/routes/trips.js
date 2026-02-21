@@ -993,113 +993,243 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
 // 🚨 FIX #2: CORRECT TRANSACTION USAGE - REMOVE manual start/commit, use withTransaction
 // ONLY KEEP THIS ONE /complete ENDPOINT
 
-// In routes/trips.routes.js - SIMPLIFIED CASH-ONLY COMPLETE ENDPOINT
+// ============================================================
+// PATCH FOR routes/trips.routes.js
+//
+// ADD these two imports near the top of trips.routes.js:
+//
+//   const { processTripWalletPayment, recordCashTripEarning } = require('../utils/tripPaymentService');
+//   const referralRouter = require('./referral');
+//
+// Then REPLACE the existing /:tripId/complete route entirely
+// with the one below.
+// ============================================================
+
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
-  
+
   try {
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
       const { cashReceived } = req.body;
       const tripId = req.params.tripId;
 
-      console.log(`✅ Driver ${driverId} completing trip ${tripId} (Cash payment)`);
+      console.log(`✅ Completing trip ${tripId} — driver ${driverId}`);
 
-      // 1. Find the trip
+      // ── 1. Load trip ────────────────────────────────────────────────────
+
       const existingTrip = await Trip.findById(tripId).session(session);
-      if (!existingTrip) {
-        throw new Error('Trip not found');
-      }
+      if (!existingTrip) throw new Error('Trip not found');
 
-      // 2. Authorization check
       if (existingTrip.driverId.toString() !== driverId) {
         throw new Error('Unauthorized: You are not the driver for this trip');
       }
 
-      // 3. Check if trip is already ended
       if (['completed', 'cancelled'].includes(existingTrip.status)) {
         throw new Error(`Trip is already ${existingTrip.status}`);
       }
 
-      // 4. SIMPLIFIED: Use estimated fare as final fare (no calculations)
       const finalFare = existingTrip.estimatedFare || 0;
-      
-      console.log(`💰 Using estimated fare: ₦${(finalFare / 100).toFixed(2)}`);
+      const paymentMethod = existingTrip.paymentMethod || 'cash';
+      const passengerId = existingTrip.passengerId.toString();
 
-      // 5. Update trip document - SIMPLIFIED: Just mark as completed
+      console.log(`💰 Fare: ₦${(finalFare / 100).toFixed(2)} | Payment: ${paymentMethod}`);
+
+      // ── 2. Process payment ──────────────────────────────────────────────
+      //
+      // Wallet trips:  debit passenger wallet, credit driver wallet (full fare)
+      // Cash trips:    credit driver wallet with earned amount (cash already received)
+      //
+      // In BOTH cases the driver receives the full fare in their wallet.
+      // If the passenger used a referral bonus to fund their wallet, that
+      // is transparent to the driver — they still get the full amount.
+
+      let paymentResult = null;
+      let resolvedPaymentMethod = paymentMethod;
+
+      if (paymentMethod === 'wallet') {
+        try {
+          paymentResult = await processTripWalletPayment(
+            {
+              tripId,
+              passengerId,
+              driverId,
+              fareKobo: finalFare,
+              serviceType: existingTrip.serviceType
+            },
+            session
+          );
+          console.log(`✅ Wallet payment processed — driver credited ₦${(finalFare / 100).toFixed(2)}`);
+        } catch (paymentErr) {
+          // Insufficient wallet balance — fall back to cash so the trip
+          // can still complete (driver physically collects the amount).
+          console.warn(
+            `⚠️ Wallet payment failed (${paymentErr.message}). ` +
+            `Falling back to cash payment.`
+          );
+          resolvedPaymentMethod = 'cash_fallback';
+
+          // Still record driver earning for cash fallback
+          paymentResult = await recordCashTripEarning(
+            {
+              tripId,
+              passengerId,
+              driverId,
+              fareKobo: finalFare,
+              serviceType: existingTrip.serviceType
+            },
+            session
+          );
+        }
+      } else {
+        // cash / any other method
+        paymentResult = await recordCashTripEarning(
+          {
+            tripId,
+            passengerId,
+            driverId,
+            fareKobo: finalFare,
+            serviceType: existingTrip.serviceType
+          },
+          session
+        );
+        console.log(`✅ Cash earning recorded for driver — ₦${(finalFare / 100).toFixed(2)}`);
+      }
+
+      // ── 3. Mark trip completed ─────────────────────────────────────────
+
       const updatedTrip = await Trip.findByIdAndUpdate(
         tripId,
         {
           status: 'completed',
-          finalFare: finalFare,
+          finalFare,
           completedAt: new Date(),
-          // Store that it was cash payment
-          paymentMethod: 'cash',
-          paymentConfirmed: cashReceived || true
+          paymentMethod: resolvedPaymentMethod,
+          paymentConfirmed: true,
+          // Store transaction IDs for auditing
+          ...(paymentResult?.passengerTxn && {
+            'metadata.passengerTransactionId': paymentResult.passengerTxn._id
+          }),
+          ...(paymentResult?.driverTxn && {
+            'metadata.driverTransactionId': paymentResult.driverTxn._id
+          })
         },
         { new: true, session }
       );
 
-      // 6. CRITICAL: Clean up driver state (make driver available again)
+      // ── 4. Update driver availability ──────────────────────────────────
+
       await User.findByIdAndUpdate(
         driverId,
         {
           'driverProfile.isAvailable': true,
-          $unset: { 'driverProfile.currentTripId': '' }
+          $unset: { 'driverProfile.currentTripId': '' },
+          $inc: { 'driverProfile.totalTrips': 1, 'driverProfile.totalEarnings': finalFare }
         },
         { session }
       );
 
-      console.log(`✅ Driver ${driverId} marked available after cash trip completion`);
+      console.log(`✅ Driver ${driverId} is now available`);
 
-      // 7. Send simple success response
+      // ── 5. First-trip referral reward gate ─────────────────────────────
+      //
+      // Atomically flip hasCompletedFirstTrip — only matches once per passenger,
+      // so the referral reward fires exactly once no matter what.
+
+      const passengerUpdate = await User.findOneAndUpdate(
+        { _id: passengerId, hasCompletedFirstTrip: { $ne: true } },
+        { $set: { hasCompletedFirstTrip: true } },
+        { session, new: false }
+      );
+      const isFirstTrip = passengerUpdate !== null;
+
+      // ── 6. Send response immediately ───────────────────────────────────
+
+      const driverNewBalance = paymentResult?.driverWallet?.balance ?? null;
+
       res.json({
         success: true,
         trip: {
           id: updatedTrip._id.toString(),
           status: updatedTrip.status,
           finalFare: updatedTrip.finalFare,
-          completedAt: updatedTrip.completedAt
+          finalFareNaira: (updatedTrip.finalFare / 100).toFixed(2),
+          completedAt: updatedTrip.completedAt,
+          paymentMethod: resolvedPaymentMethod
         },
+        // Include driver's updated balance so the app can refresh the UI
+        driverWallet: driverNewBalance !== null
+          ? {
+              balance: driverNewBalance,
+              balanceNaira: (driverNewBalance / 100).toFixed(2),
+              balanceFormatted: `₦${(driverNewBalance / 100).toLocaleString()}`
+            }
+          : null,
         message: 'Trip completed successfully. Driver is now available for new trips.'
       });
 
-      // 8. Send notifications AFTER response (non-blocking)
+      // ── 7. Post-commit side effects (non-blocking) ─────────────────────
+
       setImmediate(async () => {
         try {
+          // Referral reward — fires only once per passenger lifetime
+          if (isFirstTrip) {
+            console.log(`🎁 First trip for passenger ${passengerId}, checking referral...`);
+            const referralRouter = require('./referral');
+            await referralRouter.triggerReferralReward(tripId, passengerId);
+          }
+
           // Notify passenger
+          const paymentNote = resolvedPaymentMethod === 'wallet'
+            ? 'Paid from your wallet.'
+            : resolvedPaymentMethod === 'cash_fallback'
+              ? 'Insufficient wallet balance — please pay driver ₦' + (finalFare / 100).toFixed(2) + ' in cash.'
+              : 'Cash payment.';
+
           emitter.emit('notification', {
-            userId: existingTrip.passengerId.toString(),
+            userId: passengerId,
             type: 'trip_completed',
             title: 'Trip Completed',
-            body: `Your trip has been completed. Amount: ₦${(finalFare / 100).toFixed(2)}`,
+            body: `Your trip is done. Fare: ₦${(finalFare / 100).toFixed(2)}. ${paymentNote}`,
             data: {
-              tripId: tripId,
+              tripId,
               fare: finalFare,
+              status: 'completed',
+              paymentMethod: resolvedPaymentMethod
+            }
+          });
+
+          // Notify driver of their earned amount
+          emitter.emit('notification', {
+            userId: driverId,
+            type: 'trip_completed',
+            title: 'Trip Completed — Payment Received',
+            body: `You earned ₦${(finalFare / 100).toFixed(2)} for this trip.`,
+            data: {
+              tripId,
+              earned: finalFare,
               status: 'completed'
             }
           });
 
-          // Emit trip_completed event for real-time updates
           emitter.emit('trip_completed', {
-            tripId: tripId,
-            driverId: driverId,
-            passengerId: existingTrip.passengerId.toString(),
-            finalFare: finalFare,
+            tripId,
+            driverId,
+            passengerId,
+            finalFare,
             completedAt: new Date()
           });
 
-          console.log(`📨 Notifications sent for completed trip ${tripId}`);
-        } catch (emitErr) {
-          console.error('Notification error (non-fatal):', emitErr);
+          console.log(`📨 Post-completion events done for trip ${tripId}`);
+        } catch (postErr) {
+          console.error('Post-completion error (non-fatal):', postErr.message);
         }
       });
-    });
+    }); // end withTransaction
 
   } catch (error) {
     console.error('❌ Complete trip error:', error.message);
 
-    // SIMPLIFIED error handling
     let statusCode = 500;
     let errorCode = 'INTERNAL_ERROR';
     let errorMessage = error.message || 'Failed to complete trip';
@@ -1114,14 +1244,15 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
       statusCode = 400;
       errorCode = 'TRIP_ALREADY_ENDED';
       errorMessage = 'This trip has already been ended.';
+    } else if (error.message.includes('Insufficient wallet balance')) {
+      // This should not surface since we fall back to cash, but just in case
+      statusCode = 400;
+      errorCode = 'INSUFFICIENT_BALANCE';
     }
 
     res.status(statusCode).json({
       success: false,
-      error: {
-        message: errorMessage,
-        code: errorCode
-      }
+      error: { message: errorMessage, code: errorCode }
     });
   } finally {
     await session.endSession();

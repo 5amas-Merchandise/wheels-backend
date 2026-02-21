@@ -1,4 +1,4 @@
-// models/transaction.model.js - COMPLETE VERSION
+// models/transaction.model.js - UPDATED VERSION
 const mongoose = require('mongoose');
 
 const TransactionSchema = new mongoose.Schema({
@@ -10,7 +10,7 @@ const TransactionSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['credit', 'debit', 'deposit', 'withdrawal', 'transfer'],
+    enum: ['credit', 'debit', 'deposit', 'withdrawal', 'transfer', 'referral_reward'],
     required: true
   },
   amount: {
@@ -29,7 +29,9 @@ const TransactionSchema = new mongoose.Schema({
       'wallet_funding',
       'admin_credit',
       'admin_debit',
-      'ride_payment',
+      'ride_payment',        // Passenger paying for a ride (wallet debit)
+      'ride_earning',        // Driver earning from a completed ride (wallet credit)
+      'referral_reward',     // Referral bonus credited to referrer or referee
       'service_fee',
       'refund',
       'bonus',
@@ -60,6 +62,12 @@ const TransactionSchema = new mongoose.Schema({
     type: String,
     sparse: true
   },
+  // Link transactions together (e.g. passenger debit ↔ driver credit for same trip)
+  relatedTransactionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Transaction',
+    default: null
+  },
   metadata: {
     type: mongoose.Schema.Types.Mixed,
     default: {}
@@ -78,5 +86,9 @@ TransactionSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
   next();
 });
+
+TransactionSchema.index({ userId: 1, createdAt: -1 });
+TransactionSchema.index({ paymentReference: 1 }, { sparse: true });
+TransactionSchema.index({ relatedTransactionId: 1 }, { sparse: true });
 
 module.exports = mongoose.model('Transaction', TransactionSchema);

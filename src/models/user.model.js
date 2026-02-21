@@ -107,18 +107,17 @@ const UserSchema = new mongoose.Schema({
     index: true,
     trim: true
   },
-  
-  // Keep as passwordHash to maintain compatibility
+
   passwordHash: {
     type: String,
     required: true,
     select: false
   },
-  profilePicUrl: { 
+  profilePicUrl: {
     type: String,
     default: null
   },
-  
+
   // Roles
   roles: {
     isUser: { type: Boolean, default: true },
@@ -126,18 +125,18 @@ const UserSchema = new mongoose.Schema({
     isTransportCompany: { type: Boolean, default: false },
     isAdmin: { type: Boolean, default: false }
   },
-  
+
   // Profiles
   driverProfile: {
     type: DriverProfileSchema,
     default: () => ({})
   },
-  
+
   transportCompanyProfile: {
     type: TransportCompanyProfileSchema,
     default: () => ({})
   },
-  
+
   // Subscription
   subscription: {
     type: {
@@ -149,17 +148,48 @@ const UserSchema = new mongoose.Schema({
     expiresAt: { type: Date },
     autoRenew: { type: Boolean, default: false }
   },
-  
+
+  // ==========================================
+  // REFERRAL FIELDS
+  // ==========================================
+
+  // This user's own shareable code
+  referralCode: {
+    type: String,
+    unique: true,
+    sparse: true, // allows null/undefined without unique conflict
+    uppercase: true,
+    trim: true,
+    index: true
+  },
+
+  // The code this user used when signing up (if any)
+  usedReferralCode: {
+    type: String,
+    uppercase: true,
+    trim: true,
+    default: null
+  },
+
+  // Whether this user's first trip has been completed
+  // Used to ensure referral reward fires only once
+  hasCompletedFirstTrip: {
+    type: Boolean,
+    default: false
+  },
+
+  // ==========================================
   // OTP
-  otpCode: { 
+  // ==========================================
+  otpCode: {
     type: String,
     select: false
   },
-  otpExpiresAt: { 
+  otpExpiresAt: {
     type: Date,
     select: false
   },
-  
+
   // Account Status
   isActive: {
     type: Boolean,
@@ -169,7 +199,7 @@ const UserSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
-  
+
   // Timestamps
   createdAt: {
     type: Date,
@@ -183,7 +213,7 @@ const UserSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
-  
+
   // Preferences
   preferences: {
     language: { type: String, default: 'en' },
@@ -203,7 +233,6 @@ const UserSchema = new mongoose.Schema({
 // MIDDLEWARE
 // ==============================
 
-// Update timestamps on save
 UserSchema.pre('save', function(next) {
   this.updatedAt = Date.now();
   next();
@@ -213,10 +242,8 @@ UserSchema.pre('save', function(next) {
 // INSTANCE METHODS
 // ==============================
 
-// Compare password method
 UserSchema.methods.comparePassword = async function(candidatePassword) {
   try {
-    // passwordHash field needs to be selected explicitly when querying
     return await bcrypt.compare(candidatePassword, this.passwordHash);
   } catch (error) {
     return false;
@@ -227,7 +254,6 @@ UserSchema.methods.comparePassword = async function(candidatePassword) {
 // STATIC METHODS
 // ==============================
 
-// Find transport companies
 UserSchema.statics.findTransportCompanies = function(verificationStatus = 'approved') {
   return this.find({
     'roles.isTransportCompany': true,
@@ -236,12 +262,10 @@ UserSchema.statics.findTransportCompanies = function(verificationStatus = 'appro
   }).sort({ 'transportCompanyProfile.totalBookings': -1 });
 };
 
-// Find by email or phone
 UserSchema.statics.findByEmailOrPhone = function(email, phone) {
   const query = {};
   if (email) query.email = email.toLowerCase();
   if (phone) query.phone = phone;
-  
   return this.findOne(query);
 };
 
@@ -249,10 +273,7 @@ UserSchema.statics.findByEmailOrPhone = function(email, phone) {
 // INDEXES
 // ==============================
 
-// 2dsphere index for driver location
 UserSchema.index({ 'driverProfile.location': '2dsphere' });
-
-// Performance indexes
 UserSchema.index({ 'roles.isDriver': 1 });
 UserSchema.index({ 'roles.isTransportCompany': 1 });
 UserSchema.index({ 'driverProfile.isAvailable': 1 });
@@ -260,18 +281,18 @@ UserSchema.index({ 'driverProfile.lastSeen': -1 });
 UserSchema.index({ 'driverProfile.verificationState': 1 });
 UserSchema.index({ phone: 1 }, { unique: true });
 UserSchema.index({ email: 1 }, { sparse: true });
+UserSchema.index({ referralCode: 1 }, { sparse: true });
 
 // ==============================
 // TO JSON TRANSFORM
 // ==============================
 
 UserSchema.set('toJSON', {
-  transform: function (doc, ret) {
+  transform: function(doc, ret) {
     delete ret.passwordHash;
     delete ret.otpCode;
     delete ret.otpExpiresAt;
     delete ret.__v;
-    
     return ret;
   }
 });
