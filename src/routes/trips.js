@@ -15,7 +15,7 @@ const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 const rateLimit = require('express-rate-limit');
 const { requireActiveSubscription } = require('../middleware/subscriptionCheck');
-const { processTripWalletPayment, recordCashTripEarning } = require('../utils/tripPaymentService');
+const { processTripWalletPayment } = require('../utils/tripPaymentService');
 
 // ==========================================
 // RATE LIMITING
@@ -45,7 +45,7 @@ const CONFIG = {
 async function cleanupFailedTripRequest(requestId) {
   try {
     console.log(`🧹 Cleaning up failed trip request: ${requestId}`);
-    
+
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest) {
       console.log(`⚠️ Trip request ${requestId} not found for cleanup`);
@@ -100,7 +100,7 @@ async function trackRejection(requestId) {
     if (!tripRequest) return false;
 
     const rejectionCount = tripRequest.candidates.filter(
-      c => c.status === 'rejected' && 
+      c => c.status === 'rejected' &&
            c.rejectionReason !== 'max_attempts_reached'
     ).length;
 
@@ -149,7 +149,7 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
   let candidateData;
   let passengerId;
   let firstCandidate;
-  
+
   try {
     await session.withTransaction(async () => {
       passengerId = req.user.sub;
@@ -201,7 +201,7 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
       console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${searchRadius}m`);
 
       let nearbyDrivers = [];
-      
+
       try {
         nearbyDrivers = await User.find({
           'roles.isDriver': true,
@@ -272,15 +272,15 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         }], { session });
 
         createdRequestId = tripRequest[0]._id;
-        
+
         responsePayload = {
           requestId: tripRequest[0]._id,
           message: 'No drivers available'
         };
-        
+
         candidateData = null;
         firstCandidate = null;
-        
+
         return;
       }
 
@@ -318,7 +318,7 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         message: `Searching ${candidates.length} drivers`,
         estimatedFare: estimatedFare || 0
       };
-      
+
       candidateData = {
         serviceType: serviceType,
         estimatedFare: estimatedFare || 0,
@@ -330,7 +330,6 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         dropoffAddress: dropoffAddress || '',
         immediateOffer: true
       };
-      
     });
 
     res.json(responsePayload);
@@ -364,7 +363,7 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
 
       if (firstCandidate) {
         const firstDriverId = firstCandidate.driverId;
-        
+
         setTimeout(async () => {
           try {
             const fresh = await TripRequest.findById(createdRequestId);
@@ -402,11 +401,11 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
   } catch (err) {
     await session.abortTransaction();
     console.error('❌ Trip request error:', err);
-    
+
     if (err.message.includes('Invalid') || err.message.includes('Unavailable')) {
       return res.status(400).json({ error: { message: err.message } });
     }
-    
+
     next(err);
   } finally {
     await session.endSession();
@@ -462,7 +461,7 @@ async function offerToNext(requestId) {
     await tripRequest.save();
 
     const driverId = nextCandidate.driverId;
-    
+
     const rejectionCount = tripRequest.candidates.filter(c => c.status === 'rejected').length;
     console.log(`📤 Offering to driver ${driverId} (Attempt ${rejectionCount + 1}/${CONFIG.MAX_REJECTIONS})`);
 
@@ -558,13 +557,13 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/accept - DRIVER ACCEPTS (FIXED - NO AUTO CLEANUP)
+// POST /trips/accept - DRIVER ACCEPTS
 // ==========================================
 
 router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, next) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  
+
   let tripData = null;
   let notificationData = null;
   let responseSent = false;
@@ -593,11 +592,11 @@ router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, 
 
     if (existingKey) {
       console.log('⚠️ Duplicate request detected');
-      
+
       if (existingKey.status === 'completed' && existingKey.tripId) {
         console.log('✅ Returning cached trip data');
         await session.abortTransaction();
-        
+
         return res.json({
           success: true,
           tripId: existingKey.tripId.toString(),
@@ -672,9 +671,9 @@ router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, 
 
     if (!tripRequest) {
       console.log(`❌ Cannot assign trip - checking current state`);
-      
+
       const currentRequest = await TripRequest.findById(requestId).session(session);
-      
+
       if (!currentRequest) {
         await idempotencyCollection.updateOne(
           { key: finalIdempotencyKey },
@@ -683,13 +682,13 @@ router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, 
         );
         throw new Error('Trip request not found');
       }
-      
+
       await idempotencyCollection.updateOne(
         { key: finalIdempotencyKey },
         { $set: { status: 'failed', error: 'Trip no longer available' } },
         { session }
       );
-      
+
       if (currentRequest.assignedDriverId && currentRequest.assignedDriverId.toString() !== driverId.toString()) {
         throw new Error('Trip was already assigned to another driver');
       } else {
@@ -735,8 +734,8 @@ router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, 
 
     await idempotencyCollection.updateOne(
       { key: finalIdempotencyKey },
-      { 
-        $set: { 
+      {
+        $set: {
           status: 'completed',
           tripId: newTrip._id,
           requestId: tripRequest._id,
@@ -833,7 +832,7 @@ router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, 
         errorMessage.includes('already processed')
       ) {
         statusCode = 400;
-        
+
         if (errorMessage.includes('already processed')) {
           errorCode = 'DUPLICATE_REQUEST';
         } else if (errorMessage.includes('already assigned')) {
@@ -897,7 +896,7 @@ router.post('/reject', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// ADMIN ENDPOINTS
+// ADMIN MIDDLEWARE
 // ==========================================
 
 const requireAdmin = (req, res, next) => {
@@ -907,6 +906,10 @@ const requireAdmin = (req, res, next) => {
     res.status(403).json({ error: { message: 'Admin access required' } });
   }
 };
+
+// ==========================================
+// GET /trips/searching - ADMIN
+// ==========================================
 
 router.get('/searching', requireAuth, requireAdmin, async (req, res, next) => {
   try {
@@ -957,7 +960,7 @@ router.get('/searching', requireAuth, requireAdmin, async (req, res, next) => {
 });
 
 // ==========================================
-// TRIP LIFECYCLE ENDPOINTS
+// POST /trips/:tripId/start
 // ==========================================
 
 router.post('/:tripId/start', requireAuth, async (req, res, next) => {
@@ -990,21 +993,9 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
   }
 });
 
-// 🚨 FIX #1: DELETE DUPLICATE COMPLETE ENDPOINT
-// 🚨 FIX #2: CORRECT TRANSACTION USAGE - REMOVE manual start/commit, use withTransaction
-// ONLY KEEP THIS ONE /complete ENDPOINT
-
-// ============================================================
-// PATCH FOR routes/trips.routes.js
-//
-// ADD these two imports near the top of trips.routes.js:
-//
-//   const { processTripWalletPayment, recordCashTripEarning } = require('../utils/tripPaymentService');
-//   const referralRouter = require('./referral');
-//
-// Then REPLACE the existing /:tripId/complete route entirely
-// with the one below.
-// ============================================================
+// ==========================================
+// POST /trips/:tripId/complete
+// ==========================================
 
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
@@ -1012,12 +1003,11 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
   try {
     await session.withTransaction(async () => {
       const driverId = req.user.sub;
-      const { cashReceived } = req.body;
       const tripId = req.params.tripId;
 
       console.log(`✅ Completing trip ${tripId} — driver ${driverId}`);
 
-      // ── 1. Load trip ────────────────────────────────────────────────────
+      // ── 1. Load trip ──────────────────────────────────────────────────
 
       const existingTrip = await Trip.findById(tripId).session(session);
       if (!existingTrip) throw new Error('Trip not found');
@@ -1036,14 +1026,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       console.log(`💰 Fare: ₦${(finalFare / 100).toFixed(2)} | Payment: ${paymentMethod}`);
 
-      // ── 2. Process payment ──────────────────────────────────────────────
-      //
-      // Wallet trips:  debit passenger wallet, credit driver wallet (full fare)
-      // Cash trips:    credit driver wallet with earned amount (cash already received)
-      //
-      // In BOTH cases the driver receives the full fare in their wallet.
-      // If the passenger used a referral bonus to fund their wallet, that
-      // is transparent to the driver — they still get the full amount.
+      // ── 2. Process payment ────────────────────────────────────────────
 
       let paymentResult = null;
       let resolvedPaymentMethod = paymentMethod;
@@ -1062,42 +1045,19 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
           );
           console.log(`✅ Wallet payment processed — driver credited ₦${(finalFare / 100).toFixed(2)}`);
         } catch (paymentErr) {
-          // Insufficient wallet balance — fall back to cash so the trip
-          // can still complete (driver physically collects the amount).
-          console.warn(
-            `⚠️ Wallet payment failed (${paymentErr.message}). ` +
-            `Falling back to cash payment.`
-          );
+          // Insufficient wallet balance — fall back to cash
+          console.warn(`⚠️ Wallet payment failed (${paymentErr.message}). Falling back to cash.`);
           resolvedPaymentMethod = 'cash_fallback';
-
-          // Still record driver earning for cash fallback
-          paymentResult = await recordCashTripEarning(
-            {
-              tripId,
-              passengerId,
-              driverId,
-              fareKobo: finalFare,
-              serviceType: existingTrip.serviceType
-            },
-            session
-          );
+          paymentResult = null;
         }
       } else {
-        // cash / any other method
-        paymentResult = await recordCashTripEarning(
-          {
-            tripId,
-            passengerId,
-            driverId,
-            fareKobo: finalFare,
-            serviceType: existingTrip.serviceType
-          },
-          session
-        );
-        console.log(`✅ Cash earning recorded for driver — ₦${(finalFare / 100).toFixed(2)}`);
+        // Cash — driver collects physically, no wallet movement needed
+        resolvedPaymentMethod = 'cash';
+        paymentResult = null;
+        console.log(`💵 Cash trip — no wallet processing needed`);
       }
 
-      // ── 3. Mark trip completed ─────────────────────────────────────────
+      // ── 3. Mark trip completed ────────────────────────────────────────
 
       const updatedTrip = await Trip.findByIdAndUpdate(
         tripId,
@@ -1107,7 +1067,6 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
           completedAt: new Date(),
           paymentMethod: resolvedPaymentMethod,
           paymentConfirmed: true,
-          // Store transaction IDs for auditing
           ...(paymentResult?.passengerTxn && {
             'metadata.passengerTransactionId': paymentResult.passengerTxn._id
           }),
@@ -1118,7 +1077,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
         { new: true, session }
       );
 
-      // ── 4. Update driver availability ──────────────────────────────────
+      // ── 4. Update driver availability ─────────────────────────────────
 
       await User.findByIdAndUpdate(
         driverId,
@@ -1132,10 +1091,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       console.log(`✅ Driver ${driverId} is now available`);
 
-      // ── 5. First-trip referral reward gate ─────────────────────────────
-      //
-      // Atomically flip hasCompletedFirstTrip — only matches once per passenger,
-      // so the referral reward fires exactly once no matter what.
+      // ── 5. First-trip referral reward gate ────────────────────────────
 
       const passengerUpdate = await User.findOneAndUpdate(
         { _id: passengerId, hasCompletedFirstTrip: { $ne: true } },
@@ -1144,7 +1100,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
       );
       const isFirstTrip = passengerUpdate !== null;
 
-      // ── 6. Send response immediately ───────────────────────────────────
+      // ── 6. Send response ──────────────────────────────────────────────
 
       const driverNewBalance = paymentResult?.driverWallet?.balance ?? null;
 
@@ -1158,7 +1114,6 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
           completedAt: updatedTrip.completedAt,
           paymentMethod: resolvedPaymentMethod
         },
-        // Include driver's updated balance so the app can refresh the UI
         driverWallet: driverNewBalance !== null
           ? {
               balance: driverNewBalance,
@@ -1169,22 +1124,24 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
         message: 'Trip completed successfully. Driver is now available for new trips.'
       });
 
-      // ── 7. Post-commit side effects (non-blocking) ─────────────────────
+      // ── 7. Post-commit side effects (non-blocking) ────────────────────
 
       setImmediate(async () => {
         try {
-          // Referral reward — fires only once per passenger lifetime
           if (isFirstTrip) {
             console.log(`🎁 First trip for passenger ${passengerId}, checking referral...`);
-            const referralRouter = require('./referral');
-            await referralRouter.triggerReferralReward(tripId, passengerId);
+            try {
+              const referralRouter = require('./referral');
+              await referralRouter.triggerReferralReward(tripId, passengerId);
+            } catch (refErr) {
+              console.error('Referral reward error (non-fatal):', refErr.message);
+            }
           }
 
-          // Notify passenger
           const paymentNote = resolvedPaymentMethod === 'wallet'
             ? 'Paid from your wallet.'
             : resolvedPaymentMethod === 'cash_fallback'
-              ? 'Insufficient wallet balance — please pay driver ₦' + (finalFare / 100).toFixed(2) + ' in cash.'
+              ? `Insufficient wallet balance — please pay driver ₦${(finalFare / 100).toFixed(2)} in cash.`
               : 'Cash payment.';
 
           emitter.emit('notification', {
@@ -1200,7 +1157,6 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
             }
           });
 
-          // Notify driver of their earned amount
           emitter.emit('notification', {
             userId: driverId,
             type: 'trip_completed',
@@ -1246,7 +1202,6 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
       errorCode = 'TRIP_ALREADY_ENDED';
       errorMessage = 'This trip has already been ended.';
     } else if (error.message.includes('Insufficient wallet balance')) {
-      // This should not surface since we fall back to cash, but just in case
       statusCode = 400;
       errorCode = 'INSUFFICIENT_BALANCE';
     }
@@ -1274,18 +1229,16 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
 
     const isPassenger = trip.passengerId.toString() === userId;
     const isDriver = trip.driverId?.toString() === userId;
-    
+
     if (!isPassenger && !isDriver) {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
 
-    // SIMPLIFIED: Just mark as cancelled
     trip.status = 'cancelled';
     trip.cancelledAt = new Date();
     trip.cancellationReason = reason || (isPassenger ? 'passenger_cancelled' : 'driver_cancelled');
     await trip.save();
 
-    // ✅ Clean up driver state if driver cancelled
     if (isDriver && trip.driverId) {
       await User.findByIdAndUpdate(trip.driverId, {
         'driverProfile.isAvailable': true,
@@ -1293,7 +1246,7 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
       });
     }
 
-    res.json({ 
+    res.json({
       success: true,
       trip,
       message: 'Trip cancelled successfully'
@@ -1301,10 +1254,336 @@ router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
 
   } catch (err) {
     console.error('Cancel error:', err);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
-      error: { message: 'Failed to cancel trip' } 
+      error: { message: 'Failed to cancel trip' }
     });
+  }
+});
+
+// ==========================================
+// GET /trips/history - GET USER TRIP HISTORY
+// ==========================================
+
+router.get('/history', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const {
+      role = 'passenger',
+      status = 'all',
+      limit = 50,
+      offset = 0,
+      startDate,
+      endDate
+    } = req.query;
+
+    console.log(`📊 Fetching trip history for user ${userId} (role: ${role})`);
+
+    const filter = {};
+
+    if (role === 'driver') {
+      filter.driverId = userId;
+    } else {
+      filter.passengerId = userId;
+    }
+
+    if (status === 'completed') {
+      filter.status = 'completed';
+    } else if (status === 'cancelled') {
+      filter.status = 'cancelled';
+    } else {
+      filter.status = { $in: ['completed', 'cancelled'] };
+    }
+
+    if (startDate || endDate) {
+      filter.completedAt = {};
+      if (startDate) filter.completedAt.$gte = new Date(startDate);
+      if (endDate) filter.completedAt.$lte = new Date(endDate);
+    }
+
+    const parsedLimit = Math.min(parseInt(limit) || 50, 100);
+    const parsedOffset = parseInt(offset) || 0;
+
+    const trips = await Trip.find(filter)
+      .populate('passengerId', 'name phone profilePicUrl')
+      .populate('driverId', 'name phone profilePicUrl driverProfile')
+      .sort({ completedAt: -1, cancelledAt: -1, createdAt: -1 })
+      .limit(parsedLimit)
+      .skip(parsedOffset)
+      .lean();
+
+    const total = await Trip.countDocuments(filter);
+
+    const formattedTrips = trips.map(trip => {
+      const isDriver = trip.driverId?._id?.toString() === userId;
+
+      return {
+        id: trip._id.toString(),
+        date: trip.completedAt || trip.cancelledAt || trip.createdAt,
+        status: trip.status,
+        pickup: {
+          address: trip.pickupLocation?.address || 'Pickup Location',
+          coordinates: trip.pickupLocation?.coordinates
+        },
+        dropoff: {
+          address: trip.dropoffLocation?.address || 'Dropoff Location',
+          coordinates: trip.dropoffLocation?.coordinates
+        },
+        serviceType: trip.serviceType,
+        paymentMethod: trip.paymentMethod,
+        estimatedFare: trip.estimatedFare,
+        finalFare: trip.finalFare,
+        fareInNaira: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
+        distanceKm: trip.distanceKm,
+        durationMinutes: trip.durationMinutes,
+        requestedAt: trip.requestedAt,
+        startedAt: trip.startedAt,
+        completedAt: trip.completedAt,
+        cancelledAt: trip.cancelledAt,
+        cancellationReason: trip.cancellationReason,
+        otherParty: isDriver ? {
+          id: trip.passengerId?._id?.toString(),
+          name: trip.passengerId?.name || 'Passenger',
+          phone: trip.passengerId?.phone,
+          profilePicUrl: trip.passengerId?.profilePicUrl
+        } : {
+          id: trip.driverId?._id?.toString(),
+          name: trip.driverId?.name || 'Driver',
+          phone: trip.driverId?.phone,
+          profilePicUrl: trip.driverId?.profilePicUrl,
+          vehicleInfo: trip.driverId?.driverProfile ? {
+            make: trip.driverId.driverProfile.vehicleMake,
+            model: trip.driverId.driverProfile.vehicleModel,
+            number: trip.driverId.driverProfile.vehicleNumber
+          } : null
+        }
+      };
+    });
+
+    const stats = {
+      totalTrips: total,
+      completedTrips: await Trip.countDocuments({ ...filter, status: 'completed' }),
+      cancelledTrips: await Trip.countDocuments({ ...filter, status: 'cancelled' }),
+      totalSpent: trips
+        .filter(t => t.status === 'completed')
+        .reduce((sum, t) => sum + (t.finalFare || 0), 0)
+    };
+
+    console.log(`✅ Found ${formattedTrips.length} trips (${total} total)`);
+
+    res.json({
+      success: true,
+      trips: formattedTrips,
+      pagination: {
+        total,
+        limit: parsedLimit,
+        offset: parsedOffset,
+        hasMore: total > parsedOffset + parsedLimit
+      },
+      stats: {
+        ...stats,
+        totalSpentInNaira: (stats.totalSpent / 100).toFixed(2)
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Trip history error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /trips/history/stats
+// ==========================================
+
+router.get('/history/stats', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const { role = 'passenger', period = 'month' } = req.query;
+
+    console.log(`📊 Fetching trip stats for user ${userId} (period: ${period})`);
+
+    const now = new Date();
+    let startDate;
+
+    switch (period) {
+      case 'week':
+        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        break;
+      case 'month':
+        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+        break;
+      case 'year':
+        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+        break;
+      default:
+        startDate = null;
+    }
+
+    const filter = role === 'driver'
+      ? { driverId: userId }
+      : { passengerId: userId };
+
+    if (startDate) {
+      filter.completedAt = { $gte: startDate };
+    }
+
+    const completedFilter = { ...filter, status: 'completed' };
+
+    const [
+      completedTrips,
+      cancelledTrips,
+      totalDistanceResult,
+      totalFareResult,
+      serviceTypeBreakdown
+    ] = await Promise.all([
+      Trip.countDocuments(completedFilter),
+      Trip.countDocuments({ ...filter, status: 'cancelled' }),
+      Trip.aggregate([
+        { $match: completedFilter },
+        { $group: { _id: null, total: { $sum: '$distanceKm' } } }
+      ]),
+      Trip.aggregate([
+        { $match: completedFilter },
+        { $group: { _id: null, total: { $sum: '$finalFare' } } }
+      ]),
+      Trip.aggregate([
+        { $match: completedFilter },
+        {
+          $group: {
+            _id: '$serviceType',
+            count: { $sum: 1 },
+            totalFare: { $sum: '$finalFare' }
+          }
+        }
+      ])
+    ]);
+
+    const totalDistance = totalDistanceResult[0]?.total || 0;
+    const totalFare = totalFareResult[0]?.total || 0;
+
+    res.json({
+      success: true,
+      period,
+      stats: {
+        totalTrips: completedTrips + cancelledTrips,
+        completedTrips,
+        cancelledTrips,
+        totalDistance: parseFloat(totalDistance.toFixed(2)),
+        totalFare,
+        totalFareInNaira: (totalFare / 100).toFixed(2),
+        averageFare: completedTrips > 0 ? totalFare / completedTrips : 0,
+        averageFareInNaira: completedTrips > 0
+          ? ((totalFare / completedTrips) / 100).toFixed(2)
+          : '0.00',
+        serviceTypeBreakdown: serviceTypeBreakdown.map(item => ({
+          serviceType: item._id,
+          count: item.count,
+          totalFare: item.totalFare,
+          totalFareInNaira: (item.totalFare / 100).toFixed(2)
+        }))
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Trip stats error:', err);
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /trips/history/:tripId
+// ==========================================
+
+router.get('/history/:tripId', requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.sub;
+    const { tripId } = req.params;
+
+    console.log(`📄 Fetching trip details: ${tripId}`);
+
+    const trip = await Trip.findById(tripId)
+      .populate('passengerId', 'name phone profilePicUrl')
+      .populate('driverId', 'name phone profilePicUrl driverProfile')
+      .lean();
+
+    if (!trip) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Trip not found' }
+      });
+    }
+
+    const isPassenger = trip.passengerId?._id?.toString() === userId;
+    const isDriver = trip.driverId?._id?.toString() === userId;
+
+    if (!isPassenger && !isDriver) {
+      return res.status(403).json({
+        success: false,
+        error: { message: 'Unauthorized access to this trip' }
+      });
+    }
+
+    const detailedTrip = {
+      id: trip._id.toString(),
+      status: trip.status,
+      passenger: {
+        id: trip.passengerId?._id?.toString(),
+        name: trip.passengerId?.name || 'Passenger',
+        phone: trip.passengerId?.phone,
+        profilePicUrl: trip.passengerId?.profilePicUrl
+      },
+      driver: {
+        id: trip.driverId?._id?.toString(),
+        name: trip.driverId?.name || 'Driver',
+        phone: trip.driverId?.phone,
+        profilePicUrl: trip.driverId?.profilePicUrl,
+        vehicle: trip.driverId?.driverProfile ? {
+          make: trip.driverId.driverProfile.vehicleMake,
+          model: trip.driverId.driverProfile.vehicleModel,
+          number: trip.driverId.driverProfile.vehicleNumber
+        } : null
+      },
+      pickup: {
+        address: trip.pickupLocation?.address || 'Pickup Location',
+        coordinates: trip.pickupLocation?.coordinates
+      },
+      dropoff: {
+        address: trip.dropoffLocation?.address || 'Dropoff Location',
+        coordinates: trip.dropoffLocation?.coordinates
+      },
+      serviceType: trip.serviceType,
+      paymentMethod: trip.paymentMethod,
+      paymentConfirmed: trip.paymentConfirmed,
+      estimatedFare: trip.estimatedFare,
+      finalFare: trip.finalFare,
+      commission: trip.commission,
+      driverEarnings: trip.driverEarnings,
+      fareBreakdown: {
+        estimated: (trip.estimatedFare / 100).toFixed(2),
+        final: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
+        commission: trip.commission ? (trip.commission / 100).toFixed(2) : '0.00',
+        driverEarnings: trip.driverEarnings ? (trip.driverEarnings / 100).toFixed(2) : '0.00'
+      },
+      distanceKm: trip.distanceKm,
+      durationMinutes: trip.durationMinutes,
+      requestedAt: trip.requestedAt,
+      startedAt: trip.startedAt,
+      completedAt: trip.completedAt,
+      cancelledAt: trip.cancelledAt,
+      cancellationReason: trip.cancellationReason,
+      completionNotes: trip.completionNotes,
+      tripRequestId: trip.tripRequestId?.toString()
+    };
+
+    res.json({
+      success: true,
+      trip: detailedTrip
+    });
+
+  } catch (err) {
+    console.error('❌ Trip detail error:', err);
+    next(err);
   }
 });
 
@@ -1316,15 +1595,15 @@ router.get('/:tripId', requireAuth, async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.tripId).lean();
     if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-    
+
     const userId = req.user.sub;
     const isPassenger = trip.passengerId.toString() === userId;
     const isDriver = trip.driverId?.toString() === userId;
-    
+
     if (!isPassenger && !isDriver) {
       return res.status(403).json({ error: { message: 'Unauthorized' } });
     }
-    
+
     res.json({ trip });
   } catch (err) {
     next(err);
@@ -1402,9 +1681,9 @@ router.post('/admin/flush-trips', requireAuth, requireAdmin, async (req, res) =>
     const deleted = await TripRequest.deleteMany({
       expiresAt: { $lt: new Date() }
     });
-    
-    res.json({ 
-      success: true, 
+
+    res.json({
+      success: true,
       deletedCount: deleted.deletedCount,
       message: `Deleted ${deleted.deletedCount} expired trip requests`
     });
@@ -1420,78 +1699,13 @@ router.get('/admin/config', requireAuth, requireAdmin, async (req, res) => {
     timestamp: new Date().toISOString(),
     stats: {
       searchingTrips: await TripRequest.countDocuments({ status: 'searching' }),
-      activeTrips: await Trip.countDocuments({ 
-        status: { $in: ['assigned', 'started', 'in_progress'] } 
+      activeTrips: await Trip.countDocuments({
+        status: { $in: ['assigned', 'started', 'in_progress'] }
       })
     }
   });
 });
 
-// ==========================================
-// Cleanup single driver state
-// ==========================================
-router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
-  try {
-    const driverId = req.user.sub;
-    
-    console.log(`🧹 Cleaning up state for driver ${driverId}`);
-    
-    const driver = await User.findById(driverId).select('driverProfile');
-    
-    if (!driver) {
-      return res.status(404).json({ error: { message: 'Driver not found' } });
-    }
-
-    let cleaned = false;
-    const issues = [];
-
-    if (driver.driverProfile?.currentTripId) {
-      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
-        .select('status');
-
-      if (!currentTrip) {
-        issues.push('Trip not found - removing stale reference');
-        cleaned = true;
-      } else if (['completed', 'cancelled'].includes(currentTrip.status)) {
-        issues.push(`Trip ${currentTrip.status} - removing stale reference`);
-        cleaned = true;
-      } else {
-        issues.push(`Trip is ${currentTrip.status} - keeping reference`);
-      }
-    }
-
-    if (cleaned) {
-      await User.findByIdAndUpdate(driverId, {
-        'driverProfile.isAvailable': true,
-        $unset: { 'driverProfile.currentTripId': '' }
-      });
-
-      console.log(`✅ Driver ${driverId} state cleaned up`);
-
-      res.json({
-        success: true,
-        message: 'Driver state cleaned up successfully',
-        issues,
-        cleaned: true
-      });
-    } else {
-      res.json({
-        success: true,
-        message: 'No cleanup needed',
-        issues,
-        cleaned: false
-      });
-    }
-
-  } catch (err) {
-    console.error('Cleanup error:', err);
-    res.status(500).json({ error: { message: 'Cleanup failed' } });
-  }
-});
-
-// ==========================================
-// Cleanup all drivers (ADMIN ONLY)
-// ==========================================
 router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req, res) => {
   try {
     console.log('🧹 Starting cleanup of all driver states');
@@ -1548,12 +1762,72 @@ router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req,
 });
 
 // ==========================================
-// Get driver current state
+// DRIVER STATE ENDPOINTS
 // ==========================================
+
+router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
+  try {
+    const driverId = req.user.sub;
+
+    console.log(`🧹 Cleaning up state for driver ${driverId}`);
+
+    const driver = await User.findById(driverId).select('driverProfile');
+
+    if (!driver) {
+      return res.status(404).json({ error: { message: 'Driver not found' } });
+    }
+
+    let cleaned = false;
+    const issues = [];
+
+    if (driver.driverProfile?.currentTripId) {
+      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
+        .select('status');
+
+      if (!currentTrip) {
+        issues.push('Trip not found - removing stale reference');
+        cleaned = true;
+      } else if (['completed', 'cancelled'].includes(currentTrip.status)) {
+        issues.push(`Trip ${currentTrip.status} - removing stale reference`);
+        cleaned = true;
+      } else {
+        issues.push(`Trip is ${currentTrip.status} - keeping reference`);
+      }
+    }
+
+    if (cleaned) {
+      await User.findByIdAndUpdate(driverId, {
+        'driverProfile.isAvailable': true,
+        $unset: { 'driverProfile.currentTripId': '' }
+      });
+
+      console.log(`✅ Driver ${driverId} state cleaned up`);
+
+      res.json({
+        success: true,
+        message: 'Driver state cleaned up successfully',
+        issues,
+        cleaned: true
+      });
+    } else {
+      res.json({
+        success: true,
+        message: 'No cleanup needed',
+        issues,
+        cleaned: false
+      });
+    }
+
+  } catch (err) {
+    console.error('Cleanup error:', err);
+    res.status(500).json({ error: { message: 'Cleanup failed' } });
+  }
+});
+
 router.get('/drivers/current-state', requireAuth, async (req, res) => {
   try {
     const driverId = req.user.sub;
-    
+
     const driver = await User.findById(driverId)
       .select('name driverProfile')
       .lean();
@@ -1582,7 +1856,7 @@ router.get('/drivers/current-state', requireAuth, async (req, res) => {
         completedAt: currentTrip.completedAt,
         cancelledAt: currentTrip.cancelledAt
       } : null,
-      needsCleanup: driver.driverProfile?.currentTripId && 
+      needsCleanup: driver.driverProfile?.currentTripId &&
                     (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status))
     });
 
@@ -1602,408 +1876,11 @@ async function createIndexes() {
       { key: 1 },
       { unique: true, expireAfterSeconds: 24 * 60 * 60 }
     );
-    
     console.log('✅ Idempotency key index created');
   } catch (err) {
     console.log('Index creation error (may already exist):', err.message);
   }
 }
-
-// ==========================================
-// GET /trips/history - GET USER TRIP HISTORY
-// ==========================================
-
-/**
- * Get trip history for the authenticated user
- * Query params:
- * - role: 'passenger' | 'driver' (default: 'passenger')
- * - status: 'completed' | 'cancelled' | 'all' (default: 'all')
- * - limit: number (default: 50, max: 100)
- * - offset: number (default: 0)
- * - startDate: ISO date string (optional)
- * - endDate: ISO date string (optional)
- */
-router.get('/history', requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user.sub;
-    const { 
-      role = 'passenger', 
-      status = 'all',
-      limit = 50, 
-      offset = 0,
-      startDate,
-      endDate
-    } = req.query;
-
-    console.log(`📊 Fetching trip history for user ${userId} (role: ${role})`);
-
-    // Build filter
-    const filter = {};
-    
-    // Filter by role
-    if (role === 'driver') {
-      filter.driverId = userId;
-    } else {
-      filter.passengerId = userId;
-    }
-
-    // Filter by status
-    if (status === 'completed') {
-      filter.status = 'completed';
-    } else if (status === 'cancelled') {
-      filter.status = 'cancelled';
-    } else {
-      // 'all' - get completed and cancelled trips
-      filter.status = { $in: ['completed', 'cancelled'] };
-    }
-
-    // Date range filter
-    if (startDate || endDate) {
-      filter.completedAt = {};
-      if (startDate) {
-        filter.completedAt.$gte = new Date(startDate);
-      }
-      if (endDate) {
-        filter.completedAt.$lte = new Date(endDate);
-      }
-    }
-
-    const parsedLimit = Math.min(parseInt(limit) || 50, 100);
-    const parsedOffset = parseInt(offset) || 0;
-
-    // Fetch trips with populated data
-    const trips = await Trip.find(filter)
-      .populate('passengerId', 'name phone profilePicUrl')
-      .populate('driverId', 'name phone profilePicUrl driverProfile')
-      .sort({ completedAt: -1, cancelledAt: -1, createdAt: -1 })
-      .limit(parsedLimit)
-      .skip(parsedOffset)
-      .lean();
-
-    const total = await Trip.countDocuments(filter);
-
-    // Format trips for frontend
-    const formattedTrips = trips.map(trip => {
-      const isDriver = trip.driverId?._id?.toString() === userId;
-      
-      return {
-        id: trip._id.toString(),
-        date: trip.completedAt || trip.cancelledAt || trip.createdAt,
-        status: trip.status,
-        
-        // Route information
-        pickup: {
-          address: trip.pickupLocation?.address || 'Pickup Location',
-          coordinates: trip.pickupLocation?.coordinates
-        },
-        dropoff: {
-          address: trip.dropoffLocation?.address || 'Dropoff Location',
-          coordinates: trip.dropoffLocation?.coordinates
-        },
-        
-        // Service details
-        serviceType: trip.serviceType,
-        paymentMethod: trip.paymentMethod,
-        
-        // Pricing
-        estimatedFare: trip.estimatedFare,
-        finalFare: trip.finalFare,
-        fareInNaira: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
-        
-        // Trip metrics
-        distanceKm: trip.distanceKm,
-        durationMinutes: trip.durationMinutes,
-        
-        // Timestamps
-        requestedAt: trip.requestedAt,
-        startedAt: trip.startedAt,
-        completedAt: trip.completedAt,
-        cancelledAt: trip.cancelledAt,
-        cancellationReason: trip.cancellationReason,
-        
-        // Other party info (driver for passenger, passenger for driver)
-        otherParty: isDriver ? {
-          id: trip.passengerId?._id?.toString(),
-          name: trip.passengerId?.name || 'Passenger',
-          phone: trip.passengerId?.phone,
-          profilePicUrl: trip.passengerId?.profilePicUrl
-        } : {
-          id: trip.driverId?._id?.toString(),
-          name: trip.driverId?.name || 'Driver',
-          phone: trip.driverId?.phone,
-          profilePicUrl: trip.driverId?.profilePicUrl,
-          vehicleInfo: trip.driverId?.driverProfile ? {
-            make: trip.driverId.driverProfile.vehicleMake,
-            model: trip.driverId.driverProfile.vehicleModel,
-            number: trip.driverId.driverProfile.vehicleNumber
-          } : null
-        }
-      };
-    });
-
-    // Calculate summary stats
-    const stats = {
-      totalTrips: total,
-      completedTrips: await Trip.countDocuments({ 
-        ...filter, 
-        status: 'completed' 
-      }),
-      cancelledTrips: await Trip.countDocuments({ 
-        ...filter, 
-        status: 'cancelled' 
-      }),
-      totalSpent: trips
-        .filter(t => t.status === 'completed')
-        .reduce((sum, t) => sum + (t.finalFare || 0), 0)
-    };
-
-    console.log(`✅ Found ${formattedTrips.length} trips (${total} total)`);
-
-    res.json({
-      success: true,
-      trips: formattedTrips,
-      pagination: {
-        total,
-        limit: parsedLimit,
-        offset: parsedOffset,
-        hasMore: total > parsedOffset + parsedLimit
-      },
-      stats: {
-        ...stats,
-        totalSpentInNaira: (stats.totalSpent / 100).toFixed(2)
-      }
-    });
-
-  } catch (err) {
-    console.error('❌ Trip history error:', err);
-    next(err);
-  }
-});
-
-// ==========================================
-// GET /trips/history/stats - GET TRIP STATISTICS
-// ==========================================
-
-/**
- * Get detailed statistics about trip history
- * Query params:
- * - role: 'passenger' | 'driver' (default: 'passenger')
- * - period: 'week' | 'month' | 'year' | 'all' (default: 'month')
- */
-router.get('/history/stats', requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user.sub;
-    const { role = 'passenger', period = 'month' } = req.query;
-
-    console.log(`📊 Fetching trip stats for user ${userId} (period: ${period})`);
-
-    // Calculate date range
-    const now = new Date();
-    let startDate;
-    
-    switch (period) {
-      case 'week':
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case 'month':
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      case 'year':
-        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        startDate = null;
-    }
-
-    const filter = role === 'driver' 
-      ? { driverId: userId }
-      : { passengerId: userId };
-    
-    if (startDate) {
-      filter.completedAt = { $gte: startDate };
-    }
-
-    // Aggregate statistics
-    const completedFilter = { ...filter, status: 'completed' };
-    
-    const [
-      completedTrips,
-      cancelledTrips,
-      totalDistanceResult,
-      totalFareResult,
-      serviceTypeBreakdown
-    ] = await Promise.all([
-      Trip.countDocuments(completedFilter),
-      Trip.countDocuments({ ...filter, status: 'cancelled' }),
-      Trip.aggregate([
-        { $match: completedFilter },
-        { $group: { _id: null, total: { $sum: '$distanceKm' } } }
-      ]),
-      Trip.aggregate([
-        { $match: completedFilter },
-        { $group: { _id: null, total: { $sum: '$finalFare' } } }
-      ]),
-      Trip.aggregate([
-        { $match: completedFilter },
-        { 
-          $group: { 
-            _id: '$serviceType', 
-            count: { $sum: 1 },
-            totalFare: { $sum: '$finalFare' }
-          } 
-        }
-      ])
-    ]);
-
-    const totalDistance = totalDistanceResult[0]?.total || 0;
-    const totalFare = totalFareResult[0]?.total || 0;
-
-    res.json({
-      success: true,
-      period,
-      stats: {
-        totalTrips: completedTrips + cancelledTrips,
-        completedTrips,
-        cancelledTrips,
-        totalDistance: parseFloat(totalDistance.toFixed(2)),
-        totalFare,
-        totalFareInNaira: (totalFare / 100).toFixed(2),
-        averageFare: completedTrips > 0 ? totalFare / completedTrips : 0,
-        averageFareInNaira: completedTrips > 0 
-          ? ((totalFare / completedTrips) / 100).toFixed(2) 
-          : '0.00',
-        serviceTypeBreakdown: serviceTypeBreakdown.map(item => ({
-          serviceType: item._id,
-          count: item.count,
-          totalFare: item.totalFare,
-          totalFareInNaira: (item.totalFare / 100).toFixed(2)
-        }))
-      }
-    });
-
-  } catch (err) {
-    console.error('❌ Trip stats error:', err);
-    next(err);
-  }
-});
-
-// ==========================================
-// GET /trips/history/:tripId - GET SINGLE TRIP DETAILS
-// ==========================================
-
-/**
- * Get detailed information about a specific trip from history
- */
-router.get('/history/:tripId', requireAuth, async (req, res, next) => {
-  try {
-    const userId = req.user.sub;
-    const { tripId } = req.params;
-
-    console.log(`📄 Fetching trip details: ${tripId}`);
-
-    const trip = await Trip.findById(tripId)
-      .populate('passengerId', 'name phone profilePicUrl')
-      .populate('driverId', 'name phone profilePicUrl driverProfile')
-      .lean();
-
-    if (!trip) {
-      return res.status(404).json({
-        success: false,
-        error: { message: 'Trip not found' }
-      });
-    }
-
-    // Authorization check
-    const isPassenger = trip.passengerId?._id?.toString() === userId;
-    const isDriver = trip.driverId?._id?.toString() === userId;
-    
-    if (!isPassenger && !isDriver) {
-      return res.status(403).json({
-        success: false,
-        error: { message: 'Unauthorized access to this trip' }
-      });
-    }
-
-    // Format detailed trip data
-    const detailedTrip = {
-      id: trip._id.toString(),
-      status: trip.status,
-      
-      // Passenger info
-      passenger: {
-        id: trip.passengerId?._id?.toString(),
-        name: trip.passengerId?.name || 'Passenger',
-        phone: trip.passengerId?.phone,
-        profilePicUrl: trip.passengerId?.profilePicUrl
-      },
-      
-      // Driver info
-      driver: {
-        id: trip.driverId?._id?.toString(),
-        name: trip.driverId?.name || 'Driver',
-        phone: trip.driverId?.phone,
-        profilePicUrl: trip.driverId?.profilePicUrl,
-        vehicle: trip.driverId?.driverProfile ? {
-          make: trip.driverId.driverProfile.vehicleMake,
-          model: trip.driverId.driverProfile.vehicleModel,
-          number: trip.driverId.driverProfile.vehicleNumber
-        } : null
-      },
-      
-      // Route
-      pickup: {
-        address: trip.pickupLocation?.address || 'Pickup Location',
-        coordinates: trip.pickupLocation?.coordinates
-      },
-      dropoff: {
-        address: trip.dropoffLocation?.address || 'Dropoff Location',
-        coordinates: trip.dropoffLocation?.coordinates
-      },
-      
-      // Service & Payment
-      serviceType: trip.serviceType,
-      paymentMethod: trip.paymentMethod,
-      paymentConfirmed: trip.paymentConfirmed,
-      
-      // Pricing
-      estimatedFare: trip.estimatedFare,
-      finalFare: trip.finalFare,
-      commission: trip.commission,
-      driverEarnings: trip.driverEarnings,
-      fareBreakdown: {
-        estimated: (trip.estimatedFare / 100).toFixed(2),
-        final: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
-        commission: trip.commission ? (trip.commission / 100).toFixed(2) : '0.00',
-        driverEarnings: trip.driverEarnings ? (trip.driverEarnings / 100).toFixed(2) : '0.00'
-      },
-      
-      // Trip metrics
-      distanceKm: trip.distanceKm,
-      durationMinutes: trip.durationMinutes,
-      
-      // Timestamps
-      requestedAt: trip.requestedAt,
-      startedAt: trip.startedAt,
-      completedAt: trip.completedAt,
-      cancelledAt: trip.cancelledAt,
-      cancellationReason: trip.cancellationReason,
-      completionNotes: trip.completionNotes,
-      
-      // Trip request reference
-      tripRequestId: trip.tripRequestId?.toString()
-    };
-
-    res.json({
-      success: true,
-      trip: detailedTrip
-    });
-
-  } catch (err) {
-    console.error('❌ Trip detail error:', err);
-    next(err);
-  }
-});
-
 
 createIndexes();
 
