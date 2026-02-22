@@ -15,6 +15,7 @@ const { calculateFare } = require('../utils/pricingCalculator');
 const emitter = require('../utils/eventEmitter');
 const rateLimit = require('express-rate-limit');
 const { requireActiveSubscription } = require('../middleware/subscriptionCheck');
+const { processTripWalletPayment, recordCashTripEarning } = require('../utils/tripPaymentService');
 
 // ==========================================
 // RATE LIMITING
