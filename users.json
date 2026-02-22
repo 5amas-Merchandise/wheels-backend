@@ -1,0 +1,1659 @@
+{
+  "success": true,
+  "users": [
+    {
+      "_id": "694cf70d46348559135dcaf2",
+      "name": "Osadinizu Precious",
+      "email": "tezzertech@gmail.com",
+      "phone": "+2348073850001",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [7.4336822, 9.0622577] },
+        "lastSeen": "2026-01-13T11:35:57.067Z",
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "createdAt": "2025-12-25T08:34:21.294Z",
+      "__v": 0,
+      "isActive": true,
+      "lastLogin": "2026-02-21T13:10:24.231Z",
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "updatedAt": "2026-02-21T13:21:33.235Z",
+      "wallet": { "balance": 0, "currency": "NGN" },
+      "hasCompletedFirstTrip": false,
+      "referralCode": "OSA6AQLZ"
+    },
+    {
+      "_id": "694d57de46348559135dcaf9",
+      "name": "Osadinizu Emmanuel",
+      "email": "emmakleen@gmail.com",
+      "phone": "+2348084327650",
+      "roles": {
+        "isUser": true,
+        "isDriver": true,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "driverProfile": {
+        "serviceCategories": ["CITY_RIDE"],
+        "verified": true,
+        "verificationState": "approved",
+        "isAvailable": false,
+        "location": {
+          "type": "Point",
+          "coordinates": [3.3711880003883, 6.538314427022849]
+        },
+        "carPicUrl": "https://res.cloudinary.com/ddlee3b3s/image/upload/v1766703555/dbl65tnrmcc9jcxs6cnv.jpg",
+        "lastSeen": "2026-02-19T19:02:43.273Z",
+        "licenseImageUrl": "https://res.cloudinary.com/ddlee3b3s/image/upload/v1766703564/k0yu0fdte8tygrsetdbu.png",
+        "licenseNumber": "Ywyw6262738uwye",
+        "nin": "54213876451",
+        "ninImageUrl": "https://res.cloudinary.com/ddlee3b3s/image/upload/v1766703557/unbq7tiyfbxr9mzrd9ph.jpg",
+        "profilePicUrl": "https://res.cloudinary.com/ddlee3b3s/image/upload/v1766703555/odimq3wyvjksqbstyhvb.jpg",
+        "vehicleMake": "Toyota",
+        "vehicleModel": "Corolla 2005",
+        "vehicleNumber": "ABJ543DC",
+        "vehicleRegistrationUrl": "https://res.cloudinary.com/ddlee3b3s/image/upload/v1766703573/evvsipafhzxc5x5ovps3.jpg",
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "createdAt": "2025-12-25T15:27:26.701Z",
+      "__v": 0,
+      "isActive": true,
+      "lastLogin": "2026-02-20T07:53:10.913Z",
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "updatedAt": "2026-02-21T13:21:33.608Z",
+      "wallet": { "balance": 0, "currency": "NGN" },
+      "hasCompletedFirstTrip": false,
+      "referralCode": "OSA7GE2V"
+    },
+    {
+      "_id": "694d593b46348559135dcb00",
+      "name": "Nicholas Namikpoh",
+      "email": "nicholasnamikpoh@gmail.com",
+      "phone": "+2348086276421",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "createdAt": "2025-12-25T15:33:15.994Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "isActive": true,
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "referralCode": "NICLW2ZT",
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "updatedAt": "2026-02-21T13:21:33.949Z"
+    },
+    {
+      "_id": "696003a0e4fff4b814f8bc82",
+      "name": "Ikechkwu Onah",
+      "email": "ik@gmail.com",
+      "phone": "+2348080808080",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-08T19:21:04.439Z",
+      "updatedAt": "2026-02-21T13:21:34.326Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "isActive": true,
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "referralCode": "IKEL53VU",
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      }
+    },
+    {
+      "_id": "696013450425255ba93fa9ef",
+      "name": "Promise Epoki",
+      "email": "promise@gmail.com",
+      "phone": "+2348018028034",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-08T20:27:49.827Z",
+      "updatedAt": "2026-02-21T13:21:34.699Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "isActive": true,
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "referralCode": "PROF29DZ",
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      }
+    },
+    {
+      "_id": "69602cd8e972ed7ab478a59f",
+      "name": "Fatima KORO",
+      "email": "fatimamohkoro@gmail.com",
+      "phone": "+2348072977991",
+      "roles": {
+        "isUser": false,
+        "isDriver": true,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-08T22:16:56.257Z",
+      "updatedAt": "2026-02-21T13:21:35.066Z",
+      "__v": 0,
+      "isActive": true,
+      "lastLogin": "2026-01-20T13:53:16.231Z",
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "hasCompletedFirstTrip": false,
+      "referralCode": "FATSJZZS"
+    },
+    {
+      "_id": "69602d53e972ed7ab478a5ae",
+      "name": "FatimaKoro",
+      "email": "timawaku@yahoo.com",
+      "phone": "+2348168998800",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-08T22:18:59.494Z",
+      "updatedAt": "2026-02-21T13:21:35.393Z",
+      "__v": 0,
+      "isActive": true,
+      "lastLogin": "2026-02-20T05:30:21.380Z",
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "hasCompletedFirstTrip": false,
+      "referralCode": "FATJCKSJ"
+    },
+    {
+      "_id": "696631d586e40be836712b2f",
+      "name": "Zainab Muhammed",
+      "email": "zain@gmail.com",
+      "phone": "+2349064007841",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-13T11:51:49.052Z",
+      "updatedAt": "2026-02-21T13:21:35.766Z",
+      "__v": 0,
+      "isActive": true,
+      "lastLogin": "2026-01-20T13:53:54.836Z",
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "hasCompletedFirstTrip": false,
+      "referralCode": "ZAIZEXB8"
+    },
+    {
+      "_id": "6967748176cee4ed44100241",
+      "name": "Prince",
+      "email": "esangsunday16@gmail.com",
+      "phone": "+2349169699361",
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isAdmin": false,
+        "isTransportCompany": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "rating": 0,
+        "totalEarnings": 0,
+        "totalReviews": 0,
+        "totalTrips": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-14T10:48:33.624Z",
+      "updatedAt": "2026-02-21T13:21:36.121Z",
+      "__v": 0,
+      "isActive": true,
+      "lastLogin": "2026-01-22T17:26:57.959Z",
+      "phoneVerified": false,
+      "preferences": {
+        "currency": "NGN",
+        "language": "en",
+        "notifications": { "email": true, "push": true, "sms": true }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "hasCompletedFirstTrip": false,
+      "referralCode": "PRIG8VDT"
+    },
+    {
+      "_id": "696d2648b62701abdc80a911",
+      "name": "David Johnson",
+      "email": "david@eliteexpress.com",
+      "phone": "+2348012345679",
+      "password": "$2b$10$kU.3/sd40hdnhbPWky8RwudnufgnEoq/FUTlIPP9OZ0BlqZqspMJe",
+      "profilePicUrl": null,
+      "roles": {
+        "isDriver": false,
+        "isTransportCompany": true,
+        "isAdmin": false,
+        "isUser": true,
+        "isAgent": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "emailVerified": false,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "stats": {
+        "totalTrips": 0,
+        "totalBookings": 0,
+        "totalSpent": 0,
+        "joinedDate": "2026-01-18T18:28:24.751Z"
+      },
+      "wallet": {
+        "balance": 0,
+        "currency": "NGN",
+        "lastUpdated": "2026-01-18T18:28:24.751Z"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0,
+        "preferredAreas": [],
+        "onlineHours": { "start": "08:00", "end": "20:00" }
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": true,
+        "verificationStatus": "approved",
+        "verificationDocuments": { "otherDocuments": [] },
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "accountStatus": "active"
+      },
+      "createdAt": "2026-01-18T18:28:24.751Z",
+      "updatedAt": "2026-02-21T13:21:36.501Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "DAVEC5ZV"
+    },
+    {
+      "_id": "6979cae29fe8c78963e1c779",
+      "name": "Osadinizu Precious",
+      "email": "tezz@wheela.ng",
+      "phone": "+2347032431344",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": true,
+        "isAdmin": false
+      },
+      "transportCompanyProfile": {
+        "companyName": "Wheela Transport LTD",
+        "companyRcNumber": "RC776345",
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": true,
+        "verificationStatus": "approved",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "createdAt": "2026-01-28T08:37:54.218Z",
+      "updatedAt": "2026-02-21T13:21:36.846Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "OSAKTZ98"
+    },
+    {
+      "_id": "6990536c07a316a4afd54eca",
+      "name": "Aisha Musa",
+      "email": "aishananamusa@gmail.com",
+      "phone": "+2347032344075",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-14T10:50:20.510Z",
+      "updatedAt": "2026-02-21T13:21:37.160Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "AISHNRRJ"
+    },
+    {
+      "_id": "6991e3237d4db2d8070fd37b",
+      "name": "Akintomowo Precious Oluwabukola",
+      "email": "akintomowoprecious0@gmail.com",
+      "phone": "+2349063711736",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-15T15:15:47.991Z",
+      "updatedAt": "2026-02-21T13:21:37.471Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "AKISQHMG"
+    },
+    {
+      "_id": "6993a3bcd46f8bb9d8e15914",
+      "name": "Ishola Waheed Arisekola",
+      "email": "isholawaheed16@gmail.com",
+      "phone": "+2348039203313",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-16T23:09:48.157Z",
+      "updatedAt": "2026-02-21T13:21:37.907Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "ISH9767C"
+    },
+    {
+      "_id": "6993a8a17105ce4377afbfc2",
+      "name": "Afnan Abubakar",
+      "email": "afnanabubakar2009@gmail.com",
+      "phone": "+2349122484137",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-16T23:31:03.438Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-16T23:30:41.974Z",
+      "updatedAt": "2026-02-21T13:21:38.228Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "AFNHJAJ3"
+    },
+    {
+      "_id": "6993b82a015102e2a2c7edca",
+      "name": "Arafat Abubakar",
+      "email": "arafahhmaraj@gmail.com",
+      "phone": "+2349044603421",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-17T00:38:01.140Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-17T00:36:58.594Z",
+      "updatedAt": "2026-02-21T13:21:38.568Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "ARAGF2ZB"
+    },
+    {
+      "_id": "69942c40c2588537cb9b8e3f",
+      "name": "Bologi Jimada",
+      "email": "bjimada@yahoo.com",
+      "phone": "+2348061399632",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-17T08:53:18.582Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-17T08:52:16.411Z",
+      "updatedAt": "2026-02-21T13:21:38.970Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "BOLK4GZ5"
+    },
+    {
+      "_id": "699532a7d528f52192f75599",
+      "name": "Neemah",
+      "phone": "+2348039100195",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-18T03:32:42.992Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-18T03:31:51.096Z",
+      "updatedAt": "2026-02-21T13:21:39.380Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "NEEQ8W86"
+    },
+    {
+      "_id": "699537160fd73dbe01d5496f",
+      "name": "Yusuff Muhammed",
+      "phone": "+23470819798",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-18T03:50:46.760Z",
+      "updatedAt": "2026-02-21T13:21:39.780Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "YUS5WRXN"
+    },
+    {
+      "_id": "6995a651adfbe55ab01dcd85",
+      "name": "Bolade Bolaji",
+      "email": "bbjaze52@gmail.com",
+      "phone": "+2348164390828",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": false,
+        "isDriver": true,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-18T11:45:21.997Z",
+      "updatedAt": "2026-02-21T13:21:40.137Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "BOLD46LN"
+    },
+    {
+      "_id": "6998820147dc4e58f26face6",
+      "name": "Deyzee",
+      "email": "deyzee.an@gmail.com",
+      "phone": "+2347058685933",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-20T15:47:13.314Z",
+      "updatedAt": "2026-02-21T13:21:40.477Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "DEY9RT7B"
+    },
+    {
+      "_id": "699892ca1939494fc5ee2cc8",
+      "name": "Ibrahim Abubakar",
+      "email": "sodangibunza@gmail.com",
+      "phone": "+2347034261826",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-20T16:59:17.613Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-20T16:58:50.200Z",
+      "updatedAt": "2026-02-21T13:21:40.876Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "IBR26DAU"
+    },
+    {
+      "_id": "6998c165501bb07072e0bd83",
+      "name": "Aisha Koro",
+      "phone": "+2348130876116",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-20T20:18:30.788Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-20T20:17:41.694Z",
+      "updatedAt": "2026-02-21T13:21:41.219Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "AISSAN6X"
+    },
+    {
+      "_id": "6998e5e9cf20d7f609dcb2e5",
+      "name": "Darasimi Bakare",
+      "phone": "+2349114696621",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-20T22:54:41.238Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-20T22:53:29.586Z",
+      "updatedAt": "2026-02-21T13:21:41.539Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "DARB6BBN"
+    },
+    {
+      "_id": "699928711564809daadc2033",
+      "name": "Ogunneye Taiwo",
+      "email": "teehberry@gmail.com",
+      "phone": "+2347060843870",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T03:37:21.429Z",
+      "updatedAt": "2026-02-21T13:21:41.864Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "OGUR2HCS"
+    },
+    {
+      "_id": "699928f61564809daadc2051",
+      "name": "Bakare Lateef Olayinka",
+      "email": "olayinkaoladapo620@gmail.com",
+      "phone": "+2348072026627",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": false,
+        "isDriver": true,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-21T03:40:08.537Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T03:39:34.963Z",
+      "updatedAt": "2026-02-21T13:21:42.201Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "BAKBDFT7"
+    },
+    {
+      "_id": "69992aa8b7ac3dabcd043a18",
+      "name": "TAIWO OLUFEMI SAKIRUDEEN",
+      "email": "thetplace@gmail.com",
+      "phone": "+2347065663261",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": false,
+        "isDriver": true,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-21T03:47:06.830Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T03:46:48.814Z",
+      "updatedAt": "2026-02-21T13:21:42.558Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "TAIWAKN6"
+    },
+    {
+      "_id": "69992b44b7ac3dabcd043a49",
+      "name": "Muhammad ABIOLA",
+      "email": "muhammadhawwaluthman@gmail.com",
+      "phone": "+2349823862633",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T03:49:24.263Z",
+      "updatedAt": "2026-02-21T13:21:42.901Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "MUHCKQWQ"
+    },
+    {
+      "_id": "69992be5b7ac3dabcd043a56",
+      "name": "Muhammad ABIOLA",
+      "email": "muhammadhawwalharahorkanmhie@gmail.com",
+      "phone": "+2349023862633",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-21T03:52:26.137Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T03:52:05.699Z",
+      "updatedAt": "2026-02-21T13:21:43.245Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "MUHSNT7R"
+    },
+    {
+      "_id": "69993485a95cf89af99e43a6",
+      "name": "Alabi Sodiq Olasubomi",
+      "email": "alabisodiq709@gmail.com",
+      "phone": "+2349191928139",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": false,
+        "isDriver": true,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T04:28:53.798Z",
+      "updatedAt": "2026-02-21T13:21:43.584Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "ALAP3834"
+    },
+    {
+      "_id": "699934eea95cf89af99e43da",
+      "name": "Alabi Sodiq Olasubomi",
+      "email": "alabisodiq209@gmail.com",
+      "phone": "+2349161928139",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": "2026-02-21T04:33:37.908Z",
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T04:30:38.636Z",
+      "updatedAt": "2026-02-21T13:21:43.995Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "ALAZMLLB"
+    },
+    {
+      "_id": "6999adf99e605ded56634cf4",
+      "name": "Rabi’atu Zarewa",
+      "phone": "+2348144017448",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T13:07:05.973Z",
+      "updatedAt": "2026-02-21T13:21:44.316Z",
+      "__v": 0,
+      "hasCompletedFirstTrip": false,
+      "referralCode": "RABUKKSC"
+    },
+    {
+      "_id": "6999b1f3206fe866b12d6c54",
+      "name": "Muhammad Raheena Aliyu",
+      "email": "raheenarht01@gmail.com",
+      "phone": "+23407033651181",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "referralCode": "MUHQF44U",
+      "usedReferralCode": null,
+      "hasCompletedFirstTrip": false,
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T13:24:03.464Z",
+      "updatedAt": "2026-02-21T13:24:03.466Z",
+      "__v": 0
+    },
+    {
+      "_id": "6999b4f9548a0c32863f0ac2",
+      "name": "Adamu Ibrahim",
+      "email": "ai9405805@gmail.com",
+      "phone": "+2347043719595",
+      "profilePicUrl": null,
+      "roles": {
+        "isUser": true,
+        "isDriver": false,
+        "isTransportCompany": false,
+        "isAdmin": false
+      },
+      "subscription": { "type": "none", "autoRenew": false },
+      "referralCode": "ADAERN6L",
+      "usedReferralCode": null,
+      "hasCompletedFirstTrip": false,
+      "isActive": true,
+      "phoneVerified": false,
+      "lastLogin": null,
+      "preferences": {
+        "notifications": { "email": true, "sms": true, "push": true },
+        "language": "en",
+        "currency": "NGN"
+      },
+      "driverProfile": {
+        "serviceCategories": [],
+        "verified": false,
+        "verificationState": "pending",
+        "isAvailable": true,
+        "location": { "type": "Point", "coordinates": [0, 0] },
+        "totalTrips": 0,
+        "totalEarnings": 0,
+        "rating": 0,
+        "totalReviews": 0,
+        "yearsOfExperience": 0
+      },
+      "transportCompanyProfile": {
+        "yearsInOperation": 0,
+        "fleetSize": 0,
+        "verified": false,
+        "verificationStatus": "pending",
+        "totalBookings": 0,
+        "rating": 0,
+        "totalReviews": 0
+      },
+      "createdAt": "2026-02-21T13:36:57.442Z",
+      "updatedAt": "2026-02-21T13:36:57.450Z",
+      "__v": 0
+    }
+  ]
+}

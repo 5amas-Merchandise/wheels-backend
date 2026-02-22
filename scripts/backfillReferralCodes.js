@@ -30,7 +30,7 @@ async function generateUniqueReferralCode(name = '') {
 }
 
 async function main() {
-  await mongoose.connect(process.env.MONGO_URI );
+  await mongoose.connect(process.env.MONGO_URI || 'mongodb+srv://tezzertech:1914@cluster0.pzkucdw.mongodb.net/wheeladev');
   const users = await User.find({ $or: [ { referralCode: { $exists: false } }, { referralCode: null }, { referralCode: '' } ] });
   let updated = 0;
   for (const user of users) {
