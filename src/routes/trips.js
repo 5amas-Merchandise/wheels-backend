@@ -1091,14 +1091,23 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       console.log(`✅ Driver ${driverId} is now available`);
 
-      // ── 5. First-trip referral reward gate ────────────────────────────
+      // ── 5. Referral reward trigger (CORRECT LOGIC) ────────────────────
 
-      const passengerUpdate = await User.findOneAndUpdate(
-        { _id: passengerId, hasCompletedFirstTrip: { $ne: true } },
-        { $set: { hasCompletedFirstTrip: true } },
-        { session, new: false }
+      // Check if passenger has a pending referral.
+      // Using status='pending' means this fires on ANY completed trip until the
+      // reward is paid — so it self-heals even for passengers whose first trip
+      // completed before the referral was recorded, or before this fix was deployed.
+      const pendingReferral = await mongoose.model('Referral').findOne({
+        refereeId: passengerId,
+        status: 'pending'
+      }).session(session);
+
+      const shouldTriggerReferral = !!pendingReferral;
+
+      console.log(
+        `🎯 Referral check for passenger ${passengerId}:`,
+        shouldTriggerReferral ? 'Pending referral found' : 'No pending referral'
       );
-      const isFirstTrip = passengerUpdate !== null;
 
       // ── 6. Send response ──────────────────────────────────────────────
 
@@ -1128,8 +1137,8 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       setImmediate(async () => {
         try {
-          if (isFirstTrip) {
-            console.log(`🎁 First trip for passenger ${passengerId}, checking referral...`);
+          if (shouldTriggerReferral) {
+            console.log(`🎁 Triggering referral reward for passenger ${passengerId}`);
             try {
               const referralRouter = require('./referral');
               await referralRouter.triggerReferralReward(tripId, passengerId);
