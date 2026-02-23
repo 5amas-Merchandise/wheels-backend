@@ -12,6 +12,7 @@ function optionalAuth(req, res, next) {
   try {
     const payload = jwt.verify(token, config.jwtSecret);
     req.user = {
+      _id: payload.userId || payload.sub || payload._id,  // ← ADD THIS LINE
       sub: payload.userId || payload.sub || payload._id,
       email: payload.email,
       phone: payload.phone,
@@ -55,6 +56,7 @@ function requireAuth(req, res, next) {
     const payload = jwt.verify(token, config.jwtSecret);
 
     req.user = {
+      _id: payload.userId || payload.sub || payload._id,  // ← ADD THIS LINE
       sub: payload.userId || payload.sub || payload._id,
       email: payload.email,
       phone: payload.phone,
