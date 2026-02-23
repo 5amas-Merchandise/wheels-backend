@@ -994,7 +994,10 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/:tripId/complete
+// POST /trips/:tripId/complete  — FIXED SECTION ONLY
+//
+// Replace the entire /:tripId/complete route in your trips.routes.js
+// with this. The rest of the file is unchanged.
 // ==========================================
 
 router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
@@ -1022,7 +1025,12 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       const finalFare = existingTrip.estimatedFare || 0;
       const paymentMethod = existingTrip.paymentMethod || 'cash';
-      const passengerId = existingTrip.passengerId.toString();
+
+      // ✅ FIX: Keep passengerId as ObjectId throughout — do NOT toString() early.
+      //         The original bug was casting to string here, then querying Referral
+      //         with a string where ObjectId is expected, causing findOne → null.
+      const passengerObjectId = existingTrip.passengerId;
+      const passengerIdStr = passengerObjectId.toString();
 
       console.log(`💰 Fare: ₦${(finalFare / 100).toFixed(2)} | Payment: ${paymentMethod}`);
 
@@ -1036,7 +1044,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
           paymentResult = await processTripWalletPayment(
             {
               tripId,
-              passengerId,
+              passengerId: passengerIdStr,
               driverId,
               fareKobo: finalFare,
               serviceType: existingTrip.serviceType
@@ -1045,13 +1053,11 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
           );
           console.log(`✅ Wallet payment processed — driver credited ₦${(finalFare / 100).toFixed(2)}`);
         } catch (paymentErr) {
-          // Insufficient wallet balance — fall back to cash
           console.warn(`⚠️ Wallet payment failed (${paymentErr.message}). Falling back to cash.`);
           resolvedPaymentMethod = 'cash_fallback';
           paymentResult = null;
         }
       } else {
-        // Cash — driver collects physically, no wallet movement needed
         resolvedPaymentMethod = 'cash';
         paymentResult = null;
         console.log(`💵 Cash trip — no wallet processing needed`);
@@ -1091,22 +1097,24 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       console.log(`✅ Driver ${driverId} is now available`);
 
-      // ── 5. Referral reward trigger (CORRECT LOGIC) ────────────────────
+      // ── 5. Check for pending referral ─────────────────────────────────
+      //
+      // ✅ FIX: Query with ObjectId (passengerObjectId), not string.
+      //         This was returning null before because of the type mismatch,
+      //         which meant shouldTriggerReferral was always false.
 
-      // Check if passenger has a pending referral.
-      // Using status='pending' means this fires on ANY completed trip until the
-      // reward is paid — so it self-heals even for passengers whose first trip
-      // completed before the referral was recorded, or before this fix was deployed.
       const pendingReferral = await mongoose.model('Referral').findOne({
-        refereeId: passengerId,
+        refereeId: passengerObjectId,  // ✅ ObjectId — not passengerIdStr
         status: 'pending'
       }).session(session);
 
       const shouldTriggerReferral = !!pendingReferral;
 
       console.log(
-        `🎯 Referral check for passenger ${passengerId}:`,
-        shouldTriggerReferral ? 'Pending referral found' : 'No pending referral'
+        `🎯 Referral check for passenger ${passengerIdStr}:`,
+        shouldTriggerReferral
+          ? `Pending referral found (${pendingReferral._id})`
+          : 'No pending referral'
       );
 
       // ── 6. Send response ──────────────────────────────────────────────
@@ -1138,10 +1146,14 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
       setImmediate(async () => {
         try {
           if (shouldTriggerReferral) {
-            console.log(`🎁 Triggering referral reward for passenger ${passengerId}`);
+            console.log(`🎁 Triggering referral reward for passenger ${passengerIdStr}`);
             try {
+              // ✅ FIX: Pass passengerIdStr (string) — triggerReferralReward
+              //         now handles the ObjectId cast internally.
+              //         No more circular require — import at top of file instead:
+              //         const { triggerReferralReward } = require('./referral');
               const referralRouter = require('./referral');
-              await referralRouter.triggerReferralReward(tripId, passengerId);
+              await referralRouter.triggerReferralReward(tripId, passengerIdStr);
             } catch (refErr) {
               console.error('Referral reward error (non-fatal):', refErr.message);
             }
@@ -1154,7 +1166,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
               : 'Cash payment.';
 
           emitter.emit('notification', {
-            userId: passengerId,
+            userId: passengerIdStr,
             type: 'trip_completed',
             title: 'Trip Completed',
             body: `Your trip is done. Fare: ₦${(finalFare / 100).toFixed(2)}. ${paymentNote}`,
@@ -1181,7 +1193,7 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
           emitter.emit('trip_completed', {
             tripId,
             driverId,
-            passengerId,
+            passengerId: passengerIdStr,
             finalFare,
             completedAt: new Date()
           });
