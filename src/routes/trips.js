@@ -1,42 +1,50 @@
-// routes/trips.routes.js (FIXED VERSION)
-const express = require('express');
+// routes/trips.routes.js
+const express = require("express");
 const router = express.Router();
-const mongoose = require('mongoose');
-const User = require('../models/user.model');
-const TripRequest = require('../models/tripRequest.model');
-const Trip = require('../models/trip.model');
-const Wallet = require('../models/wallet.model');
-const Transaction = require('../models/transaction.model');
-const Settings = require('../models/settings.model');
-const { requireAuth } = require('../middleware/auth');
-const { validateCoordinates, validateServiceType } = require('../middleware/validation');
-const { isLuxury } = require('../constants/serviceTypes');
-const { calculateFare } = require('../utils/pricingCalculator');
-const emitter = require('../utils/eventEmitter');
-const rateLimit = require('express-rate-limit');
-const { requireActiveSubscription } = require('../middleware/subscriptionCheck');
-const { processTripWalletPayment } = require('../utils/tripPaymentService');
+const mongoose = require("mongoose");
+const User = require("../models/user.model");
+const TripRequest = require("../models/tripRequest.model");
+const Trip = require("../models/trip.model");
+const Wallet = require("../models/wallet.model");
+const Transaction = require("../models/transaction.model");
+const Settings = require("../models/settings.model");
+const { requireAuth } = require("../middleware/auth");
+const {
+  validateCoordinates,
+  validateServiceType,
+} = require("../middleware/validation");
+const { isLuxury } = require("../constants/serviceTypes");
+const { calculateFare } = require("../utils/pricingCalculator");
+const emitter = require("../utils/eventEmitter");
+const rateLimit = require("express-rate-limit");
+const {
+  requireActiveSubscription,
+} = require("../middleware/subscriptionCheck");
+const {
+  processTripWalletPayment,
+  recordCashTripEarning,
+} = require("../utils/tripPaymentService");
 
 // ==========================================
 // RATE LIMITING
 // ==========================================
 const requestLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 5, // limit each IP to 5 requests per windowMs
-  message: { error: { message: 'Too many requests, please try again later.' } }
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: { message: "Too many requests, please try again later." } },
 });
 
 // ==========================================
 // CONFIGURATION
 // ==========================================
 const CONFIG = {
-  OFFER_TIMEOUT_MS: 20000, // 20 seconds
+  OFFER_TIMEOUT_MS: 20000,
   MAX_REJECTIONS: 5,
-  SEARCH_TIMEOUT_MS: 5 * 60 * 1000, // 5 minutes
-  FAILED_TRIP_CLEANUP_MS: 5 * 60 * 1000, // 5 minutes
-  DRIVER_LAST_SEEN_THRESHOLD_MS: 5 * 60 * 1000, // 5 minutes
-  SEARCH_RADIUS_METERS: 5000, // 5km
-  MAX_DRIVERS_SEARCH: 10
+  SEARCH_TIMEOUT_MS: 5 * 60 * 1000,
+  FAILED_TRIP_CLEANUP_MS: 5 * 60 * 1000,
+  DRIVER_LAST_SEEN_THRESHOLD_MS: 5 * 60 * 1000,
+  SEARCH_RADIUS_METERS: 5000,
+  MAX_DRIVERS_SEARCH: 10,
 };
 
 // ==========================================
@@ -52,33 +60,30 @@ async function cleanupFailedTripRequest(requestId) {
       return;
     }
 
-    tripRequest.candidates.forEach(candidate => {
-      if (candidate.status === 'offered' || candidate.status === 'pending') {
-        candidate.status = 'rejected';
+    tripRequest.candidates.forEach((candidate) => {
+      if (candidate.status === "offered" || candidate.status === "pending") {
+        candidate.status = "rejected";
         candidate.rejectedAt = new Date();
-        candidate.rejectionReason = 'max_attempts_reached';
+        candidate.rejectionReason = "max_attempts_reached";
       }
     });
 
-    tripRequest.status = 'no_drivers';
+    tripRequest.status = "no_drivers";
     await tripRequest.save();
 
     try {
-      emitter.emit('notification', {
+      emitter.emit("notification", {
         userId: tripRequest.passengerId.toString(),
-        type: 'no_driver_found',
-        title: 'No Drivers Available',
-        body: 'Unable to find a driver after multiple attempts. Please try again later.',
-        data: {
-          requestId: tripRequest._id,
-          reason: 'max_rejections_reached'
-        }
+        type: "no_driver_found",
+        title: "No Drivers Available",
+        body: "Unable to find a driver after multiple attempts. Please try again later.",
+        data: { requestId: tripRequest._id, reason: "max_rejections_reached" },
       });
     } catch (emitErr) {
-      console.error('Notification emit error during cleanup:', emitErr);
+      console.error("Notification emit error during cleanup:", emitErr);
     }
 
-    console.log(`✅ Trip request ${requestId} marked as no_drivers and cleaned up`);
+    console.log(`✅ Trip request ${requestId} marked as no_drivers`);
 
     setTimeout(async () => {
       try {
@@ -88,7 +93,6 @@ async function cleanupFailedTripRequest(requestId) {
         console.error(`❌ Error deleting trip request ${requestId}:`, delErr);
       }
     }, CONFIG.FAILED_TRIP_CLEANUP_MS);
-
   } catch (err) {
     console.error(`❌ Error cleaning up trip request ${requestId}:`, err);
   }
@@ -100,14 +104,18 @@ async function trackRejection(requestId) {
     if (!tripRequest) return false;
 
     const rejectionCount = tripRequest.candidates.filter(
-      c => c.status === 'rejected' &&
-           c.rejectionReason !== 'max_attempts_reached'
+      (c) =>
+        c.status === "rejected" && c.rejectionReason !== "max_attempts_reached",
     ).length;
 
-    console.log(`📊 Trip ${requestId} rejection count: ${rejectionCount}/${CONFIG.MAX_REJECTIONS}`);
+    console.log(
+      `📊 Trip ${requestId} rejection count: ${rejectionCount}/${CONFIG.MAX_REJECTIONS}`,
+    );
 
     if (rejectionCount >= CONFIG.MAX_REJECTIONS) {
-      console.log(`🚫 Trip ${requestId} reached max rejections (${CONFIG.MAX_REJECTIONS}), initiating cleanup`);
+      console.log(
+        `🚫 Trip ${requestId} reached max rejections, initiating cleanup`,
+      );
       await cleanupFailedTripRequest(requestId);
       return true;
     }
@@ -127,22 +135,25 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
-  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-            Math.sin(dLon/2) * Math.sin(dLon/2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) *
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   return R * c;
 }
 
 function toRad(degrees) {
-  return degrees * Math.PI / 180;
+  return (degrees * Math.PI) / 180;
 }
 
 // ==========================================
-// POST /trips/request - CREATE TRIP REQUEST
+// POST /trips/request
 // ==========================================
 
-router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
+router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
   const session = await mongoose.startSession();
   let responsePayload;
   let createdRequestId;
@@ -157,255 +168,236 @@ router.post('/request', requireAuth, requestLimiter, async (req, res, next) => {
         pickup,
         dropoff,
         serviceType,
-        paymentMethod = 'wallet',
+        paymentMethod = "cash",
         radiusMeters = CONFIG.SEARCH_RADIUS_METERS,
         limit = CONFIG.MAX_DRIVERS_SEARCH,
         estimatedFare,
         distance,
         duration,
         pickupAddress,
-        dropoffAddress
+        dropoffAddress,
       } = req.body;
 
-      console.log('🚗 === NEW TRIP REQUEST ===');
-      console.log('Passenger ID:', passengerId);
-      console.log('Service Type:', serviceType);
-      console.log('Estimated Fare:', estimatedFare);
-      console.log('Distance:', distance, 'km');
+      console.log("🚗 === NEW TRIP REQUEST ===");
+      console.log("Passenger ID:", passengerId);
+      console.log("Service Type:", serviceType);
+      console.log("Payment Method:", paymentMethod);
+      console.log("Estimated Fare (naira):", estimatedFare);
+      console.log("Distance:", distance, "km");
 
       if (!pickup || !validateCoordinates(pickup.coordinates)) {
-        throw new Error('Invalid pickup coordinates');
+        throw new Error("Invalid pickup coordinates");
       }
 
       if (!validateServiceType(serviceType)) {
-        throw new Error('Invalid serviceType');
+        throw new Error("Invalid serviceType");
       }
 
       if (estimatedFare && (estimatedFare < 0 || estimatedFare > 1000000)) {
-        throw new Error('Invalid estimated fare');
+        throw new Error("Invalid estimated fare");
       }
 
       if (distance && (distance < 0 || distance > 1000)) {
-        throw new Error('Invalid distance');
+        throw new Error("Invalid distance");
       }
 
       if (duration && (duration < 0 || duration > 24 * 60 * 60)) {
-        throw new Error('Invalid duration');
+        throw new Error("Invalid duration");
       }
 
       const [lng, lat] = pickup.coordinates;
       const now = new Date();
-      const searchRadius = radiusMeters;
-      const lastSeenThreshold = new Date(now.getTime() - CONFIG.DRIVER_LAST_SEEN_THRESHOLD_MS);
+      const lastSeenThreshold = new Date(
+        now.getTime() - CONFIG.DRIVER_LAST_SEEN_THRESHOLD_MS,
+      );
 
-      console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${searchRadius}m`);
+      console.log(
+        `📍 Searching for drivers near [${lat}, ${lng}] within ${radiusMeters}m`,
+      );
 
       let nearbyDrivers = [];
 
       try {
         nearbyDrivers = await User.find({
-          'roles.isDriver': true,
-          'driverProfile.verified': true,
-          'driverProfile.verificationState': 'approved',
-          'driverProfile.isAvailable': true,
-          'driverProfile.lastSeen': { $gte: lastSeenThreshold },
-          'driverProfile.location': {
+          "roles.isDriver": true,
+          "driverProfile.verified": true,
+          "driverProfile.verificationState": "approved",
+          "driverProfile.isAvailable": true,
+          "driverProfile.lastSeen": { $gte: lastSeenThreshold },
+          "driverProfile.location": {
             $near: {
-              $geometry: {
-                type: 'Point',
-                coordinates: [lng, lat]
-              },
-              $maxDistance: searchRadius
-            }
-          }
+              $geometry: { type: "Point", coordinates: [lng, lat] },
+              $maxDistance: radiusMeters,
+            },
+          },
         })
-        .select('_id name driverProfile subscription')
-        .limit(limit)
-        .session(session)
-        .lean();
-
+          .select("_id name driverProfile subscription")
+          .limit(limit)
+          .session(session)
+          .lean();
       } catch (geoError) {
-        console.error('❌ Geospatial query error:', geoError.message);
-        throw new Error('Geospatial service temporarily unavailable');
+        console.error("❌ Geospatial query error:", geoError.message);
+        throw new Error("Geospatial service temporarily unavailable");
       }
 
       console.log(`📊 Found ${nearbyDrivers?.length || 0} nearby drivers`);
 
       const candidates = [];
-      for (const driver of (nearbyDrivers || [])) {
-        const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
+      for (const driver of nearbyDrivers || []) {
+        const supportsService =
+          driver.driverProfile?.serviceCategories?.includes(serviceType);
         if (!supportsService) {
-          console.log(` ⚠️ Driver ${driver._id} doesn't support ${serviceType}`);
+          console.log(
+            ` ⚠️ Driver ${driver._id} doesn't support ${serviceType}`,
+          );
           continue;
         }
-
         candidates.push({
           driverId: driver._id,
-          status: 'pending',
+          status: "pending",
           driverName: driver.name,
           offeredAt: null,
           rejectedAt: null,
-          rejectionReason: null
+          rejectionReason: null,
         });
-
-        console.log(` ✅ Added driver ${driver._id} to candidates list`);
+        console.log(` ✅ Added driver ${driver._id} to candidates`);
       }
 
-      console.log(`✅ ${candidates.length} drivers qualified as candidates`);
+      console.log(`✅ ${candidates.length} drivers qualified`);
 
       let tripRequest;
       if (candidates.length === 0) {
-        tripRequest = await TripRequest.create([{
-          passengerId,
-          pickup,
-          dropoff,
-          serviceType,
-          paymentMethod,
-          estimatedFare: estimatedFare || 0,
-          distance: distance || 0,
-          duration: duration || 0,
-          pickupAddress: pickupAddress || '',
-          dropoffAddress: dropoffAddress || '',
-          candidates: [],
-          status: 'no_drivers',
-          expiresAt: new Date(now.getTime() + 60 * 1000)
-        }], { session });
+        tripRequest = await TripRequest.create(
+          [
+            {
+              passengerId,
+              pickup,
+              dropoff,
+              serviceType,
+              paymentMethod,
+              estimatedFare: estimatedFare || 0,
+              distance: distance || 0,
+              duration: duration || 0,
+              pickupAddress: pickupAddress || "",
+              dropoffAddress: dropoffAddress || "",
+              candidates: [],
+              status: "no_drivers",
+              expiresAt: new Date(now.getTime() + 60 * 1000),
+            },
+          ],
+          { session },
+        );
 
         createdRequestId = tripRequest[0]._id;
-
         responsePayload = {
           requestId: tripRequest[0]._id,
-          message: 'No drivers available'
+          message: "No drivers available",
         };
-
         candidateData = null;
         firstCandidate = null;
-
         return;
       }
 
-      if (candidates.length > 0) {
-        candidates[0].status = 'offered';
-        candidates[0].offeredAt = now;
-        firstCandidate = candidates[0];
-        console.log(`📤 Offering to first driver: ${candidates[0].driverId}`);
-      }
+      candidates[0].status = "offered";
+      candidates[0].offeredAt = now;
+      firstCandidate = candidates[0];
+      console.log(`📤 Offering to first driver: ${candidates[0].driverId}`);
 
-      tripRequest = await TripRequest.create([{
-        passengerId,
-        pickup,
-        dropoff,
-        serviceType,
-        paymentMethod,
-        estimatedFare: estimatedFare || 0,
-        distance: distance || 0,
-        duration: duration || 0,
-        pickupAddress: pickupAddress || '',
-        dropoffAddress: dropoffAddress || '',
-        candidates,
-        status: 'searching',
-        expiresAt: new Date(now.getTime() + CONFIG.SEARCH_TIMEOUT_MS)
-      }], { session });
+      tripRequest = await TripRequest.create(
+        [
+          {
+            passengerId,
+            pickup,
+            dropoff,
+            serviceType,
+            paymentMethod,
+            estimatedFare: estimatedFare || 0,
+            distance: distance || 0,
+            duration: duration || 0,
+            pickupAddress: pickupAddress || "",
+            dropoffAddress: dropoffAddress || "",
+            candidates,
+            status: "searching",
+            expiresAt: new Date(now.getTime() + CONFIG.SEARCH_TIMEOUT_MS),
+          },
+        ],
+        { session },
+      );
 
       const createdRequest = tripRequest[0];
       createdRequestId = createdRequest._id;
-
-      console.log(`✅ Trip request ${createdRequest._id} created with ${candidates.length} candidates`);
 
       responsePayload = {
         requestId: createdRequest._id,
         candidatesCount: candidates.length,
         message: `Searching ${candidates.length} drivers`,
-        estimatedFare: estimatedFare || 0
+        estimatedFare: estimatedFare || 0,
       };
 
       candidateData = {
-        serviceType: serviceType,
+        serviceType,
         estimatedFare: estimatedFare || 0,
         distance: distance || 0,
         duration: duration || 0,
-        pickup: pickup,
-        dropoff: dropoff,
-        pickupAddress: pickupAddress || '',
-        dropoffAddress: dropoffAddress || '',
-        immediateOffer: true
+        pickup,
+        dropoff,
+        pickupAddress: pickupAddress || "",
+        dropoffAddress: dropoffAddress || "",
+        paymentMethod,
+        immediateOffer: true,
       };
     });
 
     res.json(responsePayload);
 
-    if (createdRequestId) {
-      if (firstCandidate) {
-        try {
-          emitter.emit('notification', {
-            userId: firstCandidate.driverId.toString(),
-            type: 'trip_offered',
-            title: 'New Trip Request',
-            body: `New ${candidateData.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
-            data: {
-              requestId: createdRequestId,
-              serviceType: candidateData.serviceType,
-              estimatedFare: candidateData.estimatedFare,
-              distance: candidateData.distance,
-              duration: candidateData.duration,
-              pickup: candidateData.pickup,
-              dropoff: candidateData.dropoff,
-              pickupAddress: candidateData.pickupAddress,
-              dropoffAddress: candidateData.dropoffAddress,
-              immediateOffer: candidateData.immediateOffer
-            }
-          });
-          console.log(`📨 Notification sent to driver ${firstCandidate.driverId}`);
-        } catch (emitErr) {
-          console.error('Notification emit error:', emitErr);
-        }
-      }
-
-      if (firstCandidate) {
-        const firstDriverId = firstCandidate.driverId;
-
-        setTimeout(async () => {
-          try {
-            const fresh = await TripRequest.findById(createdRequestId);
-            if (!fresh || fresh.status !== 'searching') return;
-
-            const cand = fresh.candidates.find(c => c.driverId.toString() === firstDriverId.toString());
-            if (cand && cand.status === 'offered') {
-              cand.status = 'rejected';
-              cand.rejectedAt = new Date();
-              cand.rejectionReason = 'timeout';
-              await fresh.save();
-
-              console.log(`⏱️ First driver ${firstDriverId} timeout, moving to next`);
-              await offerToNext(createdRequestId);
-            }
-          } catch (err) {
-            console.error('Timeout error:', err);
-          }
-        }, CONFIG.OFFER_TIMEOUT_MS);
-      }
-    } else {
+    if (createdRequestId && firstCandidate) {
       try {
-        emitter.emit('notification', {
-          userId: passengerId,
-          type: 'no_driver_found',
-          title: 'No Drivers Available',
-          body: `No ${candidateData?.serviceType || 'service'} drivers are available at this time.`,
-          data: { requestId: createdRequestId }
+        emitter.emit("notification", {
+          userId: firstCandidate.driverId.toString(),
+          type: "trip_offered",
+          title: "New Trip Request",
+          body: `New ${candidateData.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
+          data: {
+            requestId: createdRequestId,
+            ...candidateData,
+          },
         });
+        console.log(
+          `📨 Notification sent to driver ${firstCandidate.driverId}`,
+        );
       } catch (emitErr) {
-        console.error('Notification emit error:', emitErr);
+        console.error("Notification emit error:", emitErr);
       }
+
+      const firstDriverId = firstCandidate.driverId;
+      setTimeout(async () => {
+        try {
+          const fresh = await TripRequest.findById(createdRequestId);
+          if (!fresh || fresh.status !== "searching") return;
+          const cand = fresh.candidates.find(
+            (c) => c.driverId.toString() === firstDriverId.toString(),
+          );
+          if (cand && cand.status === "offered") {
+            cand.status = "rejected";
+            cand.rejectedAt = new Date();
+            cand.rejectionReason = "timeout";
+            await fresh.save();
+            await offerToNext(createdRequestId);
+          }
+        } catch (err) {
+          console.error("Timeout error:", err);
+        }
+      }, CONFIG.OFFER_TIMEOUT_MS);
     }
-
   } catch (err) {
-    await session.abortTransaction();
-    console.error('❌ Trip request error:', err);
-
-    if (err.message.includes('Invalid') || err.message.includes('Unavailable')) {
+    if (session.inTransaction()) await session.abortTransaction();
+    console.error("❌ Trip request error:", err);
+    if (
+      err.message.includes("Invalid") ||
+      err.message.includes("Unavailable")
+    ) {
       return res.status(400).json({ error: { message: err.message } });
     }
-
     next(err);
   } finally {
     await session.endSession();
@@ -421,19 +413,16 @@ async function offerToNext(requestId) {
     console.log(`🔄 offerToNext for ${requestId}`);
 
     const tripRequest = await TripRequest.findById(requestId);
-    if (!tripRequest || tripRequest.status !== 'searching') {
+    if (!tripRequest || tripRequest.status !== "searching") {
       console.log(`❌ Trip ${requestId} not searching or not found`);
       return;
     }
 
     const shouldCleanup = await trackRejection(requestId);
-    if (shouldCleanup) {
-      console.log(`🚫 Trip ${requestId} reached max rejections, cleaning up`);
-      return;
-    }
+    if (shouldCleanup) return;
 
     const nextCandidate = tripRequest.candidates.find(
-      c => c.status === 'pending' && !c.rejectedAt
+      (c) => c.status === "pending" && !c.rejectedAt,
     );
 
     if (!nextCandidate) {
@@ -442,34 +431,23 @@ async function offerToNext(requestId) {
       return;
     }
 
-    const wasRejected = tripRequest.candidates.some(
-      c => c.driverId.equals(nextCandidate.driverId) &&
-           (c.status === 'rejected' || c.rejectedAt)
-    );
-
-    if (wasRejected) {
-      console.log(`🚫 Driver ${nextCandidate.driverId} was already rejected, marking and moving to next`);
-      nextCandidate.status = 'rejected';
-      nextCandidate.rejectedAt = new Date();
-      nextCandidate.rejectionReason = 'already_rejected';
-      await tripRequest.save();
-      return await offerToNext(requestId);
-    }
-
-    nextCandidate.status = 'offered';
+    nextCandidate.status = "offered";
     nextCandidate.offeredAt = new Date();
     await tripRequest.save();
 
     const driverId = nextCandidate.driverId;
-
-    const rejectionCount = tripRequest.candidates.filter(c => c.status === 'rejected').length;
-    console.log(`📤 Offering to driver ${driverId} (Attempt ${rejectionCount + 1}/${CONFIG.MAX_REJECTIONS})`);
+    const rejectionCount = tripRequest.candidates.filter(
+      (c) => c.status === "rejected",
+    ).length;
+    console.log(
+      `📤 Offering to driver ${driverId} (Attempt ${rejectionCount + 1}/${CONFIG.MAX_REJECTIONS})`,
+    );
 
     try {
-      emitter.emit('notification', {
+      emitter.emit("notification", {
         userId: driverId.toString(),
-        type: 'trip_offered',
-        title: 'New Trip Request',
+        type: "trip_offered",
+        title: "New Trip Request",
         body: `New ${tripRequest.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
         data: {
           requestId: tripRequest._id,
@@ -479,67 +457,65 @@ async function offerToNext(requestId) {
           duration: tripRequest.duration || 0,
           pickup: tripRequest.pickup,
           dropoff: tripRequest.dropoff,
-          pickupAddress: tripRequest.pickupAddress || '',
-          dropoffAddress: tripRequest.dropoffAddress || '',
-          immediateOffer: true
-        }
+          pickupAddress: tripRequest.pickupAddress || "",
+          dropoffAddress: tripRequest.dropoffAddress || "",
+          paymentMethod: tripRequest.paymentMethod || "cash",
+          immediateOffer: true,
+        },
       });
     } catch (emitErr) {
-      console.error('Notification emit error in offerToNext:', emitErr);
+      console.error("Notification emit error in offerToNext:", emitErr);
     }
 
     setTimeout(async () => {
       try {
         const fresh = await TripRequest.findById(requestId);
-        if (!fresh || fresh.status !== 'searching') {
-          console.log(`Trip ${requestId} no longer searching, stopping timeout`);
-          return;
-        }
-
-        const cand = fresh.candidates.find(c => c.driverId.toString() === driverId.toString());
-        if (cand && cand.status === 'offered') {
-          console.log(`⏱️ Driver ${driverId} timeout, rejecting`);
-          cand.status = 'rejected';
+        if (!fresh || fresh.status !== "searching") return;
+        const cand = fresh.candidates.find(
+          (c) => c.driverId.toString() === driverId.toString(),
+        );
+        if (cand && cand.status === "offered") {
+          cand.status = "rejected";
           cand.rejectedAt = new Date();
-          cand.rejectionReason = 'timeout';
+          cand.rejectionReason = "timeout";
           await fresh.save();
-
           await offerToNext(requestId);
         }
       } catch (err) {
-        console.error('Timeout error:', err);
+        console.error("Timeout error:", err);
       }
     }, CONFIG.OFFER_TIMEOUT_MS);
-
   } catch (err) {
-    console.error('❌ offerToNext error:', err);
+    console.error("❌ offerToNext error:", err);
   }
 }
 
 // ==========================================
-// GET /trips/request/:requestId - POLL STATUS
+// GET /trips/request/:requestId
 // ==========================================
 
-router.get('/request/:requestId', requireAuth, async (req, res, next) => {
+router.get("/request/:requestId", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { requestId } = req.params;
 
     const tripRequest = await TripRequest.findById(requestId)
-      .populate('passengerId', 'name phone')
-      .populate('assignedDriverId', 'name phone driverProfile')
+      .populate("passengerId", "name phone")
+      .populate("assignedDriverId", "name phone driverProfile")
       .lean();
 
     if (!tripRequest) {
-      return res.status(404).json({ error: { message: 'Trip request not found' } });
+      return res
+        .status(404)
+        .json({ error: { message: "Trip request not found" } });
     }
 
     if (tripRequest.passengerId._id.toString() !== userId) {
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
+      return res.status(403).json({ error: { message: "Unauthorized" } });
     }
 
     let trip = null;
-    if (tripRequest.status === 'assigned' && tripRequest.assignedDriverId) {
+    if (tripRequest.status === "assigned" && tripRequest.assignedDriverId) {
       trip = await Trip.findOne({ tripRequestId: tripRequest._id }).lean();
     }
 
@@ -548,8 +524,8 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
         ...tripRequest,
         _id: trip?._id || tripRequest._id,
         status: trip?.status || tripRequest.status,
-        assignedDriverId: tripRequest.assignedDriverId
-      }
+        assignedDriverId: tripRequest.assignedDriverId,
+      },
     });
   } catch (err) {
     next(err);
@@ -557,340 +533,278 @@ router.get('/request/:requestId', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/accept - DRIVER ACCEPTS
+// POST /trips/accept
 // ==========================================
 
-router.post('/accept', requireAuth, requireActiveSubscription, async (req, res, next) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
+router.post(
+  "/accept",
+  requireAuth,
+  requireActiveSubscription,
+  async (req, res, next) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-  let tripData = null;
-  let notificationData = null;
-  let responseSent = false;
+    let tripData = null;
+    let notificationData = null;
+    let responseSent = false;
 
-  try {
-    const driverId = req.user.sub;
-    const { requestId, idempotencyKey } = req.body;
+    try {
+      const driverId = req.user.sub;
+      const { requestId, idempotencyKey } = req.body;
 
-    if (!requestId) {
-      throw new Error('Request ID is required');
-    }
+      if (!requestId) throw new Error("Request ID is required");
 
-    const finalIdempotencyKey = idempotencyKey || `accept_${requestId}_${driverId}_${Date.now()}`;
+      const finalIdempotencyKey =
+        idempotencyKey || `accept_${requestId}_${driverId}_${Date.now()}`;
 
-    console.log(`🤝 Driver ${driverId} attempting to accept request ${requestId}`);
-    console.log('✅ Subscription verified:', {
-      expiresAt: req.subscription.expiresAt,
-      vehicleType: req.subscription.vehicleType
-    });
-
-    const idempotencyCollection = mongoose.connection.collection('idempotency_keys');
-    const existingKey = await idempotencyCollection.findOne(
-      { key: finalIdempotencyKey },
-      { session }
-    );
-
-    if (existingKey) {
-      console.log('⚠️ Duplicate request detected');
-
-      if (existingKey.status === 'completed' && existingKey.tripId) {
-        console.log('✅ Returning cached trip data');
-        await session.abortTransaction();
-
-        return res.json({
-          success: true,
-          tripId: existingKey.tripId.toString(),
-          requestId: existingKey.requestId.toString(),
-          driverId: driverId.toString(),
-          fromCache: true
-        });
-      } else if (existingKey.status === 'processing') {
-        throw new Error('Request is already being processed');
-      } else {
-        throw new Error('Previous accept attempt failed. Please try again.');
-      }
-    }
-
-    await idempotencyCollection.insertOne({
-      key: finalIdempotencyKey,
-      driverId: driverId,
-      requestId: requestId,
-      status: 'processing',
-      createdAt: new Date(),
-      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
-    }, { session });
-
-    console.log('🔒 Idempotency key inserted');
-
-    const driver = await User.findById(driverId)
-      .select('name driverProfile')
-      .session(session);
-
-    if (!driver) {
-      throw new Error('Driver not found');
-    }
-
-    if (!driver.driverProfile?.isAvailable) {
-      console.log(`⚠️ Driver isAvailable: ${driver.driverProfile?.isAvailable}`);
-      await idempotencyCollection.updateOne(
-        { key: finalIdempotencyKey },
-        { $set: { status: 'failed', error: 'Driver not available' } },
-        { session }
+      console.log(
+        `🤝 Driver ${driverId} attempting to accept request ${requestId}`,
       );
-      throw new Error('Driver is not available');
-    }
 
-    console.log('✅ Driver availability verified');
+      const idempotencyCollection =
+        mongoose.connection.collection("idempotency_keys");
+      const existingKey = await idempotencyCollection.findOne(
+        { key: finalIdempotencyKey },
+        { session },
+      );
 
-    const tripRequest = await TripRequest.findOneAndUpdate(
-      {
-        _id: requestId,
-        status: 'searching',
-        assignedDriverId: null,
-        'candidates': {
-          $elemMatch: {
-            driverId: driverId,
-            status: 'offered'
-          }
+      if (existingKey) {
+        if (existingKey.status === "completed" && existingKey.tripId) {
+          await session.abortTransaction();
+          return res.json({
+            success: true,
+            tripId: existingKey.tripId.toString(),
+            requestId: existingKey.requestId.toString(),
+            driverId,
+            fromCache: true,
+          });
+        } else if (existingKey.status === "processing") {
+          throw new Error("Request is already being processed");
+        } else {
+          throw new Error("Previous accept attempt failed. Please try again.");
         }
-      },
-      {
-        $set: {
-          assignedDriverId: driverId,
-          status: 'assigned',
-          'candidates.$[elem].status': 'accepted',
-          'candidates.$[elem].acceptedAt': new Date()
-        }
-      },
-      {
-        arrayFilters: [{ 'elem.driverId': driverId }],
-        new: true,
-        session
       }
-    );
 
-    if (!tripRequest) {
-      console.log(`❌ Cannot assign trip - checking current state`);
+      await idempotencyCollection.insertOne(
+        {
+          key: finalIdempotencyKey,
+          driverId,
+          requestId,
+          status: "processing",
+          createdAt: new Date(),
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+        },
+        { session },
+      );
 
-      const currentRequest = await TripRequest.findById(requestId).session(session);
-
-      if (!currentRequest) {
+      const driver = await User.findById(driverId)
+        .select("name driverProfile")
+        .session(session);
+      if (!driver) throw new Error("Driver not found");
+      if (!driver.driverProfile?.isAvailable) {
         await idempotencyCollection.updateOne(
           { key: finalIdempotencyKey },
-          { $set: { status: 'failed', error: 'Trip request not found' } },
-          { session }
+          { $set: { status: "failed", error: "Driver not available" } },
+          { session },
         );
-        throw new Error('Trip request not found');
+        throw new Error("Driver is not available");
       }
+
+      const tripRequest = await TripRequest.findOneAndUpdate(
+        {
+          _id: requestId,
+          status: "searching",
+          assignedDriverId: null,
+          candidates: { $elemMatch: { driverId, status: "offered" } },
+        },
+        {
+          $set: {
+            assignedDriverId: driverId,
+            status: "assigned",
+            "candidates.$[elem].status": "accepted",
+            "candidates.$[elem].acceptedAt": new Date(),
+          },
+        },
+        { arrayFilters: [{ "elem.driverId": driverId }], new: true, session },
+      );
+
+      if (!tripRequest) {
+        const currentRequest =
+          await TripRequest.findById(requestId).session(session);
+        if (!currentRequest) {
+          await idempotencyCollection.updateOne(
+            { key: finalIdempotencyKey },
+            { $set: { status: "failed", error: "Trip request not found" } },
+            { session },
+          );
+          throw new Error("Trip request not found");
+        }
+        await idempotencyCollection.updateOne(
+          { key: finalIdempotencyKey },
+          { $set: { status: "failed", error: "Trip no longer available" } },
+          { session },
+        );
+        throw new Error("Trip is no longer available");
+      }
+
+      const tripDoc = await Trip.create(
+        [
+          {
+            passengerId: tripRequest.passengerId,
+            driverId,
+            tripRequestId: tripRequest._id,
+            serviceType: tripRequest.serviceType,
+            paymentMethod: tripRequest.paymentMethod || "cash",
+            pickupLocation: tripRequest.pickup,
+            dropoffLocation: tripRequest.dropoff,
+            status: "assigned",
+            estimatedFare: tripRequest.estimatedFare || 0,
+            distanceKm: tripRequest.distance || 0,
+            durationMinutes: Math.round((tripRequest.duration || 0) / 60),
+            requestedAt: new Date(),
+            metadata: {
+              subscriptionId: req.subscription.id,
+              subscriptionExpiresAt: req.subscription.expiresAt,
+              vehicleType: req.subscription.vehicleType,
+            },
+          },
+        ],
+        { session },
+      );
+
+      const newTrip = tripDoc[0];
+
+      await User.findByIdAndUpdate(
+        driverId,
+        {
+          "driverProfile.isAvailable": false,
+          "driverProfile.currentTripId": newTrip._id,
+        },
+        { session },
+      );
 
       await idempotencyCollection.updateOne(
         { key: finalIdempotencyKey },
-        { $set: { status: 'failed', error: 'Trip no longer available' } },
-        { session }
+        {
+          $set: {
+            status: "completed",
+            tripId: newTrip._id,
+            requestId: tripRequest._id,
+            updatedAt: new Date(),
+          },
+        },
+        { session },
       );
 
-      if (currentRequest.assignedDriverId && currentRequest.assignedDriverId.toString() !== driverId.toString()) {
-        throw new Error('Trip was already assigned to another driver');
-      } else {
-        throw new Error('Trip is no longer available');
-      }
-    }
+      await session.commitTransaction();
 
-    console.log(`✅ Trip ${requestId} atomically assigned to driver ${driverId}`);
+      tripData = {
+        success: true,
+        tripId: newTrip._id.toString(),
+        requestId: tripRequest._id.toString(),
+        driverId,
+        subscription: {
+          expiresAt: req.subscription.expiresAt,
+          vehicleType: req.subscription.vehicleType,
+        },
+      };
 
-    const tripDoc = await Trip.create([{
-      passengerId: tripRequest.passengerId,
-      driverId: driverId,
-      tripRequestId: tripRequest._id,
-      serviceType: tripRequest.serviceType,
-      paymentMethod: tripRequest.paymentMethod || 'wallet',
-      pickupLocation: tripRequest.pickup,
-      dropoffLocation: tripRequest.dropoff,
-      status: 'assigned',
-      estimatedFare: tripRequest.estimatedFare || 0,
-      distanceKm: tripRequest.distance || 0,
-      durationMinutes: Math.round((tripRequest.duration || 0) / 60),
-      requestedAt: new Date(),
-      metadata: {
-        subscriptionId: req.subscription.id,
-        subscriptionExpiresAt: req.subscription.expiresAt,
-        vehicleType: req.subscription.vehicleType
-      }
-    }], { session });
+      notificationData = {
+        passengerId: tripRequest.passengerId.toString(),
+        driverId,
+        tripId: newTrip._id.toString(),
+        requestId: tripRequest._id.toString(),
+        driverName: driver.name || "Driver",
+        serviceType: tripRequest.serviceType,
+        estimatedFare: tripRequest.estimatedFare || 0,
+        pickup: tripRequest.pickup,
+        dropoff: tripRequest.dropoff,
+        pickupAddress: tripRequest.pickupAddress || "",
+        dropoffAddress: tripRequest.dropoffAddress || "",
+      };
 
-    const newTrip = tripDoc[0];
-    console.log(`✅ Trip document ${newTrip._id} created`);
+      res.json(tripData);
+      responseSent = true;
 
-    await User.findByIdAndUpdate(
-      driverId,
-      {
-        'driverProfile.isAvailable': false,
-        'driverProfile.currentTripId': newTrip._id
-      },
-      { session }
-    );
-
-    console.log('✅ Driver status updated');
-
-    await idempotencyCollection.updateOne(
-      { key: finalIdempotencyKey },
-      {
-        $set: {
-          status: 'completed',
-          tripId: newTrip._id,
-          requestId: tripRequest._id,
-          updatedAt: new Date()
-        }
-      },
-      { session }
-    );
-
-    console.log('✅ Idempotency key updated to completed');
-
-    await session.commitTransaction();
-    console.log('✅ Transaction committed successfully');
-
-    tripData = {
-      success: true,
-      tripId: newTrip._id.toString(),
-      requestId: tripRequest._id.toString(),
-      driverId: driverId.toString(),
-      subscription: {
-        expiresAt: req.subscription.expiresAt,
-        vehicleType: req.subscription.vehicleType
-      }
-    };
-
-    notificationData = {
-      passengerId: tripRequest.passengerId.toString(),
-      driverId: driverId.toString(),
-      tripId: newTrip._id.toString(),
-      requestId: tripRequest._id.toString(),
-      driverName: driver.name || 'Driver',
-      serviceType: tripRequest.serviceType,
-      estimatedFare: tripRequest.estimatedFare || 0,
-      pickup: tripRequest.pickup,
-      dropoff: tripRequest.dropoff,
-      pickupAddress: tripRequest.pickupAddress || '',
-      dropoffAddress: tripRequest.dropoffAddress || ''
-    };
-
-    res.json(tripData);
-    responseSent = true;
-    console.log('✅ Response sent to driver');
-
-    // Send notifications (non-blocking)
-    setImmediate(() => {
-      try {
-        emitter.emit('notification', {
-          userId: notificationData.passengerId,
-          type: 'trip_accepted',
-          notificationType: 'trip_accepted',
-          title: 'Driver Accepted!',
-          body: `${notificationData.driverName} is on the way`,
-          data: {
-            requestId: notificationData.requestId,
-            tripId: notificationData.tripId,
-            driverId: notificationData.driverId,
-            driverName: notificationData.driverName,
-            serviceType: notificationData.serviceType,
-            estimatedFare: notificationData.estimatedFare,
-            pickup: notificationData.pickup,
-            dropoff: notificationData.dropoff,
-            pickupAddress: notificationData.pickupAddress,
-            dropoffAddress: notificationData.dropoffAddress
-          }
-        });
-
-        console.log(`📨 Notifications sent for trip ${notificationData.tripId}`);
-      } catch (emitErr) {
-        console.error('❌ Notification error (non-fatal):', emitErr.message);
-      }
-    });
-
-  } catch (error) {
-    if (session.inTransaction()) {
-      await session.abortTransaction();
-      console.log('❌ Transaction aborted');
-    }
-
-    console.error('❌ Accept error:', error.message);
-
-    if (!responseSent) {
-      const errorMessage = error.message || 'Failed to accept ride';
-      let statusCode = 500;
-      let errorCode = 'INTERNAL_ERROR';
-
-      if (errorMessage.includes('not found')) {
-        statusCode = 404;
-        errorCode = 'NOT_FOUND';
-      } else if (
-        errorMessage.includes('not available') ||
-        errorMessage.includes('active trip') ||
-        errorMessage.includes('not offered') ||
-        errorMessage.includes('already assigned') ||
-        errorMessage.includes('already processed')
-      ) {
-        statusCode = 400;
-
-        if (errorMessage.includes('already processed')) {
-          errorCode = 'DUPLICATE_REQUEST';
-        } else if (errorMessage.includes('already assigned')) {
-          errorCode = 'TRIP_ALREADY_ASSIGNED';
-        } else {
-          errorCode = 'TRIP_UNAVAILABLE';
-        }
-      }
-
-      res.status(statusCode).json({
-        success: false,
-        error: {
-          message: errorMessage,
-          code: errorCode
+      setImmediate(() => {
+        try {
+          emitter.emit("notification", {
+            userId: notificationData.passengerId,
+            type: "trip_accepted",
+            notificationType: "trip_accepted",
+            title: "Driver Accepted!",
+            body: `${notificationData.driverName} is on the way`,
+            data: { ...notificationData },
+          });
+        } catch (emitErr) {
+          console.error("❌ Notification error:", emitErr.message);
         }
       });
+    } catch (error) {
+      if (session.inTransaction()) await session.abortTransaction();
+      console.error("❌ Accept error:", error.message);
+
+      if (!responseSent) {
+        let statusCode = 500,
+          errorCode = "INTERNAL_ERROR";
+        if (error.message.includes("not found")) {
+          statusCode = 404;
+          errorCode = "NOT_FOUND";
+        } else if (
+          error.message.includes("not available") ||
+          error.message.includes("no longer available")
+        ) {
+          statusCode = 400;
+          errorCode = "TRIP_UNAVAILABLE";
+        }
+        res
+          .status(statusCode)
+          .json({
+            success: false,
+            error: { message: error.message, code: errorCode },
+          });
+      }
+    } finally {
+      await session.endSession();
     }
-  } finally {
-    await session.endSession();
-  }
-});
+  },
+);
 
 // ==========================================
-// POST /trips/reject - DRIVER REJECTS
+// POST /trips/reject
 // ==========================================
 
-router.post('/reject', requireAuth, async (req, res, next) => {
+router.post("/reject", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const { requestId } = req.body;
 
-    console.log(`🚫 Driver ${driverId} rejecting ${requestId}`);
-
     const tripRequest = await TripRequest.findById(requestId);
-    if (!tripRequest || tripRequest.status !== 'searching') {
-      return res.status(400).json({ error: { message: 'Trip no longer searching' } });
+    if (!tripRequest || tripRequest.status !== "searching") {
+      return res
+        .status(400)
+        .json({ error: { message: "Trip no longer searching" } });
     }
 
     const candidate = tripRequest.candidates.find(
-      c => c.driverId.toString() === driverId && c.status === 'offered'
+      (c) => c.driverId.toString() === driverId && c.status === "offered",
     );
 
     if (!candidate) {
-      return res.status(403).json({ error: { message: 'You were not offered this trip' } });
+      return res
+        .status(403)
+        .json({ error: { message: "You were not offered this trip" } });
     }
 
-    candidate.status = 'rejected';
+    candidate.status = "rejected";
     candidate.rejectedAt = new Date();
-    candidate.rejectionReason = 'manual_rejection';
+    candidate.rejectionReason = "manual_rejection";
     await tripRequest.save();
 
-    console.log(`❌ Driver ${driverId} rejected trip ${requestId}`);
-
     await offerToNext(requestId);
-
     res.json({ success: true });
   } catch (err) {
-    console.error('❌ Reject error:', err);
+    console.error("❌ Reject error:", err);
     next(err);
   }
 });
@@ -900,61 +814,34 @@ router.post('/reject', requireAuth, async (req, res, next) => {
 // ==========================================
 
 const requireAdmin = (req, res, next) => {
-  if (req.user?.roles?.isAdmin) {
-    next();
-  } else {
-    res.status(403).json({ error: { message: 'Admin access required' } });
-  }
+  if (req.user?.roles?.isAdmin) next();
+  else res.status(403).json({ error: { message: "Admin access required" } });
 };
 
 // ==========================================
 // GET /trips/searching - ADMIN
 // ==========================================
 
-router.get('/searching', requireAuth, requireAdmin, async (req, res, next) => {
+router.get("/searching", requireAuth, requireAdmin, async (req, res, next) => {
   try {
-    const searchingTrips = await TripRequest.find({
-      status: 'searching'
-    })
-    .populate('passengerId', 'name phone')
-    .select('_id serviceType pickup dropoff estimatedFare candidates status createdAt expiresAt')
-    .sort({ createdAt: -1 })
-    .lean();
-
-    const formatted = searchingTrips.map(trip => ({
-      requestId: trip._id,
-      passengerName: trip.passengerId?.name || 'Unknown',
-      serviceType: trip.serviceType,
-      estimatedFare: trip.estimatedFare,
-      pickup: trip.pickup,
-      dropoff: trip.dropoff,
-      status: trip.status,
-      createdAt: trip.createdAt,
-      expiresAt: trip.expiresAt,
-      timeUntilExpiry: Math.max(0, trip.expiresAt - new Date()),
-      candidates: trip.candidates.map(c => ({
-        driverId: c.driverId,
-        status: c.status,
-        offeredAt: c.offeredAt,
-        rejectedAt: c.rejectedAt,
-        rejectionReason: c.rejectionReason
-      })),
-      candidateCount: trip.candidates.length,
-      activeOffers: trip.candidates.filter(c => c.status === 'offered').length,
-      rejectedCount: trip.candidates.filter(c => c.status === 'rejected').length
-    }));
+    const searchingTrips = await TripRequest.find({ status: "searching" })
+      .populate("passengerId", "name phone")
+      .select(
+        "_id serviceType pickup dropoff estimatedFare candidates status createdAt expiresAt",
+      )
+      .sort({ createdAt: -1 })
+      .lean();
 
     res.json({
-      count: formatted.length,
-      trips: formatted,
+      count: searchingTrips.length,
+      trips: searchingTrips,
       timestamp: new Date().toISOString(),
       config: {
         OFFER_TIMEOUT_MS: CONFIG.OFFER_TIMEOUT_MS,
-        MAX_REJECTIONS: CONFIG.MAX_REJECTIONS
-      }
+        MAX_REJECTIONS: CONFIG.MAX_REJECTIONS,
+      },
     });
   } catch (err) {
-    console.error('Error in /searching:', err);
     next(err);
   }
 });
@@ -963,28 +850,30 @@ router.get('/searching', requireAuth, requireAdmin, async (req, res, next) => {
 // POST /trips/:tripId/start
 // ==========================================
 
-router.post('/:tripId/start', requireAuth, async (req, res, next) => {
+router.post("/:tripId/start", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId);
 
-    if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
-    if (trip.driverId.toString() !== driverId) return res.status(403).json({ error: { message: 'Unauthorized' } });
+    if (!trip)
+      return res.status(404).json({ error: { message: "Trip not found" } });
+    if (trip.driverId.toString() !== driverId)
+      return res.status(403).json({ error: { message: "Unauthorized" } });
 
-    trip.status = 'started';
+    trip.status = "started";
     trip.startedAt = new Date();
     await trip.save();
 
     try {
-      emitter.emit('notification', {
+      emitter.emit("notification", {
         userId: trip.passengerId.toString(),
-        type: 'trip_started',
-        title: 'Trip Started',
-        body: 'Your driver has started the trip',
-        data: { tripId: trip._id }
+        type: "trip_started",
+        title: "Trip Started",
+        body: "Your driver has started the trip",
+        data: { tripId: trip._id },
       });
     } catch (emitErr) {
-      console.error('Notification emit error:', emitErr);
+      console.error("Notification emit error:", emitErr);
     }
 
     res.json({ trip });
@@ -994,13 +883,17 @@ router.post('/:tripId/start', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/:tripId/complete  — FIXED SECTION ONLY
+// POST /trips/:tripId/complete  ← MAIN FIX
+// ==========================================
 //
-// Replace the entire /:tripId/complete route in your trips.routes.js
-// with this. The rest of the file is unchanged.
+// UNIT CONVENTION:
+//   Trip.estimatedFare  → stored in NAIRA  (frontend sends naira)
+//   Wallet.balance      → stored in KOBO   (Paystack convention)
+//   processTripWalletPayment receives fareNaira and converts internally
+//
 // ==========================================
 
-router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
+router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
 
   try {
@@ -1010,227 +903,268 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 
       console.log(`✅ Completing trip ${tripId} — driver ${driverId}`);
 
-      // ── 1. Load trip ──────────────────────────────────────────────────
-
+      // ── 1. Load trip ─────────────────────────────────────────────────────
       const existingTrip = await Trip.findById(tripId).session(session);
-      if (!existingTrip) throw new Error('Trip not found');
+      if (!existingTrip) throw new Error("Trip not found");
 
       if (existingTrip.driverId.toString() !== driverId) {
-        throw new Error('Unauthorized: You are not the driver for this trip');
+        throw new Error("Unauthorized: You are not the driver for this trip");
       }
 
-      if (['completed', 'cancelled'].includes(existingTrip.status)) {
+      if (["completed", "cancelled"].includes(existingTrip.status)) {
         throw new Error(`Trip is already ${existingTrip.status}`);
       }
 
-      const finalFare = existingTrip.estimatedFare || 0;
-      const paymentMethod = existingTrip.paymentMethod || 'cash';
+      // fareNaira: the fare is stored in NAIRA in Trip.estimatedFare
+      const fareNaira = existingTrip.estimatedFare || 0;
+      const paymentMethod = existingTrip.paymentMethod || "cash";
 
-      // ✅ FIX: Keep passengerId as ObjectId throughout — do NOT toString() early.
-      //         The original bug was casting to string here, then querying Referral
-      //         with a string where ObjectId is expected, causing findOne → null.
+      // Keep passengerId as ObjectId for referral query; use toString() for notifications
       const passengerObjectId = existingTrip.passengerId;
       const passengerIdStr = passengerObjectId.toString();
 
-      console.log(`💰 Fare: ₦${(finalFare / 100).toFixed(2)} | Payment: ${paymentMethod}`);
+      console.log(`💰 Fare: ₦${fareNaira} (naira) | Payment: ${paymentMethod}`);
 
-      // ── 2. Process payment ────────────────────────────────────────────
-
+      // ── 2. Process payment ────────────────────────────────────────────────
       let paymentResult = null;
       let resolvedPaymentMethod = paymentMethod;
 
-      if (paymentMethod === 'wallet') {
+      if (paymentMethod === "wallet") {
         try {
           paymentResult = await processTripWalletPayment(
             {
               tripId,
               passengerId: passengerIdStr,
               driverId,
-              fareKobo: finalFare,
-              serviceType: existingTrip.serviceType
+              fareNaira, // ✅ naira — service converts to kobo internally
+              serviceType: existingTrip.serviceType,
             },
-            session
+            session,
           );
-          console.log(`✅ Wallet payment processed — driver credited ₦${(finalFare / 100).toFixed(2)}`);
+          console.log(
+            `✅ Wallet payment processed — passenger debited ₦${fareNaira}, driver credited ₦${fareNaira}`,
+          );
         } catch (paymentErr) {
-          console.warn(`⚠️ Wallet payment failed (${paymentErr.message}). Falling back to cash.`);
-          resolvedPaymentMethod = 'cash_fallback';
+          console.warn(
+            `⚠️ Wallet payment failed (${paymentErr.message}). Falling back to cash.`,
+          );
+          resolvedPaymentMethod = "cash_fallback";
           paymentResult = null;
         }
       } else {
-        resolvedPaymentMethod = 'cash';
-        paymentResult = null;
-        console.log(`💵 Cash trip — no wallet processing needed`);
+        // Record cash earning for stats (no wallet balance change)
+        try {
+          paymentResult = await recordCashTripEarning(
+            {
+              tripId,
+              driverId,
+              fareNaira,
+              serviceType: existingTrip.serviceType,
+            },
+            session,
+          );
+          console.log(`💵 Cash earning recorded for driver ${driverId}`);
+        } catch (cashErr) {
+          console.warn(
+            `⚠️ Cash earning record failed (non-fatal): ${cashErr.message}`,
+          );
+        }
+        resolvedPaymentMethod = "cash";
       }
 
-      // ── 3. Mark trip completed ────────────────────────────────────────
-
+      // ── 3. Mark trip completed ────────────────────────────────────────────
       const updatedTrip = await Trip.findByIdAndUpdate(
         tripId,
         {
-          status: 'completed',
-          finalFare,
+          status: "completed",
+          finalFare: fareNaira,
           completedAt: new Date(),
           paymentMethod: resolvedPaymentMethod,
           paymentConfirmed: true,
           ...(paymentResult?.passengerTxn && {
-            'metadata.passengerTransactionId': paymentResult.passengerTxn._id
+            "metadata.passengerTransactionId": paymentResult.passengerTxn._id,
           }),
           ...(paymentResult?.driverTxn && {
-            'metadata.driverTransactionId': paymentResult.driverTxn._id
-          })
+            "metadata.driverTransactionId": paymentResult.driverTxn._id,
+          }),
         },
-        { new: true, session }
+        { new: true, session },
       );
 
-      // ── 4. Update driver availability ─────────────────────────────────
-
+      // ── 4. Update driver availability ──────────────────────────────────
       await User.findByIdAndUpdate(
         driverId,
         {
-          'driverProfile.isAvailable': true,
-          $unset: { 'driverProfile.currentTripId': '' },
-          $inc: { 'driverProfile.totalTrips': 1, 'driverProfile.totalEarnings': finalFare }
+          "driverProfile.isAvailable": true,
+          $unset: { "driverProfile.currentTripId": "" },
+          $inc: {
+            "driverProfile.totalTrips": 1,
+            "driverProfile.totalEarnings": fareNaira,
+          },
         },
-        { session }
+        { session },
       );
 
       console.log(`✅ Driver ${driverId} is now available`);
 
-      // ── 5. Check for pending referral ─────────────────────────────────
-      //
-      // ✅ FIX: Query with ObjectId (passengerObjectId), not string.
-      //         This was returning null before because of the type mismatch,
-      //         which meant shouldTriggerReferral was always false.
-
-      const pendingReferral = await mongoose.model('Referral').findOne({
-        refereeId: passengerObjectId,  // ✅ ObjectId — not passengerIdStr
-        status: 'pending'
-      }).session(session);
+      // ── 5. Check for pending referral (use ObjectId!) ─────────────────
+      const pendingReferral = await mongoose
+        .model("Referral")
+        .findOne({
+          refereeId: passengerObjectId, // ✅ ObjectId — not string
+          status: "pending",
+        })
+        .session(session);
 
       const shouldTriggerReferral = !!pendingReferral;
-
       console.log(
-        `🎯 Referral check for passenger ${passengerIdStr}:`,
-        shouldTriggerReferral
-          ? `Pending referral found (${pendingReferral._id})`
-          : 'No pending referral'
+        `🎯 Referral check for ${passengerIdStr}:`,
+        shouldTriggerReferral ? `Found (${pendingReferral._id})` : "None",
       );
 
-      // ── 6. Send response ──────────────────────────────────────────────
-
+      // ── 6. Build driver wallet info for response ────────────────────────
       const driverNewBalance = paymentResult?.driverWallet?.balance ?? null;
 
+      // ── 7. Determine notification messages ─────────────────────────────
+      let passengerNote, driverNote;
+
+      if (resolvedPaymentMethod === "wallet") {
+        passengerNote = `₦${fareNaira.toLocaleString()} was deducted from your wallet.`;
+        driverNote = `₦${fareNaira.toLocaleString()} has been credited to your wallet. No need to collect cash from the passenger.`;
+      } else if (resolvedPaymentMethod === "cash_fallback") {
+        passengerNote = `Wallet payment failed — please pay the driver ₦${fareNaira.toLocaleString()} in cash.`;
+        driverNote = `Wallet payment failed — please collect ₦${fareNaira.toLocaleString()} in cash from the passenger.`;
+      } else {
+        passengerNote = `Please pay the driver ₦${fareNaira.toLocaleString()} in cash.`;
+        driverNote = `Collect ₦${fareNaira.toLocaleString()} in cash from the passenger.`;
+      }
+
+      // ── 8. Send HTTP response ────────────────────────────────────────────
       res.json({
         success: true,
         trip: {
           id: updatedTrip._id.toString(),
           status: updatedTrip.status,
           finalFare: updatedTrip.finalFare,
-          finalFareNaira: (updatedTrip.finalFare / 100).toFixed(2),
           completedAt: updatedTrip.completedAt,
-          paymentMethod: resolvedPaymentMethod
+          paymentMethod: resolvedPaymentMethod,
         },
-        driverWallet: driverNewBalance !== null
-          ? {
-              balance: driverNewBalance,
-              balanceNaira: (driverNewBalance / 100).toFixed(2),
-              balanceFormatted: `₦${(driverNewBalance / 100).toLocaleString()}`
-            }
-          : null,
-        message: 'Trip completed successfully. Driver is now available for new trips.'
+        payment: {
+          method: resolvedPaymentMethod,
+          isWallet: resolvedPaymentMethod === "wallet",
+          isCash: resolvedPaymentMethod === "cash",
+          isFallback: resolvedPaymentMethod === "cash_fallback",
+          fareNaira,
+          fareFormatted: `₦${fareNaira.toLocaleString()}`,
+          // Driver-facing message
+          driverMessage: driverNote,
+          // New driver wallet balance (only for wallet payments)
+          driverWallet:
+            driverNewBalance !== null
+              ? {
+                  balance: driverNewBalance,
+                  balanceNaira: (driverNewBalance / 100).toFixed(2),
+                  balanceFormatted: `₦${(driverNewBalance / 100).toLocaleString()}`,
+                }
+              : null,
+        },
+        message: "Trip completed successfully.",
       });
 
-      // ── 7. Post-commit side effects (non-blocking) ────────────────────
-
+      // ── 9. Post-commit side effects ──────────────────────────────────────
       setImmediate(async () => {
         try {
           if (shouldTriggerReferral) {
-            console.log(`🎁 Triggering referral reward for passenger ${passengerIdStr}`);
             try {
-              // ✅ FIX: Pass passengerIdStr (string) — triggerReferralReward
-              //         now handles the ObjectId cast internally.
-              //         No more circular require — import at top of file instead:
-              //         const { triggerReferralReward } = require('./referral');
-              const referralRouter = require('./referral');
-              await referralRouter.triggerReferralReward(tripId, passengerIdStr);
+              const referralRouter = require("./referral");
+              if (typeof referralRouter.triggerReferralReward === "function") {
+                await referralRouter.triggerReferralReward(
+                  tripId,
+                  passengerIdStr,
+                );
+              }
             } catch (refErr) {
-              console.error('Referral reward error (non-fatal):', refErr.message);
+              console.error(
+                "Referral reward error (non-fatal):",
+                refErr.message,
+              );
             }
           }
 
-          const paymentNote = resolvedPaymentMethod === 'wallet'
-            ? 'Paid from your wallet.'
-            : resolvedPaymentMethod === 'cash_fallback'
-              ? `Insufficient wallet balance — please pay driver ₦${(finalFare / 100).toFixed(2)} in cash.`
-              : 'Cash payment.';
-
-          emitter.emit('notification', {
+          emitter.emit("notification", {
             userId: passengerIdStr,
-            type: 'trip_completed',
-            title: 'Trip Completed',
-            body: `Your trip is done. Fare: ₦${(finalFare / 100).toFixed(2)}. ${paymentNote}`,
+            type: "trip_completed",
+            title: "Trip Completed",
+            body: `Your trip is done. Fare: ₦${fareNaira.toLocaleString()}. ${passengerNote}`,
             data: {
               tripId,
-              fare: finalFare,
-              status: 'completed',
-              paymentMethod: resolvedPaymentMethod
-            }
+              fare: fareNaira,
+              status: "completed",
+              paymentMethod: resolvedPaymentMethod,
+            },
           });
 
-          emitter.emit('notification', {
+          emitter.emit("notification", {
             userId: driverId,
-            type: 'trip_completed',
-            title: 'Trip Completed — Payment Received',
-            body: `You earned ₦${(finalFare / 100).toFixed(2)} for this trip.`,
+            type: "trip_completed",
+            title: "Trip Completed",
+            body: `You earned ₦${fareNaira.toLocaleString()}. ${driverNote}`,
             data: {
               tripId,
-              earned: finalFare,
-              status: 'completed'
-            }
+              earned: fareNaira,
+              status: "completed",
+              paymentMethod: resolvedPaymentMethod,
+              driverMessage: driverNote,
+              isWalletPayment: resolvedPaymentMethod === "wallet",
+            },
           });
 
-          emitter.emit('trip_completed', {
+          emitter.emit("trip_completed", {
             tripId,
             driverId,
             passengerId: passengerIdStr,
-            finalFare,
-            completedAt: new Date()
+            finalFare: fareNaira,
+            completedAt: new Date(),
           });
 
-          console.log(`📨 Post-completion events done for trip ${tripId}`);
+          console.log(
+            `📨 Post-completion notifications sent for trip ${tripId}`,
+          );
         } catch (postErr) {
-          console.error('Post-completion error (non-fatal):', postErr.message);
+          console.error("Post-completion error (non-fatal):", postErr.message);
         }
       });
     }); // end withTransaction
-
   } catch (error) {
-    console.error('❌ Complete trip error:', error.message);
+    console.error("❌ Complete trip error:", error.message);
 
     let statusCode = 500;
-    let errorCode = 'INTERNAL_ERROR';
-    let errorMessage = error.message || 'Failed to complete trip';
+    let errorCode = "INTERNAL_ERROR";
+    let errorMessage = error.message || "Failed to complete trip";
 
-    if (error.message.includes('not found')) {
+    if (error.message.includes("not found")) {
       statusCode = 404;
-      errorCode = 'TRIP_NOT_FOUND';
-    } else if (error.message.includes('Unauthorized')) {
+      errorCode = "TRIP_NOT_FOUND";
+    } else if (error.message.includes("Unauthorized")) {
       statusCode = 403;
-      errorCode = 'UNAUTHORIZED';
-    } else if (error.message.includes('already completed') || error.message.includes('already cancelled')) {
+      errorCode = "UNAUTHORIZED";
+    } else if (
+      error.message.includes("already completed") ||
+      error.message.includes("already cancelled")
+    ) {
       statusCode = 400;
-      errorCode = 'TRIP_ALREADY_ENDED';
-      errorMessage = 'This trip has already been ended.';
-    } else if (error.message.includes('Insufficient wallet balance')) {
+      errorCode = "TRIP_ALREADY_ENDED";
+    } else if (error.message.includes("Insufficient wallet balance")) {
       statusCode = 400;
-      errorCode = 'INSUFFICIENT_BALANCE';
+      errorCode = "INSUFFICIENT_BALANCE";
     }
 
-    res.status(statusCode).json({
-      success: false,
-      error: { message: errorMessage, code: errorCode }
-    });
+    res
+      .status(statusCode)
+      .json({
+        success: false,
+        error: { message: errorMessage, code: errorCode },
+      });
   } finally {
     await session.endSession();
   }
@@ -1240,81 +1174,66 @@ router.post('/:tripId/complete', requireAuth, async (req, res, next) => {
 // POST /trips/:tripId/cancel
 // ==========================================
 
-router.post('/:tripId/cancel', requireAuth, async (req, res, next) => {
+router.post("/:tripId/cancel", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { reason } = req.body;
 
     const trip = await Trip.findById(req.params.tripId);
-    if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
+    if (!trip)
+      return res.status(404).json({ error: { message: "Trip not found" } });
 
     const isPassenger = trip.passengerId.toString() === userId;
     const isDriver = trip.driverId?.toString() === userId;
 
     if (!isPassenger && !isDriver) {
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
+      return res.status(403).json({ error: { message: "Unauthorized" } });
     }
 
-    trip.status = 'cancelled';
+    trip.status = "cancelled";
     trip.cancelledAt = new Date();
-    trip.cancellationReason = reason || (isPassenger ? 'passenger_cancelled' : 'driver_cancelled');
+    trip.cancellationReason =
+      reason || (isPassenger ? "passenger_cancelled" : "driver_cancelled");
     await trip.save();
 
     if (isDriver && trip.driverId) {
       await User.findByIdAndUpdate(trip.driverId, {
-        'driverProfile.isAvailable': true,
-        $unset: { 'driverProfile.currentTripId': '' }
+        "driverProfile.isAvailable": true,
+        $unset: { "driverProfile.currentTripId": "" },
       });
     }
 
-    res.json({
-      success: true,
-      trip,
-      message: 'Trip cancelled successfully'
-    });
-
+    res.json({ success: true, trip, message: "Trip cancelled successfully" });
   } catch (err) {
-    console.error('Cancel error:', err);
-    res.status(500).json({
-      success: false,
-      error: { message: 'Failed to cancel trip' }
-    });
+    console.error("Cancel error:", err);
+    res
+      .status(500)
+      .json({ success: false, error: { message: "Failed to cancel trip" } });
   }
 });
 
 // ==========================================
-// GET /trips/history - GET USER TRIP HISTORY
+// GET /trips/history
 // ==========================================
 
-router.get('/history', requireAuth, async (req, res, next) => {
+router.get("/history", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const {
-      role = 'passenger',
-      status = 'all',
+      role = "passenger",
+      status = "all",
       limit = 50,
       offset = 0,
       startDate,
-      endDate
+      endDate,
     } = req.query;
 
-    console.log(`📊 Fetching trip history for user ${userId} (role: ${role})`);
+    const filter =
+      role === "driver" ? { driverId: userId } : { passengerId: userId };
 
-    const filter = {};
-
-    if (role === 'driver') {
-      filter.driverId = userId;
-    } else {
-      filter.passengerId = userId;
-    }
-
-    if (status === 'completed') {
-      filter.status = 'completed';
-    } else if (status === 'cancelled') {
-      filter.status = 'cancelled';
-    } else {
-      filter.status = { $in: ['completed', 'cancelled'] };
-    }
+    if (status === "completed") filter.status = "completed";
+    else if (status === "cancelled") filter.status = "cancelled";
+    else filter.status = { $in: ["completed", "cancelled"] };
 
     if (startDate || endDate) {
       filter.completedAt = {};
@@ -1326,8 +1245,8 @@ router.get('/history', requireAuth, async (req, res, next) => {
     const parsedOffset = parseInt(offset) || 0;
 
     const trips = await Trip.find(filter)
-      .populate('passengerId', 'name phone profilePicUrl')
-      .populate('driverId', 'name phone profilePicUrl driverProfile')
+      .populate("passengerId", "name phone profilePicUrl")
+      .populate("driverId", "name phone profilePicUrl driverProfile")
       .sort({ completedAt: -1, cancelledAt: -1, createdAt: -1 })
       .limit(parsedLimit)
       .skip(parsedOffset)
@@ -1335,26 +1254,25 @@ router.get('/history', requireAuth, async (req, res, next) => {
 
     const total = await Trip.countDocuments(filter);
 
-    const formattedTrips = trips.map(trip => {
+    const formattedTrips = trips.map((trip) => {
       const isDriver = trip.driverId?._id?.toString() === userId;
-
       return {
         id: trip._id.toString(),
         date: trip.completedAt || trip.cancelledAt || trip.createdAt,
         status: trip.status,
         pickup: {
-          address: trip.pickupLocation?.address || 'Pickup Location',
-          coordinates: trip.pickupLocation?.coordinates
+          address: trip.pickupLocation?.address || "Pickup Location",
+          coordinates: trip.pickupLocation?.coordinates,
         },
         dropoff: {
-          address: trip.dropoffLocation?.address || 'Dropoff Location',
-          coordinates: trip.dropoffLocation?.coordinates
+          address: trip.dropoffLocation?.address || "Dropoff Location",
+          coordinates: trip.dropoffLocation?.coordinates,
         },
         serviceType: trip.serviceType,
         paymentMethod: trip.paymentMethod,
         estimatedFare: trip.estimatedFare,
         finalFare: trip.finalFare,
-        fareInNaira: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
+        fareInNaira: trip.finalFare ? trip.finalFare.toFixed(2) : "0.00",
         distanceKm: trip.distanceKm,
         durationMinutes: trip.durationMinutes,
         requestedAt: trip.requestedAt,
@@ -1362,35 +1280,28 @@ router.get('/history', requireAuth, async (req, res, next) => {
         completedAt: trip.completedAt,
         cancelledAt: trip.cancelledAt,
         cancellationReason: trip.cancellationReason,
-        otherParty: isDriver ? {
-          id: trip.passengerId?._id?.toString(),
-          name: trip.passengerId?.name || 'Passenger',
-          phone: trip.passengerId?.phone,
-          profilePicUrl: trip.passengerId?.profilePicUrl
-        } : {
-          id: trip.driverId?._id?.toString(),
-          name: trip.driverId?.name || 'Driver',
-          phone: trip.driverId?.phone,
-          profilePicUrl: trip.driverId?.profilePicUrl,
-          vehicleInfo: trip.driverId?.driverProfile ? {
-            make: trip.driverId.driverProfile.vehicleMake,
-            model: trip.driverId.driverProfile.vehicleModel,
-            number: trip.driverId.driverProfile.vehicleNumber
-          } : null
-        }
+        otherParty: isDriver
+          ? {
+              id: trip.passengerId?._id?.toString(),
+              name: trip.passengerId?.name || "Passenger",
+              phone: trip.passengerId?.phone,
+              profilePicUrl: trip.passengerId?.profilePicUrl,
+            }
+          : {
+              id: trip.driverId?._id?.toString(),
+              name: trip.driverId?.name || "Driver",
+              phone: trip.driverId?.phone,
+              profilePicUrl: trip.driverId?.profilePicUrl,
+              vehicleInfo: trip.driverId?.driverProfile
+                ? {
+                    make: trip.driverId.driverProfile.vehicleMake,
+                    model: trip.driverId.driverProfile.vehicleModel,
+                    number: trip.driverId.driverProfile.vehicleNumber,
+                  }
+                : null,
+            },
       };
     });
-
-    const stats = {
-      totalTrips: total,
-      completedTrips: await Trip.countDocuments({ ...filter, status: 'completed' }),
-      cancelledTrips: await Trip.countDocuments({ ...filter, status: 'cancelled' }),
-      totalSpent: trips
-        .filter(t => t.status === 'completed')
-        .reduce((sum, t) => sum + (t.finalFare || 0), 0)
-    };
-
-    console.log(`✅ Found ${formattedTrips.length} trips (${total} total)`);
 
     res.json({
       success: true,
@@ -1399,16 +1310,25 @@ router.get('/history', requireAuth, async (req, res, next) => {
         total,
         limit: parsedLimit,
         offset: parsedOffset,
-        hasMore: total > parsedOffset + parsedLimit
+        hasMore: total > parsedOffset + parsedLimit,
       },
       stats: {
-        ...stats,
-        totalSpentInNaira: (stats.totalSpent / 100).toFixed(2)
-      }
+        totalTrips: total,
+        completedTrips: await Trip.countDocuments({
+          ...filter,
+          status: "completed",
+        }),
+        cancelledTrips: await Trip.countDocuments({
+          ...filter,
+          status: "cancelled",
+        }),
+        totalSpent: trips
+          .filter((t) => t.status === "completed")
+          .reduce((s, t) => s + (t.finalFare || 0), 0),
+      },
     });
-
   } catch (err) {
-    console.error('❌ Trip history error:', err);
+    console.error("❌ Trip history error:", err);
     next(err);
   }
 });
@@ -1417,71 +1337,57 @@ router.get('/history', requireAuth, async (req, res, next) => {
 // GET /trips/history/stats
 // ==========================================
 
-router.get('/history/stats', requireAuth, async (req, res, next) => {
+router.get("/history/stats", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
-    const { role = 'passenger', period = 'month' } = req.query;
-
-    console.log(`📊 Fetching trip stats for user ${userId} (period: ${period})`);
+    const { role = "passenger", period = "month" } = req.query;
 
     const now = new Date();
     let startDate;
+    if (period === "week")
+      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    else if (period === "month")
+      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    else if (period === "year")
+      startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
 
-    switch (period) {
-      case 'week':
-        startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-        break;
-      case 'month':
-        startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-        break;
-      case 'year':
-        startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
-        break;
-      default:
-        startDate = null;
-    }
+    const filter =
+      role === "driver" ? { driverId: userId } : { passengerId: userId };
+    if (startDate) filter.completedAt = { $gte: startDate };
 
-    const filter = role === 'driver'
-      ? { driverId: userId }
-      : { passengerId: userId };
-
-    if (startDate) {
-      filter.completedAt = { $gte: startDate };
-    }
-
-    const completedFilter = { ...filter, status: 'completed' };
+    const completedFilter = { ...filter, status: "completed" };
 
     const [
       completedTrips,
       cancelledTrips,
-      totalDistanceResult,
-      totalFareResult,
-      serviceTypeBreakdown
+      totalDistRes,
+      totalFareRes,
+      serviceBreakdown,
     ] = await Promise.all([
       Trip.countDocuments(completedFilter),
-      Trip.countDocuments({ ...filter, status: 'cancelled' }),
+      Trip.countDocuments({ ...filter, status: "cancelled" }),
       Trip.aggregate([
         { $match: completedFilter },
-        { $group: { _id: null, total: { $sum: '$distanceKm' } } }
+        { $group: { _id: null, total: { $sum: "$distanceKm" } } },
       ]),
       Trip.aggregate([
         { $match: completedFilter },
-        { $group: { _id: null, total: { $sum: '$finalFare' } } }
+        { $group: { _id: null, total: { $sum: "$finalFare" } } },
       ]),
       Trip.aggregate([
         { $match: completedFilter },
         {
           $group: {
-            _id: '$serviceType',
+            _id: "$serviceType",
             count: { $sum: 1 },
-            totalFare: { $sum: '$finalFare' }
-          }
-        }
-      ])
+            totalFare: { $sum: "$finalFare" },
+          },
+        },
+      ]),
     ]);
 
-    const totalDistance = totalDistanceResult[0]?.total || 0;
-    const totalFare = totalFareResult[0]?.total || 0;
+    const totalDistance = totalDistRes[0]?.total || 0;
+    const totalFare = totalFareRes[0]?.total || 0;
 
     res.json({
       success: true,
@@ -1492,22 +1398,16 @@ router.get('/history/stats', requireAuth, async (req, res, next) => {
         cancelledTrips,
         totalDistance: parseFloat(totalDistance.toFixed(2)),
         totalFare,
-        totalFareInNaira: (totalFare / 100).toFixed(2),
+        totalFareFormatted: `₦${totalFare.toLocaleString()}`,
         averageFare: completedTrips > 0 ? totalFare / completedTrips : 0,
-        averageFareInNaira: completedTrips > 0
-          ? ((totalFare / completedTrips) / 100).toFixed(2)
-          : '0.00',
-        serviceTypeBreakdown: serviceTypeBreakdown.map(item => ({
-          serviceType: item._id,
-          count: item.count,
-          totalFare: item.totalFare,
-          totalFareInNaira: (item.totalFare / 100).toFixed(2)
-        }))
-      }
+        serviceTypeBreakdown: serviceBreakdown.map((i) => ({
+          serviceType: i._id,
+          count: i.count,
+          totalFare: i.totalFare,
+        })),
+      },
     });
-
   } catch (err) {
-    console.error('❌ Trip stats error:', err);
     next(err);
   }
 });
@@ -1516,94 +1416,30 @@ router.get('/history/stats', requireAuth, async (req, res, next) => {
 // GET /trips/history/:tripId
 // ==========================================
 
-router.get('/history/:tripId', requireAuth, async (req, res, next) => {
+router.get("/history/:tripId", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
-    const { tripId } = req.params;
-
-    console.log(`📄 Fetching trip details: ${tripId}`);
-
-    const trip = await Trip.findById(tripId)
-      .populate('passengerId', 'name phone profilePicUrl')
-      .populate('driverId', 'name phone profilePicUrl driverProfile')
+    const trip = await Trip.findById(req.params.tripId)
+      .populate("passengerId", "name phone profilePicUrl")
+      .populate("driverId", "name phone profilePicUrl driverProfile")
       .lean();
 
-    if (!trip) {
-      return res.status(404).json({
-        success: false,
-        error: { message: 'Trip not found' }
-      });
-    }
+    if (!trip)
+      return res
+        .status(404)
+        .json({ success: false, error: { message: "Trip not found" } });
 
     const isPassenger = trip.passengerId?._id?.toString() === userId;
     const isDriver = trip.driverId?._id?.toString() === userId;
 
     if (!isPassenger && !isDriver) {
-      return res.status(403).json({
-        success: false,
-        error: { message: 'Unauthorized access to this trip' }
-      });
+      return res
+        .status(403)
+        .json({ success: false, error: { message: "Unauthorized" } });
     }
 
-    const detailedTrip = {
-      id: trip._id.toString(),
-      status: trip.status,
-      passenger: {
-        id: trip.passengerId?._id?.toString(),
-        name: trip.passengerId?.name || 'Passenger',
-        phone: trip.passengerId?.phone,
-        profilePicUrl: trip.passengerId?.profilePicUrl
-      },
-      driver: {
-        id: trip.driverId?._id?.toString(),
-        name: trip.driverId?.name || 'Driver',
-        phone: trip.driverId?.phone,
-        profilePicUrl: trip.driverId?.profilePicUrl,
-        vehicle: trip.driverId?.driverProfile ? {
-          make: trip.driverId.driverProfile.vehicleMake,
-          model: trip.driverId.driverProfile.vehicleModel,
-          number: trip.driverId.driverProfile.vehicleNumber
-        } : null
-      },
-      pickup: {
-        address: trip.pickupLocation?.address || 'Pickup Location',
-        coordinates: trip.pickupLocation?.coordinates
-      },
-      dropoff: {
-        address: trip.dropoffLocation?.address || 'Dropoff Location',
-        coordinates: trip.dropoffLocation?.coordinates
-      },
-      serviceType: trip.serviceType,
-      paymentMethod: trip.paymentMethod,
-      paymentConfirmed: trip.paymentConfirmed,
-      estimatedFare: trip.estimatedFare,
-      finalFare: trip.finalFare,
-      commission: trip.commission,
-      driverEarnings: trip.driverEarnings,
-      fareBreakdown: {
-        estimated: (trip.estimatedFare / 100).toFixed(2),
-        final: trip.finalFare ? (trip.finalFare / 100).toFixed(2) : '0.00',
-        commission: trip.commission ? (trip.commission / 100).toFixed(2) : '0.00',
-        driverEarnings: trip.driverEarnings ? (trip.driverEarnings / 100).toFixed(2) : '0.00'
-      },
-      distanceKm: trip.distanceKm,
-      durationMinutes: trip.durationMinutes,
-      requestedAt: trip.requestedAt,
-      startedAt: trip.startedAt,
-      completedAt: trip.completedAt,
-      cancelledAt: trip.cancelledAt,
-      cancellationReason: trip.cancellationReason,
-      completionNotes: trip.completionNotes,
-      tripRequestId: trip.tripRequestId?.toString()
-    };
-
-    res.json({
-      success: true,
-      trip: detailedTrip
-    });
-
+    res.json({ success: true, trip });
   } catch (err) {
-    console.error('❌ Trip detail error:', err);
     next(err);
   }
 });
@@ -1612,18 +1448,18 @@ router.get('/history/:tripId', requireAuth, async (req, res, next) => {
 // GET /trips/:tripId
 // ==========================================
 
-router.get('/:tripId', requireAuth, async (req, res, next) => {
+router.get("/:tripId", requireAuth, async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.tripId).lean();
-    if (!trip) return res.status(404).json({ error: { message: 'Trip not found' } });
+    if (!trip)
+      return res.status(404).json({ error: { message: "Trip not found" } });
 
     const userId = req.user.sub;
-    const isPassenger = trip.passengerId.toString() === userId;
-    const isDriver = trip.driverId?.toString() === userId;
-
-    if (!isPassenger && !isDriver) {
-      return res.status(403).json({ error: { message: 'Unauthorized' } });
-    }
+    const isAuth =
+      trip.passengerId.toString() === userId ||
+      trip.driverId?.toString() === userId;
+    if (!isAuth)
+      return res.status(403).json({ error: { message: "Unauthorized" } });
 
     res.json({ trip });
   } catch (err) {
@@ -1635,18 +1471,17 @@ router.get('/:tripId', requireAuth, async (req, res, next) => {
 // GET /trips
 // ==========================================
 
-router.get('/', requireAuth, async (req, res, next) => {
+router.get("/", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
-    const { role = 'passenger', limit = 50, offset = 0 } = req.query;
-
-    const filter = role === 'driver' ? { driverId: userId } : { passengerId: userId };
+    const { role = "passenger", limit = 50, offset = 0 } = req.query;
+    const filter =
+      role === "driver" ? { driverId: userId } : { passengerId: userId };
     const trips = await Trip.find(filter)
       .sort({ requestedAt: -1 })
       .limit(parseInt(limit))
       .skip(parseInt(offset))
       .lean();
-
     res.json({ trips, total: await Trip.countDocuments(filter) });
   } catch (err) {
     next(err);
@@ -1654,41 +1489,38 @@ router.get('/', requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// PERIODIC CLEANUP JOB
+// PERIODIC CLEANUP
 // ==========================================
 
 function startPeriodicCleanup() {
-  setInterval(async () => {
-    try {
-      const now = new Date();
+  setInterval(
+    async () => {
+      try {
+        const now = new Date();
+        const expired = await TripRequest.find({
+          status: "searching",
+          expiresAt: { $lt: now },
+        }).lean();
+        for (const req of expired) await cleanupFailedTripRequest(req._id);
 
-      const expired = await TripRequest.find({
-        status: 'searching',
-        expiresAt: { $lt: now }
-      }).lean();
+        const deleted = await TripRequest.deleteMany({
+          status: "no_drivers",
+          createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) },
+        });
+        if (deleted.deletedCount > 0)
+          console.log(
+            `🗑️ Deleted ${deleted.deletedCount} old no_drivers requests`,
+          );
 
-      for (const req of expired) {
-        console.log(`🧹 Cleaning up expired trip request: ${req._id}`);
-        await cleanupFailedTripRequest(req._id);
+        await mongoose.connection
+          .collection("idempotency_keys")
+          .deleteMany({ expiresAt: { $lt: now } });
+      } catch (err) {
+        console.error("Cleanup error:", err);
       }
-
-      const deleted = await TripRequest.deleteMany({
-        status: 'no_drivers',
-        createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) }
-      });
-
-      if (deleted.deletedCount > 0) {
-        console.log(`🗑️ Deleted ${deleted.deletedCount} old no_drivers requests`);
-      }
-
-      await mongoose.connection.collection('idempotency_keys').deleteMany({
-        expiresAt: { $lt: now }
-      });
-
-    } catch (err) {
-      console.error('Cleanup error:', err);
-    }
-  }, 5 * 60 * 1000);
+    },
+    5 * 60 * 1000,
+  );
 }
 
 startPeriodicCleanup();
@@ -1697,170 +1529,90 @@ startPeriodicCleanup();
 // ADMIN ENDPOINTS
 // ==========================================
 
-router.post('/admin/flush-trips', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const deleted = await TripRequest.deleteMany({
-      expiresAt: { $lt: new Date() }
-    });
+router.post(
+  "/admin/flush-trips",
+  requireAuth,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const deleted = await TripRequest.deleteMany({
+        expiresAt: { $lt: new Date() },
+      });
+      res.json({ success: true, deletedCount: deleted.deletedCount });
+    } catch (err) {
+      res.status(500).json({ error: { message: "Flush failed" } });
+    }
+  },
+);
 
-    res.json({
-      success: true,
-      deletedCount: deleted.deletedCount,
-      message: `Deleted ${deleted.deletedCount} expired trip requests`
-    });
-  } catch (err) {
-    console.error('Flush error:', err);
-    res.status(500).json({ error: { message: 'Flush failed' } });
-  }
-});
-
-router.get('/admin/config', requireAuth, requireAdmin, async (req, res) => {
+router.get("/admin/config", requireAuth, requireAdmin, async (req, res) => {
   res.json({
     config: CONFIG,
     timestamp: new Date().toISOString(),
     stats: {
-      searchingTrips: await TripRequest.countDocuments({ status: 'searching' }),
+      searchingTrips: await TripRequest.countDocuments({ status: "searching" }),
       activeTrips: await Trip.countDocuments({
-        status: { $in: ['assigned', 'started', 'in_progress'] }
-      })
-    }
+        status: { $in: ["assigned", "started", "in_progress"] },
+      }),
+    },
   });
 });
 
-router.post('/admin/cleanup-all-drivers', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    console.log('🧹 Starting cleanup of all driver states');
-
-    const driversWithTrips = await User.find({
-      'driverProfile.currentTripId': { $exists: true, $ne: null }
-    }).select('_id name driverProfile');
-
-    const results = {
-      total: driversWithTrips.length,
-      cleaned: 0,
-      active: 0,
-      errors: []
-    };
-
-    for (const driver of driversWithTrips) {
-      try {
-        const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
-          .select('status');
-
-        if (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status)) {
-          await User.findByIdAndUpdate(driver._id, {
-            'driverProfile.isAvailable': true,
-            $unset: { 'driverProfile.currentTripId': '' }
-          });
-
-          results.cleaned++;
-          console.log(`✅ Cleaned up driver ${driver._id} (${driver.name})`);
-        } else {
-          results.active++;
-          console.log(`⏩ Driver ${driver._id} has active trip ${currentTrip.status}`);
-        }
-      } catch (err) {
-        results.errors.push({
-          driverId: driver._id,
-          error: err.message
-        });
-        console.error(`❌ Error cleaning driver ${driver._id}:`, err.message);
-      }
-    }
-
-    console.log('✅ Cleanup complete:', results);
-
-    res.json({
-      success: true,
-      message: 'Driver state cleanup complete',
-      results
-    });
-
-  } catch (err) {
-    console.error('Admin cleanup error:', err);
-    res.status(500).json({ error: { message: 'Cleanup failed' } });
-  }
-});
-
-// ==========================================
-// DRIVER STATE ENDPOINTS
-// ==========================================
-
-router.post('/drivers/cleanup-state', requireAuth, async (req, res) => {
+router.post("/drivers/cleanup-state", requireAuth, async (req, res) => {
   try {
     const driverId = req.user.sub;
-
-    console.log(`🧹 Cleaning up state for driver ${driverId}`);
-
-    const driver = await User.findById(driverId).select('driverProfile');
-
-    if (!driver) {
-      return res.status(404).json({ error: { message: 'Driver not found' } });
-    }
+    const driver = await User.findById(driverId).select("driverProfile");
+    if (!driver)
+      return res.status(404).json({ error: { message: "Driver not found" } });
 
     let cleaned = false;
     const issues = [];
 
     if (driver.driverProfile?.currentTripId) {
-      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
-        .select('status');
-
-      if (!currentTrip) {
-        issues.push('Trip not found - removing stale reference');
+      const currentTrip = await Trip.findById(
+        driver.driverProfile.currentTripId,
+      ).select("status");
+      if (
+        !currentTrip ||
+        ["completed", "cancelled"].includes(currentTrip?.status)
+      ) {
         cleaned = true;
-      } else if (['completed', 'cancelled'].includes(currentTrip.status)) {
-        issues.push(`Trip ${currentTrip.status} - removing stale reference`);
-        cleaned = true;
+        issues.push(
+          !currentTrip
+            ? "Trip not found — removing stale ref"
+            : `Trip ${currentTrip.status} — removing stale ref`,
+        );
       } else {
-        issues.push(`Trip is ${currentTrip.status} - keeping reference`);
+        issues.push(`Trip is ${currentTrip.status} — keeping ref`);
       }
     }
 
     if (cleaned) {
       await User.findByIdAndUpdate(driverId, {
-        'driverProfile.isAvailable': true,
-        $unset: { 'driverProfile.currentTripId': '' }
-      });
-
-      console.log(`✅ Driver ${driverId} state cleaned up`);
-
-      res.json({
-        success: true,
-        message: 'Driver state cleaned up successfully',
-        issues,
-        cleaned: true
-      });
-    } else {
-      res.json({
-        success: true,
-        message: 'No cleanup needed',
-        issues,
-        cleaned: false
+        "driverProfile.isAvailable": true,
+        $unset: { "driverProfile.currentTripId": "" },
       });
     }
 
+    res.json({ success: true, cleaned, issues });
   } catch (err) {
-    console.error('Cleanup error:', err);
-    res.status(500).json({ error: { message: 'Cleanup failed' } });
+    res.status(500).json({ error: { message: "Cleanup failed" } });
   }
 });
 
-router.get('/drivers/current-state', requireAuth, async (req, res) => {
+router.get("/drivers/current-state", requireAuth, async (req, res) => {
   try {
     const driverId = req.user.sub;
-
     const driver = await User.findById(driverId)
-      .select('name driverProfile')
+      .select("name driverProfile")
       .lean();
-
-    if (!driver) {
-      return res.status(404).json({ error: { message: 'Driver not found' } });
-    }
+    if (!driver)
+      return res.status(404).json({ error: { message: "Driver not found" } });
 
     let currentTrip = null;
     if (driver.driverProfile?.currentTripId) {
       currentTrip = await Trip.findById(driver.driverProfile.currentTripId)
-        .select('status requestedAt startedAt completedAt cancelledAt')
+        .select("status requestedAt startedAt completedAt cancelledAt")
         .lean();
     }
 
@@ -1869,37 +1621,32 @@ router.get('/drivers/current-state', requireAuth, async (req, res) => {
       name: driver.name,
       isAvailable: driver.driverProfile?.isAvailable,
       currentTripId: driver.driverProfile?.currentTripId?.toString() || null,
-      currentTrip: currentTrip ? {
-        id: currentTrip._id,
-        status: currentTrip.status,
-        requestedAt: currentTrip.requestedAt,
-        startedAt: currentTrip.startedAt,
-        completedAt: currentTrip.completedAt,
-        cancelledAt: currentTrip.cancelledAt
-      } : null,
-      needsCleanup: driver.driverProfile?.currentTripId &&
-                    (!currentTrip || ['completed', 'cancelled'].includes(currentTrip?.status))
+      currentTrip,
+      needsCleanup:
+        driver.driverProfile?.currentTripId &&
+        (!currentTrip ||
+          ["completed", "cancelled"].includes(currentTrip?.status)),
     });
-
   } catch (err) {
-    console.error('Get state error:', err);
-    res.status(500).json({ error: { message: 'Failed to get state' } });
+    res.status(500).json({ error: { message: "Failed to get state" } });
   }
 });
 
 // ==========================================
-// CREATE INDEXES
+// INDEX CREATION
 // ==========================================
 
 async function createIndexes() {
   try {
-    await mongoose.connection.collection('idempotency_keys').createIndex(
-      { key: 1 },
-      { unique: true, expireAfterSeconds: 24 * 60 * 60 }
-    );
-    console.log('✅ Idempotency key index created');
+    await mongoose.connection
+      .collection("idempotency_keys")
+      .createIndex(
+        { key: 1 },
+        { unique: true, expireAfterSeconds: 24 * 60 * 60 },
+      );
+    console.log("✅ Idempotency key index created");
   } catch (err) {
-    console.log('Index creation error (may already exist):', err.message);
+    console.log("Index creation note:", err.message);
   }
 }
 

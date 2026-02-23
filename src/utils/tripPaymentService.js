@@ -11,6 +11,13 @@
 //
 // The referral bonus is just wallet credit the passenger already has.
 // From the driver's perspective it makes no difference — they earn the full amount.
+//
+// IMPORTANT UNIT NOTE:
+// ─────────────────────────────────────────────────────────────────────────────
+// fareNaira in this function is the actual value coming from Trip.estimatedFare
+// stored in NAIRA (not kobo). The wallet balance is stored in KOBO by Paystack convention.
+// So we convert: fareKobo = fareNaira * 100 for wallet operations.
+// ─────────────────────────────────────────────────────────────────────────────
 
 const mongoose = require('mongoose');
 const Wallet = require('../models/wallet.model');
@@ -23,21 +30,30 @@ const Transaction = require('../models/transaction.model');
  * @param {string} params.tripId
  * @param {string} params.passengerId
  * @param {string} params.driverId
- * @param {number} params.fareKobo         - Final fare in kobo (smallest unit)
+ * @param {number} params.fareNaira         - Final fare in NAIRA (as stored in Trip)
  * @param {string} params.serviceType
- * @param {Object} session                 - Mongoose session (must be active)
+ * @param {Object} session                   - Mongoose session (must be active)
  *
  * @returns {{ passengerTxn, driverTxn, driverWallet }}
  * @throws  Error if passenger wallet has insufficient balance
  */
-async function processTripWalletPayment({ tripId, passengerId, driverId, fareKobo, serviceType }, session) {
-  console.log(`💳 Processing wallet payment for trip ${tripId}: ₦${(fareKobo / 100).toFixed(2)}`);
+async function processTripWalletPayment({ tripId, passengerId, driverId, fareNaira, serviceType }, session) {
+  console.log(`💳 Processing wallet payment for trip ${tripId}: ₦${fareNaira}`);
+
+  // Convert to kobo for wallet operations
+  const fareKobo = Math.round(fareNaira * 100);
+  
+  if (!fareKobo || fareKobo <= 0) {
+    throw new Error(`Invalid fare: ${fareNaira} naira`);
+  }
+
+  const passengerObjectId = new mongoose.Types.ObjectId(passengerId);
+  const driverObjectId = new mongoose.Types.ObjectId(driverId);
 
   // ── 1. Load both wallets ──────────────────────────────────────────────────
-
   const [passengerWallet, driverWallet] = await Promise.all([
-    Wallet.findOne({ owner: passengerId }).session(session),
-    Wallet.findOne({ owner: driverId }).session(session)
+    Wallet.findOne({ owner: passengerObjectId }).session(session),
+    Wallet.findOne({ owner: driverObjectId }).session(session)
   ]);
 
   if (!passengerWallet) {
@@ -49,181 +65,159 @@ async function processTripWalletPayment({ tripId, passengerId, driverId, fareKob
   if (!resolvedDriverWallet) {
     console.log(`⚠️ Driver ${driverId} has no wallet — creating one`);
     const created = await Wallet.create([{
-      owner: driverId,
+      owner: driverObjectId,
       balance: 0,
       currency: 'NGN'
     }], { session });
     resolvedDriverWallet = created[0];
   }
 
-  // ── 2. Check passenger has enough balance ────────────────────────────────
-  //
-  // The passenger's wallet may hold a mix of:
-  //   - Regular funded balance (from Paystack top-ups)
-  //   - Referral bonus credits
-  // We treat them identically — the total balance is what matters.
+  console.log(`👛 Passenger wallet balance: ${passengerWallet.balance} kobo (₦${(passengerWallet.balance / 100).toFixed(2)})`);
+  console.log(`💰 Fare required: ${fareKobo} kobo (₦${fareNaira})`);
 
+  // ── 2. Check passenger has enough balance ────────────────────────────────
   if (passengerWallet.balance < fareKobo) {
     const shortfall = fareKobo - passengerWallet.balance;
     throw new Error(
       `Insufficient wallet balance. ` +
       `Available: ₦${(passengerWallet.balance / 100).toFixed(2)}, ` +
-      `Required: ₦${(fareKobo / 100).toFixed(2)}, ` +
+      `Required: ₦${fareNaira}, ` +
       `Shortfall: ₦${(shortfall / 100).toFixed(2)}`
     );
   }
 
   // ── 3. Debit passenger ───────────────────────────────────────────────────
-
   const passengerBalanceBefore = passengerWallet.balance;
   passengerWallet.balance -= fareKobo;
   await passengerWallet.save({ session });
 
   console.log(
-    `➖ Passenger ${passengerId} debited ₦${(fareKobo / 100).toFixed(2)}. ` +
+    `➖ Passenger ${passengerId} debited ₦${fareNaira}. ` +
     `Balance: ₦${(passengerBalanceBefore / 100).toFixed(2)} → ₦${(passengerWallet.balance / 100).toFixed(2)}`
   );
 
   // ── 4. Credit driver (full fare — always) ────────────────────────────────
-  //
-  // Even if the passenger paid using a referral bonus, the driver receives
-  // the full fare. The "cost" of the bonus is absorbed by the platform
-  // (the referral credit was issued from the platform, not from the driver).
-
   const driverBalanceBefore = resolvedDriverWallet.balance;
   resolvedDriverWallet.balance += fareKobo;
   await resolvedDriverWallet.save({ session });
 
   console.log(
-    `➕ Driver ${driverId} credited ₦${(fareKobo / 100).toFixed(2)}. ` +
+    `➕ Driver ${driverId} credited ₦${fareNaira}. ` +
     `Balance: ₦${(driverBalanceBefore / 100).toFixed(2)} → ₦${(resolvedDriverWallet.balance / 100).toFixed(2)}`
   );
 
   // ── 5. Create transaction records ────────────────────────────────────────
-  //
-  // We create the passenger record first so we can link the driver record back to it.
-
-  const [passengerTxnArr] = await Transaction.create([
-    {
-      userId: passengerId,
-      type: 'debit',
-      amount: fareKobo,
-      description: `Ride payment — ${serviceType} trip`,
-      category: 'ride_payment',
-      status: 'completed',
-      balanceBefore: passengerBalanceBefore,
-      balanceAfter: passengerWallet.balance,
-      metadata: {
-        tripId: tripId.toString(),
-        driverId: driverId.toString(),
-        fareKobo,
-        paymentMethod: 'wallet'
-      }
+  const [passengerTxn] = await Transaction.create([{
+    userId: passengerObjectId,
+    type: 'debit',
+    amount: fareKobo,
+    description: `Ride payment — ${serviceType || 'ride'} trip`,
+    category: 'trip_payment',
+    status: 'completed',
+    balanceBefore: passengerBalanceBefore,
+    balanceAfter: passengerWallet.balance,
+    metadata: {
+      tripId: tripId.toString(),
+      driverId: driverId.toString(),
+      serviceType,
+      fareNaira,
     }
-  ], { session });
+  }], { session });
 
-  // Driver transaction references the passenger transaction
-  const [driverTxnArr] = await Transaction.create([
-    {
-      userId: driverId,
-      type: 'credit',
-      amount: fareKobo,
-      description: `Ride earnings — ${serviceType} trip`,
-      category: 'ride_earning',
-      status: 'completed',
-      balanceBefore: driverBalanceBefore,
-      balanceAfter: resolvedDriverWallet.balance,
-      relatedTransactionId: passengerTxnArr._id,
-      metadata: {
-        tripId: tripId.toString(),
-        passengerId: passengerId.toString(),
-        fareKobo,
-        paymentMethod: 'wallet'
-      }
+  const [driverTxn] = await Transaction.create([{
+    userId: driverObjectId,
+    type: 'credit',
+    amount: fareKobo,
+    description: `Ride earnings — ${serviceType || 'ride'} trip`,
+    category: 'trip_earning',
+    status: 'completed',
+    balanceBefore: driverBalanceBefore,
+    balanceAfter: resolvedDriverWallet.balance,
+    relatedTransactionId: passengerTxn._id,
+    metadata: {
+      tripId: tripId.toString(),
+      passengerId: passengerId.toString(),
+      serviceType,
+      fareNaira,
+      paymentMethod: 'wallet'
     }
-  ], { session });
+  }], { session });
 
   // Back-link passenger txn to driver txn for easy auditing
   await Transaction.findByIdAndUpdate(
-    passengerTxnArr._id,
-    { relatedTransactionId: driverTxnArr._id },
+    passengerTxn._id,
+    { relatedTransactionId: driverTxn._id },
     { session }
   );
 
-  console.log(
-    `📝 Transactions created — Passenger: ${passengerTxnArr._id}, Driver: ${driverTxnArr._id}`
-  );
+  console.log(`📝 Transactions created — Passenger: ${passengerTxn._id}, Driver: ${driverTxn._id}`);
 
   return {
-    passengerTxn: passengerTxnArr,
-    driverTxn: driverTxnArr,
+    passengerTxn,
+    driverTxn,
     driverWallet: resolvedDriverWallet
   };
 }
 
 /**
- * Pay driver for a cash trip.
- * For cash trips the passenger pays the driver in person, so we only need
- * to create a Transaction record crediting the driver's earnings history.
- * We intentionally DO NOT touch wallet balances here because the physical
- * cash has already changed hands outside the app.
- *
- * If you later want to track driver cash earnings in the wallet you can
- * flip `creditWallet` to true.
+ * Record earnings for a cash trip.
+ * For cash trips the passenger pays the driver in person. We credit the driver's
+ * wallet to keep their total earnings accurate, since the physical cash has
+ * already changed hands outside the app.
  *
  * @param {Object} params
  * @param {string} params.tripId
- * @param {string} params.passengerId
  * @param {string} params.driverId
- * @param {number} params.fareKobo
+ * @param {number} params.fareNaira
  * @param {string} params.serviceType
  * @param {Object} session
  *
- * @returns {{ driverTxn }}
+ * @returns {{ driverTxn, driverWallet }}
  */
-async function recordCashTripEarning({ tripId, passengerId, driverId, fareKobo, serviceType }, session) {
-  console.log(`💵 Recording cash earnings for driver ${driverId}: ₦${(fareKobo / 100).toFixed(2)}`);
+async function recordCashTripEarning({ tripId, driverId, fareNaira, serviceType }, session) {
+  console.log(`💵 Recording cash earnings for driver ${driverId}: ₦${fareNaira}`);
 
-  // Credit driver wallet so their total_earnings stat is accurate
-  const driverWallet = await Wallet.findOne({ owner: driverId }).session(session);
+  const fareKobo = Math.round(fareNaira * 100);
+  const driverObjectId = new mongoose.Types.ObjectId(driverId);
 
-  let resolvedWallet = driverWallet;
-  if (!resolvedWallet) {
+  let driverWallet = await Wallet.findOne({ owner: driverObjectId }).session(session);
+  
+  if (!driverWallet) {
+    console.log(`Creating new wallet for driver ${driverId}`);
     const created = await Wallet.create([{
-      owner: driverId,
+      owner: driverObjectId,
       balance: 0,
       currency: 'NGN'
     }], { session });
-    resolvedWallet = created[0];
+    driverWallet = created[0];
   }
 
-  const balanceBefore = resolvedWallet.balance;
-
-  // ⬇️  Credit the driver wallet with the cash fare they physically collected.
-  //      This keeps their in-app "total earnings" accurate even for cash trips.
-  resolvedWallet.balance += fareKobo;
-  await resolvedWallet.save({ session });
+  const balanceBefore = driverWallet.balance;
+  
+  // Credit the driver wallet with the cash fare they physically collected
+  driverWallet.balance += fareKobo;
+  await driverWallet.save({ session });
 
   const [driverTxn] = await Transaction.create([{
-    userId: driverId,
+    userId: driverObjectId,
     type: 'credit',
     amount: fareKobo,
-    description: `Cash ride earnings — ${serviceType} trip`,
-    category: 'ride_earning',
+    description: `Cash ride earnings — ${serviceType || 'ride'} trip`,
+    category: 'trip_earning',
     status: 'completed',
     balanceBefore,
-    balanceAfter: resolvedWallet.balance,
+    balanceAfter: driverWallet.balance,
     metadata: {
       tripId: tripId.toString(),
-      passengerId: passengerId.toString(),
-      fareKobo,
+      serviceType,
+      fareNaira,
       paymentMethod: 'cash'
     }
   }], { session });
 
-  console.log(`✅ Driver cash earning recorded: ${driverTxn._id}`);
+  console.log(`✅ Driver cash earning recorded: ${driverTxn._id} | New balance: ₦${(driverWallet.balance / 100).toFixed(2)}`);
 
-  return { driverTxn, driverWallet: resolvedWallet };
+  return { driverTxn, driverWallet };
 }
 
 module.exports = { processTripWalletPayment, recordCashTripEarning };
