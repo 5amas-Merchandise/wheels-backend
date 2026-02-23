@@ -57,14 +57,14 @@ async function recordReferral(newUserId, referralCode) {
   if (!referralCode) return;
 
   try {
-    // Find the referrer by their code
+    // Find the referrer by their code only — no isActive check.
+    // Everyone gets their reward regardless of account status.
     const referrer = await User.findOne({
-      referralCode: referralCode.toUpperCase().trim(),
-      isActive: true
+      referralCode: referralCode.toUpperCase().trim()
     }).lean();
 
     if (!referrer) {
-      console.log(`⚠️ Referral code ${referralCode} not found or belongs to inactive user`);
+      console.log(`⚠️ Referral code ${referralCode} not found`);
       return;
     }
 
@@ -276,11 +276,12 @@ router.post('/signup', authLimiter, async (req, res, next) => {
       }
     }
 
-    // Validate referral code early (before creating user) so we can warn client
+    // Validate referral code — no isActive check.
+    // Codes belonging to any user (active or suspended) are valid
+    // and everyone gets their reward.
     if (referralCode) {
       const referrer = await User.findOne({
-        referralCode: referralCode.toUpperCase().trim(),
-        isActive: true
+        referralCode: referralCode.toUpperCase().trim()
       }).lean();
 
       if (!referrer) {

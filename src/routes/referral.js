@@ -228,14 +228,12 @@ router.get('/history', requireAuth, async (req, res, next) => {
 router.post('/validate', async (req, res, next) => {
   try {
     const { code } = req.body;
-
     if (!code || typeof code !== 'string') {
       return res.status(400).json({ success: false, error: { message: 'code is required' } });
     }
 
     const referrer = await User.findOne({
-      referralCode: code.toUpperCase().trim(),
-      isActive: true
+      referralCode: code.toUpperCase().trim()
     }).select('name referralCode').lean();
 
     if (!referrer) {
