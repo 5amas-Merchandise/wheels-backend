@@ -1,3 +1,4 @@
+// models/tripRequest.model.js
 const mongoose = require('mongoose');
 
 const CandidateSchema = new mongoose.Schema({
@@ -37,8 +38,9 @@ const TripRequestSchema = new mongoose.Schema({
   serviceType: { type: String, required: true },
   paymentMethod: { 
     type: String, 
-    enum: ['wallet', 'cash'], 
-    default: 'wallet' 
+    // ✅ free_ride added — represents a loyalty redemption; passenger pays nothing
+    enum: ['wallet', 'cash', 'free_ride'], 
+    default: 'cash' 
   },
   estimatedFare: { type: Number, default: 0 },
   distance: { type: Number, default: 0 },
@@ -53,22 +55,56 @@ const TripRequestSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId, 
     ref: 'User' 
   },
+
+  // ── LOYALTY / FREE RIDE FIELDS ─────────────────────────────────────────────
+  //
+  // isFreeRide:
+  //   Set to true by the /trips/request handler when the passenger has an
+  //   active, unexpired free-ride entitlement (LoyaltyProgress.freeRideAvailable).
+  //   Copied verbatim onto the Trip document when a driver accepts.
+  //   The passenger pays ₦0. The driver still gets paid — by the system.
+  //
+  isFreeRide: {
+    type: Boolean,
+    default: false,
+    index: true
+  },
+
+  // Snapshot of the LoyaltyProgress._id at the time of this request.
+  // Kept for audit / support — so we can always trace which loyalty doc
+  // authorised this free ride even if the progress doc is later modified.
+  loyaltyProgressId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'LoyaltyProgress',
+    default: null
+  },
+
+  // The fare the DRIVER will receive from the system wallet for a free ride.
+  // Equals estimatedFare (naira). Stored here so it's locked in at request
+  // time and can't be gamed by fare recalculation later.
+  freeRideDriverPayoutNaira: {
+    type: Number,
+    default: 0
+  },
+  // ─────────────────────────────────────────────────────────────────────────
+
   expiresAt: { 
     type: Date, 
     required: true,
-    index: { expireAfterSeconds: 0 } // 🔥 TTL INDEX - NON-NEGOTIABLE
+    index: { expireAfterSeconds: 0 } // 🔥 TTL INDEX — NON-NEGOTIABLE
   },
   createdAt: { type: Date, default: Date.now }
 });
 
-// ✅ Indexes for better query performance
+// ── Indexes ────────────────────────────────────────────────────────────────
 TripRequestSchema.index({ pickup: '2dsphere' });
 TripRequestSchema.index({ dropoff: '2dsphere' });
 TripRequestSchema.index({ status: 1 });
 TripRequestSchema.index({ passengerId: 1 });
 TripRequestSchema.index({ createdAt: -1 });
-TripRequestSchema.index({ expiresAt: 1 }); // Already included in TTL but good for queries
+TripRequestSchema.index({ expiresAt: 1 });
 TripRequestSchema.index({ 'candidates.driverId': 1 });
 TripRequestSchema.index({ 'candidates.status': 1 });
+TripRequestSchema.index({ isFreeRide: 1, status: 1 }); // for admin queries
 
 module.exports = mongoose.model('TripRequest', TripRequestSchema);

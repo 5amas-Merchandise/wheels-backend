@@ -8,6 +8,7 @@ const Trip = require("../models/trip.model");
 const Wallet = require("../models/wallet.model");
 const Transaction = require("../models/transaction.model");
 const Settings = require("../models/settings.model");
+const LoyaltyProgress = require("../models/Loyaltyprogress.model");
 const { requireAuth } = require("../middleware/auth");
 const {
   validateCoordinates,
@@ -23,6 +24,7 @@ const {
 const {
   processTripWalletPayment,
   recordCashTripEarning,
+  processFreeRideLoyaltyPayment,
 } = require("../utils/tripPaymentService");
 
 // ==========================================
@@ -48,17 +50,13 @@ const CONFIG = {
 };
 
 // ==========================================
-// REJECTION TRACKING IN DATABASE
+// REJECTION TRACKING
 // ==========================================
 async function cleanupFailedTripRequest(requestId) {
   try {
     console.log(`🧹 Cleaning up failed trip request: ${requestId}`);
-
     const tripRequest = await TripRequest.findById(requestId);
-    if (!tripRequest) {
-      console.log(`⚠️ Trip request ${requestId} not found for cleanup`);
-      return;
-    }
+    if (!tripRequest) return;
 
     tripRequest.candidates.forEach((candidate) => {
       if (candidate.status === "offered" || candidate.status === "pending") {
@@ -83,8 +81,6 @@ async function cleanupFailedTripRequest(requestId) {
       console.error("Notification emit error during cleanup:", emitErr);
     }
 
-    console.log(`✅ Trip request ${requestId} marked as no_drivers`);
-
     setTimeout(async () => {
       try {
         await TripRequest.findByIdAndDelete(requestId);
@@ -105,21 +101,13 @@ async function trackRejection(requestId) {
 
     const rejectionCount = tripRequest.candidates.filter(
       (c) =>
-        c.status === "rejected" && c.rejectionReason !== "max_attempts_reached",
+        c.status === "rejected" && c.rejectionReason !== "max_attempts_reached"
     ).length;
 
-    console.log(
-      `📊 Trip ${requestId} rejection count: ${rejectionCount}/${CONFIG.MAX_REJECTIONS}`,
-    );
-
     if (rejectionCount >= CONFIG.MAX_REJECTIONS) {
-      console.log(
-        `🚫 Trip ${requestId} reached max rejections, initiating cleanup`,
-      );
       await cleanupFailedTripRequest(requestId);
       return true;
     }
-
     return false;
   } catch (err) {
     console.error(`❌ Error tracking rejection for ${requestId}:`, err);
@@ -130,7 +118,6 @@ async function trackRejection(requestId) {
 // ==========================================
 // HELPER FUNCTIONS
 // ==========================================
-
 function calculateDistance(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const dLat = toRad(lat2 - lat1);
@@ -150,9 +137,8 @@ function toRad(degrees) {
 }
 
 // ==========================================
-// POST /trips/request  (FIXED: paymentMethod validation & persistence)
+// POST /trips/request
 // ==========================================
-
 router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
   const session = await mongoose.startSession();
   let responsePayload;
@@ -178,11 +164,9 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         dropoffAddress,
       } = req.body;
 
-      // --- FIX: validate and resolve payment method ---
+      // ── Validate payment method ──────────────────────────────────────────
       const VALID_PAYMENT_METHODS = ["cash", "wallet"];
-      const resolvedPaymentMethod = VALID_PAYMENT_METHODS.includes(
-        paymentMethod,
-      )
+      const resolvedPaymentMethod = VALID_PAYMENT_METHODS.includes(paymentMethod)
         ? paymentMethod
         : "cash";
 
@@ -191,40 +175,61 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
       console.log("Service Type:", serviceType);
       console.log("Payment Method (resolved):", resolvedPaymentMethod);
       console.log("Estimated Fare (naira):", estimatedFare);
-      console.log("Distance:", distance, "km");
 
       if (!pickup || !validateCoordinates(pickup.coordinates)) {
         throw new Error("Invalid pickup coordinates");
       }
-
       if (!validateServiceType(serviceType)) {
         throw new Error("Invalid serviceType");
       }
-
       if (estimatedFare && (estimatedFare < 0 || estimatedFare > 1000000)) {
         throw new Error("Invalid estimated fare");
       }
-
       if (distance && (distance < 0 || distance > 1000)) {
         throw new Error("Invalid distance");
       }
-
       if (duration && (duration < 0 || duration > 24 * 60 * 60)) {
         throw new Error("Invalid duration");
       }
 
+      // ── LOYALTY ELIGIBILITY CHECK ────────────────────────────────────────
+      // Check BEFORE searching for drivers so we can set isFreeRide + lock in
+      // the driver payout amount at the moment of request.
+      let isFreeRide = false;
+      let loyaltyProgressId = null;
+      let freeRideDriverPayoutNaira = 0;
+      let finalPaymentMethod = resolvedPaymentMethod;
+
+      try {
+        const { eligible, progress } = await LoyaltyProgress.checkEligibility(passengerId);
+
+        if (eligible) {
+          isFreeRide = true;
+          loyaltyProgressId = progress._id;
+          // Lock in the payout — driver gets whatever the frontend calculated
+          freeRideDriverPayoutNaira = estimatedFare || 0;
+          finalPaymentMethod = "free_ride";
+
+          console.log(
+            `🎁 Passenger ${passengerId} has a FREE RIDE available! ` +
+            `Driver payout locked at ₦${freeRideDriverPayoutNaira}`
+          );
+        }
+      } catch (loyaltyErr) {
+        // Non-fatal — if loyalty check fails, proceed as normal paid trip
+        console.warn(`⚠️ Loyalty check failed (non-fatal): ${loyaltyErr.message}`);
+      }
+      // ────────────────────────────────────────────────────────────────────
+
       const [lng, lat] = pickup.coordinates;
       const now = new Date();
       const lastSeenThreshold = new Date(
-        now.getTime() - CONFIG.DRIVER_LAST_SEEN_THRESHOLD_MS,
+        now.getTime() - CONFIG.DRIVER_LAST_SEEN_THRESHOLD_MS
       );
 
-      console.log(
-        `📍 Searching for drivers near [${lat}, ${lng}] within ${radiusMeters}m`,
-      );
+      console.log(`📍 Searching for drivers near [${lat}, ${lng}] within ${radiusMeters}m`);
 
       let nearbyDrivers = [];
-
       try {
         nearbyDrivers = await User.find({
           "roles.isDriver": true,
@@ -252,14 +257,8 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
 
       const candidates = [];
       for (const driver of nearbyDrivers || []) {
-        const supportsService =
-          driver.driverProfile?.serviceCategories?.includes(serviceType);
-        if (!supportsService) {
-          console.log(
-            ` ⚠️ Driver ${driver._id} doesn't support ${serviceType}`,
-          );
-          continue;
-        }
+        const supportsService = driver.driverProfile?.serviceCategories?.includes(serviceType);
+        if (!supportsService) continue;
         candidates.push({
           driverId: driver._id,
           status: "pending",
@@ -268,39 +267,37 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
           rejectedAt: null,
           rejectionReason: null,
         });
-        console.log(` ✅ Added driver ${driver._id} to candidates`);
       }
 
       console.log(`✅ ${candidates.length} drivers qualified`);
 
+      // ── Build shared trip request fields ──────────────────────────────────
+      const tripRequestBase = {
+        passengerId,
+        pickup,
+        dropoff,
+        serviceType,
+        paymentMethod: finalPaymentMethod,
+        estimatedFare: estimatedFare || 0,
+        distance: distance || 0,
+        duration: duration || 0,
+        pickupAddress: pickupAddress || "",
+        dropoffAddress: dropoffAddress || "",
+        // Loyalty fields
+        isFreeRide,
+        loyaltyProgressId,
+        freeRideDriverPayoutNaira,
+      };
+
       let tripRequest;
+
       if (candidates.length === 0) {
         tripRequest = await TripRequest.create(
-          [
-            {
-              passengerId,
-              pickup,
-              dropoff,
-              serviceType,
-              paymentMethod: resolvedPaymentMethod, // FIX: use resolved value
-              estimatedFare: estimatedFare || 0,
-              distance: distance || 0,
-              duration: duration || 0,
-              pickupAddress: pickupAddress || "",
-              dropoffAddress: dropoffAddress || "",
-              candidates: [],
-              status: "no_drivers",
-              expiresAt: new Date(now.getTime() + 60 * 1000),
-            },
-          ],
-          { session },
+          [{ ...tripRequestBase, candidates: [], status: "no_drivers", expiresAt: new Date(now.getTime() + 60 * 1000) }],
+          { session }
         );
-
         createdRequestId = tripRequest[0]._id;
-        responsePayload = {
-          requestId: tripRequest[0]._id,
-          message: "No drivers available",
-        };
+        responsePayload = { requestId: tripRequest[0]._id, message: "No drivers available" };
         candidateData = null;
         firstCandidate = null;
         return;
@@ -309,27 +306,10 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
       candidates[0].status = "offered";
       candidates[0].offeredAt = now;
       firstCandidate = candidates[0];
-      console.log(`📤 Offering to first driver: ${candidates[0].driverId}`);
 
       tripRequest = await TripRequest.create(
-        [
-          {
-            passengerId,
-            pickup,
-            dropoff,
-            serviceType,
-            paymentMethod: resolvedPaymentMethod, // FIX: use resolved value
-            estimatedFare: estimatedFare || 0,
-            distance: distance || 0,
-            duration: duration || 0,
-            pickupAddress: pickupAddress || "",
-            dropoffAddress: dropoffAddress || "",
-            candidates,
-            status: "searching",
-            expiresAt: new Date(now.getTime() + CONFIG.SEARCH_TIMEOUT_MS),
-          },
-        ],
-        { session },
+        [{ ...tripRequestBase, candidates, status: "searching", expiresAt: new Date(now.getTime() + CONFIG.SEARCH_TIMEOUT_MS) }],
+        { session }
       );
 
       const createdRequest = tripRequest[0];
@@ -338,11 +318,17 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
       responsePayload = {
         requestId: createdRequest._id,
         candidatesCount: candidates.length,
-        message: `Searching ${candidates.length} drivers`,
+        message: isFreeRide
+          ? `🎁 Free ride! Searching ${candidates.length} drivers`
+          : `Searching ${candidates.length} drivers`,
         estimatedFare: estimatedFare || 0,
+        // ✅ Tell the frontend it's a free ride so it can show the banner
+        isFreeRide,
+        loyalty: isFreeRide
+          ? { isFreeRide: true, passengerPays: 0, driverEarns: freeRideDriverPayoutNaira }
+          : null,
       };
 
-      // FIX: use resolvedPaymentMethod in candidateData
       candidateData = {
         serviceType,
         estimatedFare: estimatedFare || 0,
@@ -352,7 +338,8 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         dropoff,
         pickupAddress: pickupAddress || "",
         dropoffAddress: dropoffAddress || "",
-        paymentMethod: resolvedPaymentMethod,
+        paymentMethod: finalPaymentMethod,
+        isFreeRide,
         immediateOffer: true,
       };
     });
@@ -366,14 +353,8 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
           type: "trip_offered",
           title: "New Trip Request",
           body: `New ${candidateData.serviceType} ride - Accept within ${CONFIG.OFFER_TIMEOUT_MS / 1000} seconds`,
-          data: {
-            requestId: createdRequestId,
-            ...candidateData,
-          },
+          data: { requestId: createdRequestId, ...candidateData },
         });
-        console.log(
-          `📨 Notification sent to driver ${firstCandidate.driverId}`,
-        );
       } catch (emitErr) {
         console.error("Notification emit error:", emitErr);
       }
@@ -384,7 +365,7 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
           const fresh = await TripRequest.findById(createdRequestId);
           if (!fresh || fresh.status !== "searching") return;
           const cand = fresh.candidates.find(
-            (c) => c.driverId.toString() === firstDriverId.toString(),
+            (c) => c.driverId.toString() === firstDriverId.toString()
           );
           if (cand && cand.status === "offered") {
             cand.status = "rejected";
@@ -401,10 +382,7 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
   } catch (err) {
     if (session.inTransaction()) await session.abortTransaction();
     console.error("❌ Trip request error:", err);
-    if (
-      err.message.includes("Invalid") ||
-      err.message.includes("Unavailable")
-    ) {
+    if (err.message.includes("Invalid") || err.message.includes("Unavailable")) {
       return res.status(400).json({ error: { message: err.message } });
     }
     next(err);
@@ -416,26 +394,19 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
 // ==========================================
 // OFFER TO NEXT DRIVER
 // ==========================================
-
 async function offerToNext(requestId) {
   try {
-    console.log(`🔄 offerToNext for ${requestId}`);
-
     const tripRequest = await TripRequest.findById(requestId);
-    if (!tripRequest || tripRequest.status !== "searching") {
-      console.log(`❌ Trip ${requestId} not searching or not found`);
-      return;
-    }
+    if (!tripRequest || tripRequest.status !== "searching") return;
 
     const shouldCleanup = await trackRejection(requestId);
     if (shouldCleanup) return;
 
     const nextCandidate = tripRequest.candidates.find(
-      (c) => c.status === "pending" && !c.rejectedAt,
+      (c) => c.status === "pending" && !c.rejectedAt
     );
 
     if (!nextCandidate) {
-      console.log(`⚠️ No more pending candidates for ${requestId}`);
       await cleanupFailedTripRequest(requestId);
       return;
     }
@@ -445,12 +416,6 @@ async function offerToNext(requestId) {
     await tripRequest.save();
 
     const driverId = nextCandidate.driverId;
-    const rejectionCount = tripRequest.candidates.filter(
-      (c) => c.status === "rejected",
-    ).length;
-    console.log(
-      `📤 Offering to driver ${driverId} (Attempt ${rejectionCount + 1}/${CONFIG.MAX_REJECTIONS})`,
-    );
 
     try {
       emitter.emit("notification", {
@@ -469,6 +434,7 @@ async function offerToNext(requestId) {
           pickupAddress: tripRequest.pickupAddress || "",
           dropoffAddress: tripRequest.dropoffAddress || "",
           paymentMethod: tripRequest.paymentMethod || "cash",
+          isFreeRide: tripRequest.isFreeRide || false,
           immediateOffer: true,
         },
       });
@@ -481,7 +447,7 @@ async function offerToNext(requestId) {
         const fresh = await TripRequest.findById(requestId);
         if (!fresh || fresh.status !== "searching") return;
         const cand = fresh.candidates.find(
-          (c) => c.driverId.toString() === driverId.toString(),
+          (c) => c.driverId.toString() === driverId.toString()
         );
         if (cand && cand.status === "offered") {
           cand.status = "rejected";
@@ -502,7 +468,6 @@ async function offerToNext(requestId) {
 // ==========================================
 // GET /trips/request/:requestId
 // ==========================================
-
 router.get("/request/:requestId", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
@@ -514,9 +479,7 @@ router.get("/request/:requestId", requireAuth, async (req, res, next) => {
       .lean();
 
     if (!tripRequest) {
-      return res
-        .status(404)
-        .json({ error: { message: "Trip request not found" } });
+      return res.status(404).json({ error: { message: "Trip request not found" } });
     }
 
     if (tripRequest.passengerId._id.toString() !== userId) {
@@ -542,9 +505,8 @@ router.get("/request/:requestId", requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/accept (FIXED: Trip.create block replaced)
+// POST /trips/accept
 // ==========================================
-
 router.post(
   "/accept",
   requireAuth,
@@ -566,15 +528,10 @@ router.post(
       const finalIdempotencyKey =
         idempotencyKey || `accept_${requestId}_${driverId}_${Date.now()}`;
 
-      console.log(
-        `🤝 Driver ${driverId} attempting to accept request ${requestId}`,
-      );
-
-      const idempotencyCollection =
-        mongoose.connection.collection("idempotency_keys");
+      const idempotencyCollection = mongoose.connection.collection("idempotency_keys");
       const existingKey = await idempotencyCollection.findOne(
         { key: finalIdempotencyKey },
-        { session },
+        { session }
       );
 
       if (existingKey) {
@@ -603,7 +560,7 @@ router.post(
           createdAt: new Date(),
           expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
         },
-        { session },
+        { session }
       );
 
       const driver = await User.findById(driverId)
@@ -614,7 +571,7 @@ router.post(
         await idempotencyCollection.updateOne(
           { key: finalIdempotencyKey },
           { $set: { status: "failed", error: "Driver not available" } },
-          { session },
+          { session }
         );
         throw new Error("Driver is not available");
       }
@@ -634,29 +591,28 @@ router.post(
             "candidates.$[elem].acceptedAt": new Date(),
           },
         },
-        { arrayFilters: [{ "elem.driverId": driverId }], new: true, session },
+        { arrayFilters: [{ "elem.driverId": driverId }], new: true, session }
       );
 
       if (!tripRequest) {
-        const currentRequest =
-          await TripRequest.findById(requestId).session(session);
+        const currentRequest = await TripRequest.findById(requestId).session(session);
         if (!currentRequest) {
           await idempotencyCollection.updateOne(
             { key: finalIdempotencyKey },
             { $set: { status: "failed", error: "Trip request not found" } },
-            { session },
+            { session }
           );
           throw new Error("Trip request not found");
         }
         await idempotencyCollection.updateOne(
           { key: finalIdempotencyKey },
           { $set: { status: "failed", error: "Trip no longer available" } },
-          { session },
+          { session }
         );
         throw new Error("Trip is no longer available");
       }
 
-      // --- FIX: Trip.create block replaced exactly as provided ---
+      // ── Create Trip — carry loyalty fields from TripRequest ───────────────
       const tripDoc = await Trip.create(
         [
           {
@@ -672,14 +628,21 @@ router.post(
             distanceKm: tripRequest.distance || 0,
             durationMinutes: Math.round((tripRequest.duration || 0) / 60),
             requestedAt: new Date(),
+            // ✅ Loyalty fields — copied from TripRequest
+            isFreeLoyaltyRide: tripRequest.isFreeRide || false,
+            loyaltyTripNumberAtBooking: null, // filled on complete
             metadata: {
               subscriptionId: req.subscription.id,
               subscriptionExpiresAt: req.subscription.expiresAt,
               vehicleType: req.subscription.vehicleType,
+              // Store loyalty payout amount so complete handler uses the
+              // locked-in value, not a recalculated one
+              freeRideDriverPayoutNaira: tripRequest.freeRideDriverPayoutNaira || 0,
+              loyaltyProgressId: tripRequest.loyaltyProgressId || null,
             },
           },
         ],
-        { session },
+        { session }
       );
 
       const newTrip = tripDoc[0];
@@ -690,7 +653,7 @@ router.post(
           "driverProfile.isAvailable": false,
           "driverProfile.currentTripId": newTrip._id,
         },
-        { session },
+        { session }
       );
 
       await idempotencyCollection.updateOne(
@@ -703,7 +666,7 @@ router.post(
             updatedAt: new Date(),
           },
         },
-        { session },
+        { session }
       );
 
       await session.commitTransaction();
@@ -713,6 +676,7 @@ router.post(
         tripId: newTrip._id.toString(),
         requestId: tripRequest._id.toString(),
         driverId,
+        isFreeRide: tripRequest.isFreeRide || false,
         subscription: {
           expiresAt: req.subscription.expiresAt,
           vehicleType: req.subscription.vehicleType,
@@ -731,6 +695,7 @@ router.post(
         dropoff: tripRequest.dropoff,
         pickupAddress: tripRequest.pickupAddress || "",
         dropoffAddress: tripRequest.dropoffAddress || "",
+        isFreeRide: tripRequest.isFreeRide || false,
       };
 
       res.json(tripData);
@@ -755,17 +720,10 @@ router.post(
       console.error("❌ Accept error:", error.message);
 
       if (!responseSent) {
-        let statusCode = 500,
-          errorCode = "INTERNAL_ERROR";
-        if (error.message.includes("not found")) {
-          statusCode = 404;
-          errorCode = "NOT_FOUND";
-        } else if (
-          error.message.includes("not available") ||
-          error.message.includes("no longer available")
-        ) {
-          statusCode = 400;
-          errorCode = "TRIP_UNAVAILABLE";
+        let statusCode = 500, errorCode = "INTERNAL_ERROR";
+        if (error.message.includes("not found")) { statusCode = 404; errorCode = "NOT_FOUND"; }
+        else if (error.message.includes("not available") || error.message.includes("no longer available")) {
+          statusCode = 400; errorCode = "TRIP_UNAVAILABLE";
         }
         res.status(statusCode).json({
           success: false,
@@ -775,13 +733,12 @@ router.post(
     } finally {
       await session.endSession();
     }
-  },
+  }
 );
 
 // ==========================================
 // POST /trips/reject
 // ==========================================
-
 router.post("/reject", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
@@ -789,19 +746,14 @@ router.post("/reject", requireAuth, async (req, res, next) => {
 
     const tripRequest = await TripRequest.findById(requestId);
     if (!tripRequest || tripRequest.status !== "searching") {
-      return res
-        .status(400)
-        .json({ error: { message: "Trip no longer searching" } });
+      return res.status(400).json({ error: { message: "Trip no longer searching" } });
     }
 
     const candidate = tripRequest.candidates.find(
-      (c) => c.driverId.toString() === driverId && c.status === "offered",
+      (c) => c.driverId.toString() === driverId && c.status === "offered"
     );
-
     if (!candidate) {
-      return res
-        .status(403)
-        .json({ error: { message: "You were not offered this trip" } });
+      return res.status(403).json({ error: { message: "You were not offered this trip" } });
     }
 
     candidate.status = "rejected";
@@ -820,7 +772,6 @@ router.post("/reject", requireAuth, async (req, res, next) => {
 // ==========================================
 // ADMIN MIDDLEWARE
 // ==========================================
-
 const requireAdmin = (req, res, next) => {
   if (req.user?.roles?.isAdmin) next();
   else res.status(403).json({ error: { message: "Admin access required" } });
@@ -829,14 +780,11 @@ const requireAdmin = (req, res, next) => {
 // ==========================================
 // GET /trips/searching - ADMIN
 // ==========================================
-
 router.get("/searching", requireAuth, requireAdmin, async (req, res, next) => {
   try {
     const searchingTrips = await TripRequest.find({ status: "searching" })
       .populate("passengerId", "name phone")
-      .select(
-        "_id serviceType pickup dropoff estimatedFare candidates status createdAt expiresAt",
-      )
+      .select("_id serviceType pickup dropoff estimatedFare candidates status createdAt expiresAt isFreeRide")
       .sort({ createdAt: -1 })
       .lean();
 
@@ -857,14 +805,12 @@ router.get("/searching", requireAuth, requireAdmin, async (req, res, next) => {
 // ==========================================
 // POST /trips/:tripId/start
 // ==========================================
-
 router.post("/:tripId/start", requireAuth, async (req, res, next) => {
   try {
     const driverId = req.user.sub;
     const trip = await Trip.findById(req.params.tripId);
 
-    if (!trip)
-      return res.status(404).json({ error: { message: "Trip not found" } });
+    if (!trip) return res.status(404).json({ error: { message: "Trip not found" } });
     if (trip.driverId.toString() !== driverId)
       return res.status(403).json({ error: { message: "Unauthorized" } });
 
@@ -891,16 +837,22 @@ router.post("/:tripId/start", requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/:tripId/complete  (FIXED: cash branch log)
+// POST /trips/:tripId/complete
 // ==========================================
 //
 // UNIT CONVENTION:
 //   Trip.estimatedFare  → stored in NAIRA  (frontend sends naira)
 //   Wallet.balance      → stored in KOBO   (Paystack convention)
-//   processTripWalletPayment receives fareNaira and converts internally
+//   All payment service functions receive fareNaira and convert internally
 //
+// LOYALTY FLOW:
+//   free_ride  → processFreeRideLoyaltyPayment (system pays driver)
+//              → LoyaltyProgress.recordCompletedTrip (isFreeLoyaltyRide=true)
+//              → trip counter stays at 0, lifetime stats updated
+//   paid trip  → normal wallet/cash flow
+//              → LoyaltyProgress.recordCompletedTrip (isFreeLoyaltyRide=false)
+//              → tripCount++, possibly unlocks next free ride
 // ==========================================
-
 router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
 
@@ -911,73 +863,84 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
 
       console.log(`✅ Completing trip ${tripId} — driver ${driverId}`);
 
-      // ── 1. Load trip ─────────────────────────────────────────────────────
+      // ── 1. Load trip ──────────────────────────────────────────────────────
       const existingTrip = await Trip.findById(tripId).session(session);
       if (!existingTrip) throw new Error("Trip not found");
 
       if (existingTrip.driverId.toString() !== driverId) {
         throw new Error("Unauthorized: You are not the driver for this trip");
       }
-
       if (["completed", "cancelled"].includes(existingTrip.status)) {
         throw new Error(`Trip is already ${existingTrip.status}`);
       }
 
-      // fareNaira: the fare is stored in NAIRA in Trip.estimatedFare
       const fareNaira = existingTrip.estimatedFare || 0;
       const paymentMethod = existingTrip.paymentMethod || "cash";
+      const isFreeLoyaltyRide = existingTrip.isFreeLoyaltyRide || false;
 
-      // Keep passengerId as ObjectId for referral query; use toString() for notifications
       const passengerObjectId = existingTrip.passengerId;
       const passengerIdStr = passengerObjectId.toString();
 
-      console.log(`💰 Fare: ₦${fareNaira} (naira) | Payment: ${paymentMethod}`);
+      console.log(`💰 Fare: ₦${fareNaira} | Payment: ${paymentMethod} | FreeLoyaltyRide: ${isFreeLoyaltyRide}`);
 
       // ── 2. Process payment ────────────────────────────────────────────────
       let paymentResult = null;
       let resolvedPaymentMethod = paymentMethod;
 
-      if (paymentMethod === "wallet") {
+      if (isFreeLoyaltyRide || paymentMethod === "free_ride") {
+        // ── FREE RIDE: system pays driver ─────────────────────────────────
+        // Use the locked-in payout amount from metadata (set at request time)
+        const driverPayoutNaira =
+          existingTrip.metadata?.freeRideDriverPayoutNaira || fareNaira;
+
         try {
-          paymentResult = await processTripWalletPayment(
+          paymentResult = await processFreeRideLoyaltyPayment(
             {
               tripId,
               passengerId: passengerIdStr,
               driverId,
-              fareNaira, // ✅ naira — service converts to kobo internally
+              fareNaira: driverPayoutNaira,
               serviceType: existingTrip.serviceType,
             },
-            session,
+            session
           );
+          resolvedPaymentMethod = "free_ride";
           console.log(
-            `✅ Wallet payment processed — passenger debited ₦${fareNaira}, driver credited ₦${fareNaira}`,
+            `🎁 Free ride payout: ₦${driverPayoutNaira} credited to driver from system wallet`
           );
+        } catch (freeRideErr) {
+          // If system wallet is insufficient, log loudly but don't block completion.
+          // Mark for manual review via completionNotes.
+          console.error(`🚨 Free ride driver payout FAILED: ${freeRideErr.message}`);
+          resolvedPaymentMethod = "free_ride_pending";
+          paymentResult = null;
+          existingTrip.completionNotes =
+            `FREE RIDE DRIVER PAYOUT FAILED: ${freeRideErr.message}. ` +
+            `Manual credit of ₦${fareNaira} required for driver ${driverId}.`;
+        }
+      } else if (paymentMethod === "wallet") {
+        // ── WALLET PAYMENT ────────────────────────────────────────────────
+        try {
+          paymentResult = await processTripWalletPayment(
+            { tripId, passengerId: passengerIdStr, driverId, fareNaira, serviceType: existingTrip.serviceType },
+            session
+          );
+          console.log(`✅ Wallet payment processed — ₦${fareNaira}`);
         } catch (paymentErr) {
-          console.warn(
-            `⚠️ Wallet payment failed (${paymentErr.message}). Falling back to cash.`,
-          );
+          console.warn(`⚠️ Wallet payment failed (${paymentErr.message}). Falling back to cash.`);
           resolvedPaymentMethod = "cash_fallback";
           paymentResult = null;
         }
       } else {
-        // --- FIX: updated console log to include "(stats only)" ---
+        // ── CASH PAYMENT ──────────────────────────────────────────────────
         try {
           paymentResult = await recordCashTripEarning(
-            {
-              tripId,
-              driverId,
-              fareNaira,
-              serviceType: existingTrip.serviceType,
-            },
-            session,
+            { tripId, driverId, fareNaira, serviceType: existingTrip.serviceType },
+            session
           );
-          console.log(
-            `💵 Cash earning recorded (stats only) for driver ${driverId}`,
-          );
+          console.log(`💵 Cash earning recorded (stats only) for driver ${driverId}`);
         } catch (cashErr) {
-          console.warn(
-            `⚠️ Cash earning record failed (non-fatal): ${cashErr.message}`,
-          );
+          console.warn(`⚠️ Cash earning record failed (non-fatal): ${cashErr.message}`);
         }
         resolvedPaymentMethod = "cash";
       }
@@ -991,6 +954,13 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
           completedAt: new Date(),
           paymentMethod: resolvedPaymentMethod,
           paymentConfirmed: true,
+          // Mark driver credit as processed only if payout succeeded
+          loyaltyDriverCreditProcessed:
+            isFreeLoyaltyRide && resolvedPaymentMethod === "free_ride",
+          loyaltyDriverCreditTxnId: paymentResult?.driverTxn?._id || null,
+          ...(existingTrip.completionNotes && {
+            completionNotes: existingTrip.completionNotes,
+          }),
           ...(paymentResult?.passengerTxn && {
             "metadata.passengerTransactionId": paymentResult.passengerTxn._id,
           }),
@@ -998,10 +968,10 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             "metadata.driverTransactionId": paymentResult.driverTxn._id,
           }),
         },
-        { new: true, session },
+        { new: true, session }
       );
 
-      // ── 4. Update driver availability ──────────────────────────────────
+      // ── 4. Update driver availability ─────────────────────────────────────
       await User.findByIdAndUpdate(
         driverId,
         {
@@ -1012,44 +982,70 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             "driverProfile.totalEarnings": fareNaira,
           },
         },
-        { session },
+        { session }
       );
 
-      console.log(`✅ Driver ${driverId} is now available`);
+      // ── 5. LOYALTY PROGRESS UPDATE ────────────────────────────────────────
+      let loyaltyResult = null;
+      try {
+        loyaltyResult = await LoyaltyProgress.recordCompletedTrip(
+          passengerObjectId,
+          tripId,
+          fareNaira,
+          isFreeLoyaltyRide,  // true = free ride (don't increment counter)
+          session
+        );
 
-      // ── 5. Check for pending referral (use ObjectId!) ─────────────────
+        console.log(
+          `🏆 Loyalty updated for ${passengerIdStr}: ` +
+          `tripCount=${loyaltyResult.progress.tripCount} | ` +
+          `justUnlocked=${loyaltyResult.justUnlocked} | ` +
+          `freeRideRedeemed=${loyaltyResult.freeRideRedeemed}`
+        );
+
+        // Stamp the trip with the loyalty counter snapshot
+        await Trip.findByIdAndUpdate(
+          tripId,
+          { loyaltyTripNumberAtBooking: loyaltyResult.progress.tripCount },
+          { session }
+        );
+      } catch (loyaltyErr) {
+        // Non-fatal — loyalty update failing must NOT block trip completion
+        console.error(`⚠️ Loyalty update failed (non-fatal): ${loyaltyErr.message}`);
+      }
+
+      // ── 6. Check for pending referral ─────────────────────────────────────
       const pendingReferral = await mongoose
         .model("Referral")
-        .findOne({
-          refereeId: passengerObjectId, // ✅ ObjectId — not string
-          status: "pending",
-        })
+        .findOne({ refereeId: passengerObjectId, status: "pending" })
         .session(session);
 
       const shouldTriggerReferral = !!pendingReferral;
-      console.log(
-        `🎯 Referral check for ${passengerIdStr}:`,
-        shouldTriggerReferral ? `Found (${pendingReferral._id})` : "None",
-      );
 
-      // ── 6. Build driver wallet info for response ────────────────────────
+      // ── 7. Build driver wallet info ───────────────────────────────────────
       const driverNewBalance = paymentResult?.driverWallet?.balance ?? null;
 
-      // ── 7. Determine notification messages ─────────────────────────────
+      // ── 8. Determine notification messages ───────────────────────────────
       let passengerNote, driverNote;
 
-      if (resolvedPaymentMethod === "wallet") {
+      if (resolvedPaymentMethod === "free_ride") {
+        passengerNote = `🎁 This was your Kilometre Club free ride! No charge.`;
+        driverNote    = `🎁 Kilometre Club ride! ₦${fareNaira.toLocaleString()} has been credited to your wallet by the platform.`;
+      } else if (resolvedPaymentMethod === "free_ride_pending") {
+        passengerNote = `🎁 This was your free ride! No charge.`;
+        driverNote    = `🎁 Free ride completed. Your ₦${fareNaira.toLocaleString()} payout is pending — our team will credit you shortly.`;
+      } else if (resolvedPaymentMethod === "wallet") {
         passengerNote = `₦${fareNaira.toLocaleString()} was deducted from your wallet.`;
-        driverNote = `₦${fareNaira.toLocaleString()} has been credited to your wallet. No need to collect cash from the passenger.`;
+        driverNote    = `₦${fareNaira.toLocaleString()} has been credited to your wallet.`;
       } else if (resolvedPaymentMethod === "cash_fallback") {
         passengerNote = `Wallet payment failed — please pay the driver ₦${fareNaira.toLocaleString()} in cash.`;
-        driverNote = `Wallet payment failed — please collect ₦${fareNaira.toLocaleString()} in cash from the passenger.`;
+        driverNote    = `Wallet payment failed — please collect ₦${fareNaira.toLocaleString()} in cash from the passenger.`;
       } else {
         passengerNote = `Please pay the driver ₦${fareNaira.toLocaleString()} in cash.`;
-        driverNote = `Collect ₦${fareNaira.toLocaleString()} in cash from the passenger.`;
+        driverNote    = `Collect ₦${fareNaira.toLocaleString()} in cash from the passenger.`;
       }
 
-      // ── 8. Send HTTP response ────────────────────────────────────────────
+      // ── 9. HTTP response ──────────────────────────────────────────────────
       res.json({
         success: true,
         trip: {
@@ -1058,66 +1054,95 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
           finalFare: updatedTrip.finalFare,
           completedAt: updatedTrip.completedAt,
           paymentMethod: resolvedPaymentMethod,
+          isFreeLoyaltyRide,
         },
         payment: {
           method: resolvedPaymentMethod,
-          isWallet: resolvedPaymentMethod === "wallet",
-          isCash: resolvedPaymentMethod === "cash",
-          isFallback: resolvedPaymentMethod === "cash_fallback",
+          isWallet:       resolvedPaymentMethod === "wallet",
+          isCash:         resolvedPaymentMethod === "cash",
+          isFallback:     resolvedPaymentMethod === "cash_fallback",
+          isFreeRide:     resolvedPaymentMethod === "free_ride" || resolvedPaymentMethod === "free_ride_pending",
           fareNaira,
-          fareFormatted: `₦${fareNaira.toLocaleString()}`,
-          // Driver-facing message
-          driverMessage: driverNote,
-          // New driver wallet balance (only for wallet payments)
+          fareFormatted:  `₦${fareNaira.toLocaleString()}`,
+          driverMessage:  driverNote,
           driverWallet:
             driverNewBalance !== null
               ? {
-                  balance: driverNewBalance,
-                  balanceNaira: (driverNewBalance / 100).toFixed(2),
+                  balance:          driverNewBalance,
+                  balanceNaira:     (driverNewBalance / 100).toFixed(2),
                   balanceFormatted: `₦${(driverNewBalance / 100).toLocaleString()}`,
                 }
               : null,
         },
+        // Loyalty summary for frontend to update progress UI
+        loyalty: loyaltyResult
+          ? {
+              tripCount:           loyaltyResult.progress.tripCount,
+              tripsRequired:       LoyaltyProgress.TRIPS_REQUIRED,
+              freeRideAvailable:   loyaltyResult.progress.freeRideAvailable,
+              justUnlocked:        loyaltyResult.justUnlocked,
+              freeRideRedeemed:    loyaltyResult.freeRideRedeemed,
+              freeRideExpiresAt:   loyaltyResult.progress.freeRideExpiresAt,
+              totalFreeRidesEarned: loyaltyResult.progress.totalFreeRidesEarned,
+            }
+          : null,
         message: "Trip completed successfully.",
       });
 
-      // ── 9. Post-commit side effects ──────────────────────────────────────
+      // ── 10. Post-commit side effects ──────────────────────────────────────
       setImmediate(async () => {
         try {
+          // Referral reward
           if (shouldTriggerReferral) {
             try {
               const referralRouter = require("./referral");
               if (typeof referralRouter.triggerReferralReward === "function") {
-                await referralRouter.triggerReferralReward(
-                  tripId,
-                  passengerIdStr,
-                );
+                await referralRouter.triggerReferralReward(tripId, passengerIdStr);
               }
             } catch (refErr) {
-              console.error(
-                "Referral reward error (non-fatal):",
-                refErr.message,
-              );
+              console.error("Referral reward error (non-fatal):", refErr.message);
             }
           }
 
+          // Passenger trip completed notification
           emitter.emit("notification", {
             userId: passengerIdStr,
             type: "trip_completed",
-            title: "Trip Completed",
+            title: isFreeLoyaltyRide ? "🎁 Free Ride Complete!" : "Trip Completed",
             body: `Your trip is done. Fare: ₦${fareNaira.toLocaleString()}. ${passengerNote}`,
             data: {
               tripId,
               fare: fareNaira,
               status: "completed",
               paymentMethod: resolvedPaymentMethod,
+              isFreeLoyaltyRide,
             },
           });
 
+          // ── LOYALTY UNLOCK NOTIFICATION ──────────────────────────────────
+          // Fires a special "you just unlocked a free ride!" push separately
+          // so the frontend can show the fancy modal
+          if (loyaltyResult?.justUnlocked) {
+            emitter.emit("notification", {
+              userId: passengerIdStr,
+              type: "loyalty_free_ride_unlocked",
+              title: "🏆 Free Ride Unlocked!",
+              body: `You've completed ${LoyaltyProgress.TRIPS_REQUIRED} rides with The Kilometre Club. Your next ride is FREE! Expires in ${LoyaltyProgress.FREE_RIDE_EXPIRY_DAYS} days.`,
+              data: {
+                type:            "loyalty_free_ride_unlocked",
+                tripCount:       loyaltyResult.progress.tripCount,
+                freeRideExpiresAt: loyaltyResult.progress.freeRideExpiresAt,
+                programme:       "kilometre_club",
+              },
+            });
+            console.log(`🏆 Free ride unlock notification sent to ${passengerIdStr}`);
+          }
+
+          // Driver trip completed notification
           emitter.emit("notification", {
             userId: driverId,
             type: "trip_completed",
-            title: "Trip Completed",
+            title: isFreeLoyaltyRide ? "🎁 Kilometre Club Ride Earned!" : "Trip Completed",
             body: `You earned ₦${fareNaira.toLocaleString()}. ${driverNote}`,
             data: {
               tripId,
@@ -1126,6 +1151,7 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
               paymentMethod: resolvedPaymentMethod,
               driverMessage: driverNote,
               isWalletPayment: resolvedPaymentMethod === "wallet",
+              isLoyaltyRide: isFreeLoyaltyRide,
             },
           });
 
@@ -1135,11 +1161,10 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             passengerId: passengerIdStr,
             finalFare: fareNaira,
             completedAt: new Date(),
+            isFreeLoyaltyRide,
           });
 
-          console.log(
-            `📨 Post-completion notifications sent for trip ${tripId}`,
-          );
+          console.log(`📨 Post-completion notifications sent for trip ${tripId}`);
         } catch (postErr) {
           console.error("Post-completion error (non-fatal):", postErr.message);
         }
@@ -1152,21 +1177,12 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
     let errorCode = "INTERNAL_ERROR";
     let errorMessage = error.message || "Failed to complete trip";
 
-    if (error.message.includes("not found")) {
-      statusCode = 404;
-      errorCode = "TRIP_NOT_FOUND";
-    } else if (error.message.includes("Unauthorized")) {
-      statusCode = 403;
-      errorCode = "UNAUTHORIZED";
-    } else if (
-      error.message.includes("already completed") ||
-      error.message.includes("already cancelled")
-    ) {
-      statusCode = 400;
-      errorCode = "TRIP_ALREADY_ENDED";
+    if (error.message.includes("not found")) { statusCode = 404; errorCode = "TRIP_NOT_FOUND"; }
+    else if (error.message.includes("Unauthorized")) { statusCode = 403; errorCode = "UNAUTHORIZED"; }
+    else if (error.message.includes("already completed") || error.message.includes("already cancelled")) {
+      statusCode = 400; errorCode = "TRIP_ALREADY_ENDED";
     } else if (error.message.includes("Insufficient wallet balance")) {
-      statusCode = 400;
-      errorCode = "INSUFFICIENT_BALANCE";
+      statusCode = 400; errorCode = "INSUFFICIENT_BALANCE";
     }
 
     res.status(statusCode).json({
@@ -1181,15 +1197,13 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
 // ==========================================
 // POST /trips/:tripId/cancel
 // ==========================================
-
 router.post("/:tripId/cancel", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { reason } = req.body;
 
     const trip = await Trip.findById(req.params.tripId);
-    if (!trip)
-      return res.status(404).json({ error: { message: "Trip not found" } });
+    if (!trip) return res.status(404).json({ error: { message: "Trip not found" } });
 
     const isPassenger = trip.passengerId.toString() === userId;
     const isDriver = trip.driverId?.toString() === userId;
@@ -1198,6 +1212,8 @@ router.post("/:tripId/cancel", requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: { message: "Unauthorized" } });
     }
 
+    // If a free ride is cancelled, we do NOT count it against the loyalty counter
+    // and we do NOT consume the free ride entitlement — it stays available.
     trip.status = "cancelled";
     trip.cancelledAt = new Date();
     trip.cancellationReason =
@@ -1214,16 +1230,73 @@ router.post("/:tripId/cancel", requireAuth, async (req, res, next) => {
     res.json({ success: true, trip, message: "Trip cancelled successfully" });
   } catch (err) {
     console.error("Cancel error:", err);
-    res
-      .status(500)
-      .json({ success: false, error: { message: "Failed to cancel trip" } });
+    res.status(500).json({ success: false, error: { message: "Failed to cancel trip" } });
+  }
+});
+
+// ==========================================
+// GET /trips/loyalty — passenger's loyalty status
+// ==========================================
+router.get("/loyalty", requireAuth, async (req, res, next) => {
+  try {
+    const passengerId = req.user.sub;
+    const { eligible, progress } = await LoyaltyProgress.checkEligibility(passengerId);
+
+    if (!progress) {
+      // No trips yet — return a fresh zeroed state
+      return res.json({
+        success: true,
+        loyalty: {
+          tripCount:            0,
+          tripsRequired:        LoyaltyProgress.TRIPS_REQUIRED,
+          tripsUntilFreeRide:   LoyaltyProgress.TRIPS_REQUIRED,
+          progressPercent:      0,
+          freeRideAvailable:    false,
+          freeRideStillValid:   false,
+          freeRideExpiresAt:    null,
+          totalFreeRidesEarned: 0,
+          totalFreeRideValueNaira: 0,
+          programme: {
+            name:        "The Kilometre Club",
+            tagline:     "Ride 5, Get 1 Free — Every Time.",
+            colour:      "#7C3AED",
+            expiryDays:  LoyaltyProgress.FREE_RIDE_EXPIRY_DAYS,
+          },
+        },
+      });
+    }
+
+    res.json({
+      success: true,
+      loyalty: {
+        tripCount:               progress.tripCount,
+        tripsRequired:           LoyaltyProgress.TRIPS_REQUIRED,
+        tripsUntilFreeRide:      progress.tripsUntilFreeRide,
+        progressPercent:         progress.progressPercent,
+        freeRideAvailable:       progress.freeRideAvailable,
+        freeRideStillValid:      progress.freeRideStillValid,
+        freeRideUnlockedAt:      progress.freeRideUnlockedAt,
+        freeRideExpiresAt:       progress.freeRideExpiresAt,
+        lastTripCountedAt:       progress.lastTripCountedAt,
+        lastFreeRideRedeemedAt:  progress.lastFreeRideRedeemedAt,
+        totalFreeRidesEarned:    progress.totalFreeRidesEarned,
+        totalFreeRideValueNaira: progress.totalFreeRideValueNaira,
+        programme: {
+          name:       "The Kilometre Club",
+          tagline:    "Ride 5, Get 1 Free — Every Time.",
+          colour:     "#7C3AED",
+          expiryDays: LoyaltyProgress.FREE_RIDE_EXPIRY_DAYS,
+        },
+      },
+    });
+  } catch (err) {
+    next(err);
   }
 });
 
 // ==========================================
 // GET /trips/history
 // ==========================================
-
 router.get("/history", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
@@ -1276,17 +1349,18 @@ router.get("/history", requireAuth, async (req, res, next) => {
           address: trip.dropoffLocation?.address || "Dropoff Location",
           coordinates: trip.dropoffLocation?.coordinates,
         },
-        serviceType: trip.serviceType,
-        paymentMethod: trip.paymentMethod,
-        estimatedFare: trip.estimatedFare,
-        finalFare: trip.finalFare,
-        fareInNaira: trip.finalFare ? trip.finalFare.toFixed(2) : "0.00",
-        distanceKm: trip.distanceKm,
+        serviceType:     trip.serviceType,
+        paymentMethod:   trip.paymentMethod,
+        isFreeLoyaltyRide: trip.isFreeLoyaltyRide || false,
+        estimatedFare:   trip.estimatedFare,
+        finalFare:       trip.finalFare,
+        fareInNaira:     trip.finalFare ? trip.finalFare.toFixed(2) : "0.00",
+        distanceKm:      trip.distanceKm,
         durationMinutes: trip.durationMinutes,
-        requestedAt: trip.requestedAt,
-        startedAt: trip.startedAt,
-        completedAt: trip.completedAt,
-        cancelledAt: trip.cancelledAt,
+        requestedAt:     trip.requestedAt,
+        startedAt:       trip.startedAt,
+        completedAt:     trip.completedAt,
+        cancelledAt:     trip.cancelledAt,
         cancellationReason: trip.cancellationReason,
         otherParty: isDriver
           ? {
@@ -1302,8 +1376,8 @@ router.get("/history", requireAuth, async (req, res, next) => {
               profilePicUrl: trip.driverId?.profilePicUrl,
               vehicleInfo: trip.driverId?.driverProfile
                 ? {
-                    make: trip.driverId.driverProfile.vehicleMake,
-                    model: trip.driverId.driverProfile.vehicleModel,
+                    make:   trip.driverId.driverProfile.vehicleMake,
+                    model:  trip.driverId.driverProfile.vehicleModel,
                     number: trip.driverId.driverProfile.vehicleNumber,
                   }
                 : null,
@@ -1321,17 +1395,12 @@ router.get("/history", requireAuth, async (req, res, next) => {
         hasMore: total > parsedOffset + parsedLimit,
       },
       stats: {
-        totalTrips: total,
-        completedTrips: await Trip.countDocuments({
-          ...filter,
-          status: "completed",
-        }),
-        cancelledTrips: await Trip.countDocuments({
-          ...filter,
-          status: "cancelled",
-        }),
+        totalTrips:     total,
+        completedTrips: await Trip.countDocuments({ ...filter, status: "completed" }),
+        cancelledTrips: await Trip.countDocuments({ ...filter, status: "cancelled" }),
+        freeRidesUsed:  await Trip.countDocuments({ ...filter, isFreeLoyaltyRide: true }),
         totalSpent: trips
-          .filter((t) => t.status === "completed")
+          .filter((t) => t.status === "completed" && !t.isFreeLoyaltyRide)
           .reduce((s, t) => s + (t.finalFare || 0), 0),
       },
     });
@@ -1344,7 +1413,6 @@ router.get("/history", requireAuth, async (req, res, next) => {
 // ==========================================
 // GET /trips/history/stats
 // ==========================================
-
 router.get("/history/stats", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
@@ -1352,47 +1420,26 @@ router.get("/history/stats", requireAuth, async (req, res, next) => {
 
     const now = new Date();
     let startDate;
-    if (period === "week")
-      startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    else if (period === "month")
-      startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-    else if (period === "year")
-      startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
+    if (period === "week") startDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    else if (period === "month") startDate = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    else if (period === "year") startDate = new Date(now.getTime() - 365 * 24 * 60 * 60 * 1000);
 
-    const filter =
-      role === "driver" ? { driverId: userId } : { passengerId: userId };
+    const filter = role === "driver" ? { driverId: userId } : { passengerId: userId };
     if (startDate) filter.completedAt = { $gte: startDate };
 
     const completedFilter = { ...filter, status: "completed" };
 
-    const [
-      completedTrips,
-      cancelledTrips,
-      totalDistRes,
-      totalFareRes,
-      serviceBreakdown,
-    ] = await Promise.all([
-      Trip.countDocuments(completedFilter),
-      Trip.countDocuments({ ...filter, status: "cancelled" }),
-      Trip.aggregate([
-        { $match: completedFilter },
-        { $group: { _id: null, total: { $sum: "$distanceKm" } } },
-      ]),
-      Trip.aggregate([
-        { $match: completedFilter },
-        { $group: { _id: null, total: { $sum: "$finalFare" } } },
-      ]),
-      Trip.aggregate([
-        { $match: completedFilter },
-        {
-          $group: {
-            _id: "$serviceType",
-            count: { $sum: 1 },
-            totalFare: { $sum: "$finalFare" },
-          },
-        },
-      ]),
-    ]);
+    const [completedTrips, cancelledTrips, totalDistRes, totalFareRes, serviceBreakdown] =
+      await Promise.all([
+        Trip.countDocuments(completedFilter),
+        Trip.countDocuments({ ...filter, status: "cancelled" }),
+        Trip.aggregate([{ $match: completedFilter }, { $group: { _id: null, total: { $sum: "$distanceKm" } } }]),
+        Trip.aggregate([{ $match: completedFilter }, { $group: { _id: null, total: { $sum: "$finalFare" } } }]),
+        Trip.aggregate([
+          { $match: completedFilter },
+          { $group: { _id: "$serviceType", count: { $sum: 1 }, totalFare: { $sum: "$finalFare" } } },
+        ]),
+      ]);
 
     const totalDistance = totalDistRes[0]?.total || 0;
     const totalFare = totalFareRes[0]?.total || 0;
@@ -1401,17 +1448,17 @@ router.get("/history/stats", requireAuth, async (req, res, next) => {
       success: true,
       period,
       stats: {
-        totalTrips: completedTrips + cancelledTrips,
+        totalTrips:      completedTrips + cancelledTrips,
         completedTrips,
         cancelledTrips,
-        totalDistance: parseFloat(totalDistance.toFixed(2)),
+        totalDistance:   parseFloat(totalDistance.toFixed(2)),
         totalFare,
         totalFareFormatted: `₦${totalFare.toLocaleString()}`,
-        averageFare: completedTrips > 0 ? totalFare / completedTrips : 0,
+        averageFare:     completedTrips > 0 ? totalFare / completedTrips : 0,
         serviceTypeBreakdown: serviceBreakdown.map((i) => ({
           serviceType: i._id,
-          count: i.count,
-          totalFare: i.totalFare,
+          count:       i.count,
+          totalFare:   i.totalFare,
         })),
       },
     });
@@ -1423,7 +1470,6 @@ router.get("/history/stats", requireAuth, async (req, res, next) => {
 // ==========================================
 // GET /trips/history/:tripId
 // ==========================================
-
 router.get("/history/:tripId", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
@@ -1432,18 +1478,13 @@ router.get("/history/:tripId", requireAuth, async (req, res, next) => {
       .populate("driverId", "name phone profilePicUrl driverProfile")
       .lean();
 
-    if (!trip)
-      return res
-        .status(404)
-        .json({ success: false, error: { message: "Trip not found" } });
+    if (!trip) return res.status(404).json({ success: false, error: { message: "Trip not found" } });
 
     const isPassenger = trip.passengerId?._id?.toString() === userId;
-    const isDriver = trip.driverId?._id?.toString() === userId;
+    const isDriver    = trip.driverId?._id?.toString() === userId;
 
     if (!isPassenger && !isDriver) {
-      return res
-        .status(403)
-        .json({ success: false, error: { message: "Unauthorized" } });
+      return res.status(403).json({ success: false, error: { message: "Unauthorized" } });
     }
 
     res.json({ success: true, trip });
@@ -1455,19 +1496,16 @@ router.get("/history/:tripId", requireAuth, async (req, res, next) => {
 // ==========================================
 // GET /trips/:tripId
 // ==========================================
-
 router.get("/:tripId", requireAuth, async (req, res, next) => {
   try {
     const trip = await Trip.findById(req.params.tripId).lean();
-    if (!trip)
-      return res.status(404).json({ error: { message: "Trip not found" } });
+    if (!trip) return res.status(404).json({ error: { message: "Trip not found" } });
 
     const userId = req.user.sub;
     const isAuth =
       trip.passengerId.toString() === userId ||
       trip.driverId?.toString() === userId;
-    if (!isAuth)
-      return res.status(403).json({ error: { message: "Unauthorized" } });
+    if (!isAuth) return res.status(403).json({ error: { message: "Unauthorized" } });
 
     res.json({ trip });
   } catch (err) {
@@ -1478,13 +1516,11 @@ router.get("/:tripId", requireAuth, async (req, res, next) => {
 // ==========================================
 // GET /trips
 // ==========================================
-
 router.get("/", requireAuth, async (req, res, next) => {
   try {
     const userId = req.user.sub;
     const { role = "passenger", limit = 50, offset = 0 } = req.query;
-    const filter =
-      role === "driver" ? { driverId: userId } : { passengerId: userId };
+    const filter = role === "driver" ? { driverId: userId } : { passengerId: userId };
     const trips = await Trip.find(filter)
       .sort({ requestedAt: -1 })
       .limit(parseInt(limit))
@@ -1499,36 +1535,39 @@ router.get("/", requireAuth, async (req, res, next) => {
 // ==========================================
 // PERIODIC CLEANUP
 // ==========================================
-
 function startPeriodicCleanup() {
-  setInterval(
-    async () => {
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      const expired = await TripRequest.find({
+        status: "searching",
+        expiresAt: { $lt: now },
+      }).lean();
+      for (const req of expired) await cleanupFailedTripRequest(req._id);
+
+      const deleted = await TripRequest.deleteMany({
+        status: "no_drivers",
+        createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) },
+      });
+      if (deleted.deletedCount > 0)
+        console.log(`🗑️ Deleted ${deleted.deletedCount} old no_drivers requests`);
+
+      await mongoose.connection
+        .collection("idempotency_keys")
+        .deleteMany({ expiresAt: { $lt: now } });
+
+      // Sweep expired free ride entitlements
       try {
-        const now = new Date();
-        const expired = await TripRequest.find({
-          status: "searching",
-          expiresAt: { $lt: now },
-        }).lean();
-        for (const req of expired) await cleanupFailedTripRequest(req._id);
-
-        const deleted = await TripRequest.deleteMany({
-          status: "no_drivers",
-          createdAt: { $lt: new Date(now.getTime() - 10 * 60 * 1000) },
-        });
-        if (deleted.deletedCount > 0)
-          console.log(
-            `🗑️ Deleted ${deleted.deletedCount} old no_drivers requests`,
-          );
-
-        await mongoose.connection
-          .collection("idempotency_keys")
-          .deleteMany({ expiresAt: { $lt: now } });
-      } catch (err) {
-        console.error("Cleanup error:", err);
+        const expiredCount = await LoyaltyProgress.expireStaleRewards();
+        if (expiredCount > 0)
+          console.log(`⏰ Expired ${expiredCount} stale loyalty free rides`);
+      } catch (loyaltyCleanupErr) {
+        console.error("Loyalty cleanup error (non-fatal):", loyaltyCleanupErr.message);
       }
-    },
-    5 * 60 * 1000,
-  );
+    } catch (err) {
+      console.error("Cleanup error:", err);
+    }
+  }, 5 * 60 * 1000);
 }
 
 startPeriodicCleanup();
@@ -1536,22 +1575,14 @@ startPeriodicCleanup();
 // ==========================================
 // ADMIN ENDPOINTS
 // ==========================================
-
-router.post(
-  "/admin/flush-trips",
-  requireAuth,
-  requireAdmin,
-  async (req, res) => {
-    try {
-      const deleted = await TripRequest.deleteMany({
-        expiresAt: { $lt: new Date() },
-      });
-      res.json({ success: true, deletedCount: deleted.deletedCount });
-    } catch (err) {
-      res.status(500).json({ error: { message: "Flush failed" } });
-    }
-  },
-);
+router.post("/admin/flush-trips", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const deleted = await TripRequest.deleteMany({ expiresAt: { $lt: new Date() } });
+    res.json({ success: true, deletedCount: deleted.deletedCount });
+  } catch (err) {
+    res.status(500).json({ error: { message: "Flush failed" } });
+  }
+});
 
 router.get("/admin/config", requireAuth, requireAdmin, async (req, res) => {
   res.json({
@@ -1570,26 +1601,16 @@ router.post("/drivers/cleanup-state", requireAuth, async (req, res) => {
   try {
     const driverId = req.user.sub;
     const driver = await User.findById(driverId).select("driverProfile");
-    if (!driver)
-      return res.status(404).json({ error: { message: "Driver not found" } });
+    if (!driver) return res.status(404).json({ error: { message: "Driver not found" } });
 
     let cleaned = false;
     const issues = [];
 
     if (driver.driverProfile?.currentTripId) {
-      const currentTrip = await Trip.findById(
-        driver.driverProfile.currentTripId,
-      ).select("status");
-      if (
-        !currentTrip ||
-        ["completed", "cancelled"].includes(currentTrip?.status)
-      ) {
+      const currentTrip = await Trip.findById(driver.driverProfile.currentTripId).select("status");
+      if (!currentTrip || ["completed", "cancelled"].includes(currentTrip?.status)) {
         cleaned = true;
-        issues.push(
-          !currentTrip
-            ? "Trip not found — removing stale ref"
-            : `Trip ${currentTrip.status} — removing stale ref`,
-        );
+        issues.push(!currentTrip ? "Trip not found — removing stale ref" : `Trip ${currentTrip.status} — removing stale ref`);
       } else {
         issues.push(`Trip is ${currentTrip.status} — keeping ref`);
       }
@@ -1611,11 +1632,8 @@ router.post("/drivers/cleanup-state", requireAuth, async (req, res) => {
 router.get("/drivers/current-state", requireAuth, async (req, res) => {
   try {
     const driverId = req.user.sub;
-    const driver = await User.findById(driverId)
-      .select("name driverProfile")
-      .lean();
-    if (!driver)
-      return res.status(404).json({ error: { message: "Driver not found" } });
+    const driver = await User.findById(driverId).select("name driverProfile").lean();
+    if (!driver) return res.status(404).json({ error: { message: "Driver not found" } });
 
     let currentTrip = null;
     if (driver.driverProfile?.currentTripId) {
@@ -1632,8 +1650,7 @@ router.get("/drivers/current-state", requireAuth, async (req, res) => {
       currentTrip,
       needsCleanup:
         driver.driverProfile?.currentTripId &&
-        (!currentTrip ||
-          ["completed", "cancelled"].includes(currentTrip?.status)),
+        (!currentTrip || ["completed", "cancelled"].includes(currentTrip?.status)),
     });
   } catch (err) {
     res.status(500).json({ error: { message: "Failed to get state" } });
@@ -1643,15 +1660,11 @@ router.get("/drivers/current-state", requireAuth, async (req, res) => {
 // ==========================================
 // INDEX CREATION
 // ==========================================
-
 async function createIndexes() {
   try {
     await mongoose.connection
       .collection("idempotency_keys")
-      .createIndex(
-        { key: 1 },
-        { unique: true, expireAfterSeconds: 24 * 60 * 60 },
-      );
+      .createIndex({ key: 1 }, { unique: true, expireAfterSeconds: 24 * 60 * 60 });
     console.log("✅ Idempotency key index created");
   } catch (err) {
     console.log("Index creation note:", err.message);
