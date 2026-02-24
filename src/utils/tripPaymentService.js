@@ -160,10 +160,10 @@ async function processTripWalletPayment({ tripId, passengerId, driverId, fareNai
 }
 
 /**
- * Record earnings for a cash trip.
- * For cash trips the passenger pays the driver in person. We credit the driver's
- * wallet to keep their total earnings accurate, since the physical cash has
- * already changed hands outside the app.
+ * Record earnings for a cash trip — STATS ONLY, no wallet balance change.
+ * The driver physically collected cash from the passenger.
+ * We create a Transaction record so earnings history is accurate,
+ * but we do NOT touch the wallet balance.
  *
  * @param {Object} params
  * @param {string} params.tripId
@@ -175,15 +175,15 @@ async function processTripWalletPayment({ tripId, passengerId, driverId, fareNai
  * @returns {{ driverTxn, driverWallet }}
  */
 async function recordCashTripEarning({ tripId, driverId, fareNaira, serviceType }, session) {
-  console.log(`💵 Recording cash earnings for driver ${driverId}: ₦${fareNaira}`);
+  console.log(`💵 Recording cash earning (stats only) for driver ${driverId}: ₦${fareNaira}`);
 
   const fareKobo = Math.round(fareNaira * 100);
   const driverObjectId = new mongoose.Types.ObjectId(driverId);
 
+  // Ensure wallet exists for the driver (needed for future wallet payments)
   let driverWallet = await Wallet.findOne({ owner: driverObjectId }).session(session);
-  
   if (!driverWallet) {
-    console.log(`Creating new wallet for driver ${driverId}`);
+    console.log(`Creating wallet for driver ${driverId}`);
     const created = await Wallet.create([{
       owner: driverObjectId,
       balance: 0,
@@ -192,12 +192,8 @@ async function recordCashTripEarning({ tripId, driverId, fareNaira, serviceType 
     driverWallet = created[0];
   }
 
-  const balanceBefore = driverWallet.balance;
-  
-  // Credit the driver wallet with the cash fare they physically collected
-  driverWallet.balance += fareKobo;
-  await driverWallet.save({ session });
-
+  // ✅ Do NOT modify wallet.balance for cash trips
+  // Create a transaction record for earnings history/stats ONLY
   const [driverTxn] = await Transaction.create([{
     userId: driverObjectId,
     type: 'credit',
@@ -205,17 +201,18 @@ async function recordCashTripEarning({ tripId, driverId, fareNaira, serviceType 
     description: `Cash ride earnings — ${serviceType || 'ride'} trip`,
     category: 'trip_earning',
     status: 'completed',
-    balanceBefore,
-    balanceAfter: driverWallet.balance,
+    balanceBefore: driverWallet.balance,   // unchanged
+    balanceAfter: driverWallet.balance,    // same — no balance change
     metadata: {
       tripId: tripId.toString(),
       serviceType,
       fareNaira,
-      paymentMethod: 'cash'
+      paymentMethod: 'cash',
+      walletCredited: false,  // explicit flag — cash stays with driver physically
     }
   }], { session });
 
-  console.log(`✅ Driver cash earning recorded: ${driverTxn._id} | New balance: ₦${(driverWallet.balance / 100).toFixed(2)}`);
+  console.log(`✅ Cash earning recorded (no wallet change): ${driverTxn._id}`);
 
   return { driverTxn, driverWallet };
 }

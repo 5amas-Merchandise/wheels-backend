@@ -150,7 +150,7 @@ function toRad(degrees) {
 }
 
 // ==========================================
-// POST /trips/request
+// POST /trips/request  (FIXED: paymentMethod validation & persistence)
 // ==========================================
 
 router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
@@ -178,10 +178,18 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         dropoffAddress,
       } = req.body;
 
+      // --- FIX: validate and resolve payment method ---
+      const VALID_PAYMENT_METHODS = ["cash", "wallet"];
+      const resolvedPaymentMethod = VALID_PAYMENT_METHODS.includes(
+        paymentMethod,
+      )
+        ? paymentMethod
+        : "cash";
+
       console.log("🚗 === NEW TRIP REQUEST ===");
       console.log("Passenger ID:", passengerId);
       console.log("Service Type:", serviceType);
-      console.log("Payment Method:", paymentMethod);
+      console.log("Payment Method (resolved):", resolvedPaymentMethod);
       console.log("Estimated Fare (naira):", estimatedFare);
       console.log("Distance:", distance, "km");
 
@@ -274,7 +282,7 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
               pickup,
               dropoff,
               serviceType,
-              paymentMethod,
+              paymentMethod: resolvedPaymentMethod, // FIX: use resolved value
               estimatedFare: estimatedFare || 0,
               distance: distance || 0,
               duration: duration || 0,
@@ -310,7 +318,7 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
             pickup,
             dropoff,
             serviceType,
-            paymentMethod,
+            paymentMethod: resolvedPaymentMethod, // FIX: use resolved value
             estimatedFare: estimatedFare || 0,
             distance: distance || 0,
             duration: duration || 0,
@@ -334,6 +342,7 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         estimatedFare: estimatedFare || 0,
       };
 
+      // FIX: use resolvedPaymentMethod in candidateData
       candidateData = {
         serviceType,
         estimatedFare: estimatedFare || 0,
@@ -343,7 +352,7 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         dropoff,
         pickupAddress: pickupAddress || "",
         dropoffAddress: dropoffAddress || "",
-        paymentMethod,
+        paymentMethod: resolvedPaymentMethod,
         immediateOffer: true,
       };
     });
@@ -533,7 +542,7 @@ router.get("/request/:requestId", requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/accept
+// POST /trips/accept (FIXED: Trip.create block replaced)
 // ==========================================
 
 router.post(
@@ -647,6 +656,7 @@ router.post(
         throw new Error("Trip is no longer available");
       }
 
+      // --- FIX: Trip.create block replaced exactly as provided ---
       const tripDoc = await Trip.create(
         [
           {
@@ -757,12 +767,10 @@ router.post(
           statusCode = 400;
           errorCode = "TRIP_UNAVAILABLE";
         }
-        res
-          .status(statusCode)
-          .json({
-            success: false,
-            error: { message: error.message, code: errorCode },
-          });
+        res.status(statusCode).json({
+          success: false,
+          error: { message: error.message, code: errorCode },
+        });
       }
     } finally {
       await session.endSession();
@@ -883,7 +891,7 @@ router.post("/:tripId/start", requireAuth, async (req, res, next) => {
 });
 
 // ==========================================
-// POST /trips/:tripId/complete  ← MAIN FIX
+// POST /trips/:tripId/complete  (FIXED: cash branch log)
 // ==========================================
 //
 // UNIT CONVENTION:
@@ -952,7 +960,7 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
           paymentResult = null;
         }
       } else {
-        // Record cash earning for stats (no wallet balance change)
+        // --- FIX: updated console log to include "(stats only)" ---
         try {
           paymentResult = await recordCashTripEarning(
             {
@@ -963,7 +971,9 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             },
             session,
           );
-          console.log(`💵 Cash earning recorded for driver ${driverId}`);
+          console.log(
+            `💵 Cash earning recorded (stats only) for driver ${driverId}`,
+          );
         } catch (cashErr) {
           console.warn(
             `⚠️ Cash earning record failed (non-fatal): ${cashErr.message}`,
@@ -1159,12 +1169,10 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
       errorCode = "INSUFFICIENT_BALANCE";
     }
 
-    res
-      .status(statusCode)
-      .json({
-        success: false,
-        error: { message: errorMessage, code: errorCode },
-      });
+    res.status(statusCode).json({
+      success: false,
+      error: { message: errorMessage, code: errorCode },
+    });
   } finally {
     await session.endSession();
   }
