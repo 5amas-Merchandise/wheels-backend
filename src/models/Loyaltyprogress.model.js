@@ -173,27 +173,36 @@ LoyaltyProgressSchema.statics.recordCompletedTrip = async function (
 ) {
   const progress = await this.findOrCreate(passengerId, session);
 
-  // Free rides: update lifetime value + audit, but don't re-increment counter
+  // ── FREE RIDE REDEEMED ────────────────────────────────────────────────────
+  // Update lifetime value + audit, reset counter to 0 so the next cycle
+  // requires a full 5 paid trips again before another free ride is unlocked.
   if (isFreeLoyaltyRide) {
     progress.totalFreeRidesEarned += 1;
     progress.totalFreeRideValueNaira += fareNaira || 0;
     progress.freeRideAvailable = false;
     progress.freeRideExpiresAt = null;
+    progress.freeRideUnlockedAt = null;
     progress.lastFreeRideRedeemedAt = new Date();
+
+    // ✅ FIX: Reset counter to 0 so the passenger must complete another
+    // full cycle of TRIPS_REQUIRED paid trips to earn the next free ride.
+    // Previously this line was missing, causing the counter to stay at 5
+    // and immediately unlock a new free ride after just 1 more paid trip.
+    progress.tripCount = 0;
 
     _appendEvent(progress, {
       eventType: 'free_ride_redeemed',
       tripId,
-      tripCountSnapshot: progress.tripCount,
+      tripCountSnapshot: progress.tripCount, // 0 after reset
       fareNaira,
-      note: 'Free ride redeemed — counter stays reset at 0'
+      note: 'Free ride redeemed — counter reset to 0, new cycle begins'
     });
 
     await progress.save({ session });
     return { progress, justUnlocked: false, freeRideRedeemed: true };
   }
 
-  // Paid trip — increment counter
+  // ── PAID TRIP — increment counter ─────────────────────────────────────────
   progress.tripCount = Math.min(progress.tripCount + 1, TRIPS_REQUIRED);
   progress.lastTripCountedAt = new Date();
 

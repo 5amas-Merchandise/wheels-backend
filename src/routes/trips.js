@@ -853,6 +853,7 @@ router.post("/:tripId/start", requireAuth, async (req, res, next) => {
 //              → LoyaltyProgress.recordCompletedTrip (isFreeLoyaltyRide=false)
 //              → tripCount++, possibly unlocks next free ride
 // ==========================================
+// POST /trips/:tripId/complete
 router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
   const session = await mongoose.startSession();
 
@@ -888,8 +889,7 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
       let resolvedPaymentMethod = paymentMethod;
 
       if (isFreeLoyaltyRide || paymentMethod === "free_ride") {
-        // ── FREE RIDE: system pays driver ─────────────────────────────────
-        // Use the locked-in payout amount from metadata (set at request time)
+        // ── FREE RIDE: driver credited directly by platform ─────────────────
         const driverPayoutNaira =
           existingTrip.metadata?.freeRideDriverPayoutNaira || fareNaira;
 
@@ -906,11 +906,10 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
           );
           resolvedPaymentMethod = "free_ride";
           console.log(
-            `🎁 Free ride payout: ₦${driverPayoutNaira} credited to driver from system wallet`
+            `🎁 Free ride payout: ₦${driverPayoutNaira} credited to driver (platform credit)`
           );
         } catch (freeRideErr) {
-          // If system wallet is insufficient, log loudly but don't block completion.
-          // Mark for manual review via completionNotes.
+          // Unexpected database error – fallback to pending manual review
           console.error(`🚨 Free ride driver payout FAILED: ${freeRideErr.message}`);
           resolvedPaymentMethod = "free_ride_pending";
           paymentResult = null;
@@ -954,7 +953,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
           completedAt: new Date(),
           paymentMethod: resolvedPaymentMethod,
           paymentConfirmed: true,
-          // Mark driver credit as processed only if payout succeeded
           loyaltyDriverCreditProcessed:
             isFreeLoyaltyRide && resolvedPaymentMethod === "free_ride",
           loyaltyDriverCreditTxnId: paymentResult?.driverTxn?._id || null,
@@ -1003,14 +1001,12 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
           `freeRideRedeemed=${loyaltyResult.freeRideRedeemed}`
         );
 
-        // Stamp the trip with the loyalty counter snapshot
         await Trip.findByIdAndUpdate(
           tripId,
           { loyaltyTripNumberAtBooking: loyaltyResult.progress.tripCount },
           { session }
         );
       } catch (loyaltyErr) {
-        // Non-fatal — loyalty update failing must NOT block trip completion
         console.error(`⚠️ Loyalty update failed (non-fatal): ${loyaltyErr.message}`);
       }
 
@@ -1074,7 +1070,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
                 }
               : null,
         },
-        // Loyalty summary for frontend to update progress UI
         loyalty: loyaltyResult
           ? {
               tripCount:           loyaltyResult.progress.tripCount,
@@ -1092,7 +1087,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
       // ── 10. Post-commit side effects ──────────────────────────────────────
       setImmediate(async () => {
         try {
-          // Referral reward
           if (shouldTriggerReferral) {
             try {
               const referralRouter = require("./referral");
@@ -1104,7 +1098,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             }
           }
 
-          // Passenger trip completed notification
           emitter.emit("notification", {
             userId: passengerIdStr,
             type: "trip_completed",
@@ -1119,9 +1112,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             },
           });
 
-          // ── LOYALTY UNLOCK NOTIFICATION ──────────────────────────────────
-          // Fires a special "you just unlocked a free ride!" push separately
-          // so the frontend can show the fancy modal
           if (loyaltyResult?.justUnlocked) {
             emitter.emit("notification", {
               userId: passengerIdStr,
@@ -1138,7 +1128,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             console.log(`🏆 Free ride unlock notification sent to ${passengerIdStr}`);
           }
 
-          // Driver trip completed notification
           emitter.emit("notification", {
             userId: driverId,
             type: "trip_completed",

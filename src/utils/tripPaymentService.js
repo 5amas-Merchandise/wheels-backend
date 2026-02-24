@@ -29,36 +29,6 @@ async function _findOrCreateWallet(ownerObjectId, session) {
   return wallet;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPER — find the system wallet (the platform's own wallet that pays drivers
-//           on free rides). The system wallet owner is identified by the env
-//           var SYSTEM_WALLET_OWNER_ID — set this to your platform's admin
-//           User._id in .env.
-//
-//           If the env var is missing we throw clearly so it's obvious in dev.
-// ─────────────────────────────────────────────────────────────────────────────
-async function _getSystemWallet(session) {
-  const systemOwnerId = process.env.SYSTEM_WALLET_OWNER_ID;
-  if (!systemOwnerId) {
-    throw new Error(
-      'SYSTEM_WALLET_OWNER_ID env var is not set. ' +
-      'Add it to your .env pointing to the platform admin User._id.'
-    );
-  }
-
-  const systemOwnerObjectId = new mongoose.Types.ObjectId(systemOwnerId);
-  const wallet = await Wallet.findOne({ owner: systemOwnerObjectId }).session(session);
-
-  if (!wallet) {
-    throw new Error(
-      `System wallet not found for owner ${systemOwnerId}. ` +
-      'Make sure the platform admin has a funded wallet.'
-    );
-  }
-
-  return wallet;
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 //  1. processTripWalletPayment
 //     Passenger wallet  →  driver wallet  (wallet-to-wallet paid trip)
@@ -216,24 +186,20 @@ async function recordCashTripEarning(
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  3. processFreeRideLoyaltyPayment   ✨ NEW ✨
+//  3. processFreeRideLoyaltyPayment   ✨ UPDATED – NO SYSTEM WALLET ✨
 //
 //  Called when a FREE RIDE (Kilometre Club redemption) completes.
 //
 //  What it does:
-//    • Passenger pays ₦0  — nothing debited from their wallet.
-//    • System wallet      — debited fareKobo.
-//    • Driver wallet      — credited fareKobo.
-//    • Two Transaction records created:
-//        ① system debit  — category: 'loyalty_payout'
-//        ② driver credit — category: 'loyalty_earning'
+//    • Passenger pays ₦0  — nothing debited.
+//    • Driver wallet      — credited fareKobo (direct platform credit).
+//    • One Transaction record created for the driver:
+//        - category: 'loyalty_earning', paymentMethod: 'free_ride'
 //
-//  Prerequisites:
-//    • SYSTEM_WALLET_OWNER_ID env var must point to the platform admin User._id.
-//    • That admin user must have a funded Wallet document.
-//    • Call this inside a mongoose session (same transaction as trip completion).
+//  No system wallet is required; the credit is treated as a promotional
+//  expense by the platform.
 //
-//  Returns: { systemTxn, driverTxn, driverWallet }
+//  Returns: { driverTxn, driverWallet }
 // ═════════════════════════════════════════════════════════════════════════════
 async function processFreeRideLoyaltyPayment(
   { tripId, passengerId, driverId, fareNaira, serviceType },
@@ -247,79 +213,27 @@ async function processFreeRideLoyaltyPayment(
   const passengerObjectId = new mongoose.Types.ObjectId(passengerId.toString());
   const tripObjectId      = new mongoose.Types.ObjectId(tripId.toString());
 
-  // ── System wallet ─────────────────────────────────────────────────────────
-  const systemWallet = await _getSystemWallet(session);
-
-  if (systemWallet.balance < fareKobo) {
-    // Non-fatal degradation: log loudly, mark trip for manual review,
-    // but don't crash the trip completion flow.
-    console.error(
-      `🚨 SYSTEM WALLET INSUFFICIENT for free ride payout! ` +
-      `Required: ₦${fareNaira} (${fareKobo} kobo) | ` +
-      `Available: ${systemWallet.balance} kobo. ` +
-      `Trip ${tripId} driver payout PENDING MANUAL REVIEW.`
-    );
-    throw new Error(
-      `System wallet has insufficient funds to pay driver for free ride. ` +
-      `Required: ₦${fareNaira.toLocaleString()}. Please top up the system wallet.`
-    );
-  }
-
-  // ── Driver wallet ─────────────────────────────────────────────────────────
+  // ── Driver wallet (create if not exists) ──────────────────────────────────
   const driverWallet = await _findOrCreateWallet(driverObjectId, session);
 
-  // ── Snapshots before ─────────────────────────────────────────────────────
-  const systemBalanceBefore = systemWallet.balance;
+  // ── Snapshot before ───────────────────────────────────────────────────────
   const driverBalanceBefore = driverWallet.balance;
 
-  // ── Debit system / credit driver ─────────────────────────────────────────
-  systemWallet.balance -= fareKobo;
-  await systemWallet.save({ session });
-
+  // ── Credit driver ─────────────────────────────────────────────────────────
   driverWallet.balance += fareKobo;
   await driverWallet.save({ session });
-
-  // ── System debit transaction ──────────────────────────────────────────────
-  const systemOwnerObjectId = new mongoose.Types.ObjectId(
-    process.env.SYSTEM_WALLET_OWNER_ID
-  );
-
-  const [systemTxn] = await Transaction.create(
-    [{
-      userId:        systemOwnerObjectId,
-      type:          'debit',
-      amount:        fareKobo,
-      description:   `Kilometre Club payout — free ride for passenger`,
-      category:      'loyalty_payout',
-      status:        'completed',
-      balanceBefore: systemBalanceBefore,
-      balanceAfter:  systemWallet.balance,
-      metadata: {
-        tripId:        tripObjectId,
-        passengerId:   passengerObjectId,
-        driverId:      driverObjectId,
-        fareNaira,
-        serviceType,
-        paymentMethod: 'free_ride',
-        role:          'system',
-        programme:     'kilometre_club',
-      },
-    }],
-    { session }
-  );
 
   // ── Driver credit transaction ─────────────────────────────────────────────
   const [driverTxn] = await Transaction.create(
     [{
-      userId:               driverObjectId,
-      type:                 'credit',
-      amount:               fareKobo,
-      description:          `Kilometre Club earnings — ${serviceType ? serviceType.replace(/_/g, ' ') : 'trip'} (free ride)`,
-      category:             'loyalty_earning',
-      status:               'completed',
-      balanceBefore:        driverBalanceBefore,
-      balanceAfter:         driverWallet.balance,
-      relatedTransactionId: systemTxn._id,
+      userId:        driverObjectId,
+      type:          'credit',
+      amount:        fareKobo,
+      description:   `Kilometre Club earnings — ${serviceType ? serviceType.replace(/_/g, ' ') : 'trip'} (free ride)`,
+      category:      'loyalty_earning',
+      status:        'completed',
+      balanceBefore: driverBalanceBefore,
+      balanceAfter:  driverWallet.balance,
       metadata: {
         tripId:        tripObjectId,
         passengerId:   passengerObjectId,
@@ -328,28 +242,18 @@ async function processFreeRideLoyaltyPayment(
         paymentMethod: 'free_ride',
         role:          'driver',
         programme:     'kilometre_club',
-        // Important flag: driver earned this from a loyalty free ride,
-        // NOT from a passenger wallet or cash payment
         loyaltyPaid:   true,
+        // No corresponding system transaction – this is a platform credit
       },
     }],
     { session }
   );
 
-  // Back-link system txn → driver txn
-  await Transaction.updateOne(
-    { _id: systemTxn._id },
-    { relatedTransactionId: driverTxn._id },
-    { session }
-  );
-
-  console.log(`✅ Free ride payout complete`);
-  console.log(`   System wallet:  ${systemBalanceBefore} → ${systemWallet.balance} kobo`);
+  console.log(`✅ Free ride payout complete – driver credited directly`);
   console.log(`   Driver wallet:  ${driverBalanceBefore} → ${driverWallet.balance} kobo`);
-  console.log(`   System txn: ${systemTxn._id} | Driver txn: ${driverTxn._id}`);
+  console.log(`   Driver txn: ${driverTxn._id}`);
 
   return {
-    systemTxn,
     driverTxn,
     driverWallet: {
       balance:          driverWallet.balance,
