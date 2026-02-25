@@ -1,4 +1,4 @@
-// models/transaction.model.js - UPDATED VERSION
+// models/transaction.model.js
 const mongoose = require('mongoose');
 
 const TransactionSchema = new mongoose.Schema({
@@ -29,9 +29,10 @@ const TransactionSchema = new mongoose.Schema({
       'wallet_funding',
       'admin_credit',
       'admin_debit',
-      'ride_payment',        // Passenger paying for a ride (wallet debit)
-      'ride_earning',        // Driver earning from a completed ride (wallet credit)
-      'referral_reward',     // Referral bonus credited to referrer or referee
+      'ride_payment',       // Passenger paying for a ride (wallet debit)
+      'ride_earning',       // Driver earning from a completed ride (wallet credit)
+      'loyalty_earning',    // ✅ FIX: Driver earning from a Kilometre Club free ride (platform credit)
+      'referral_reward',    // Referral bonus credited to referrer or referee
       'service_fee',
       'refund',
       'bonus',
@@ -90,5 +91,6 @@ TransactionSchema.pre('save', function(next) {
 TransactionSchema.index({ userId: 1, createdAt: -1 });
 TransactionSchema.index({ paymentReference: 1 }, { sparse: true });
 TransactionSchema.index({ relatedTransactionId: 1 }, { sparse: true });
+TransactionSchema.index({ category: 1, createdAt: -1 }); // ✅ useful for loyalty earning queries
 
 module.exports = mongoose.model('Transaction', TransactionSchema);

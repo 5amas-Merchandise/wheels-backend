@@ -24,6 +24,9 @@ const TRIPS_REQUIRED = 5;
 // How many days the passenger has to redeem their free ride once unlocked
 const FREE_RIDE_EXPIRY_DAYS = 30;
 
+// Maximum fare value (naira) the platform will pay the driver for a free ride
+const FREE_RIDE_MAX_PAYOUT_NAIRA = 5000;
+
 const LoyaltyProgressSchema = new mongoose.Schema({
 
   // ── Core identity ──────────────────────────────────────────────────────────
@@ -36,12 +39,14 @@ const LoyaltyProgressSchema = new mongoose.Schema({
   },
 
   // ── Counter ────────────────────────────────────────────────────────────────
-  // Number of PAID completed trips since the last free ride was redeemed (0–5)
+  // Number of PAID completed trips since the last free ride was redeemed (0–5).
+  // ⚠️  We intentionally do NOT cap this at TRIPS_REQUIRED in the schema —
+  //     the application layer controls the value precisely so it never gets
+  //     "stuck" at 5 and causes accidental re-unlocks.
   tripCount: {
     type: Number,
     default: 0,
-    min: 0,
-    max: TRIPS_REQUIRED
+    min: 0
   },
 
   // ── Free-ride state ────────────────────────────────────────────────────────
@@ -94,7 +99,13 @@ const LoyaltyProgressSchema = new mongoose.Schema({
       {
         eventType: {
           type: String,
-          enum: ['trip_counted', 'free_ride_unlocked', 'free_ride_redeemed', 'free_ride_expired', 'free_ride_granted_manually'],
+          enum: [
+            'trip_counted',
+            'free_ride_unlocked',
+            'free_ride_redeemed',
+            'free_ride_expired',
+            'free_ride_granted_manually'
+          ],
         },
         tripId: { type: mongoose.Schema.Types.ObjectId, ref: 'Trip' },
         tripCountSnapshot: { type: Number },   // value of tripCount AFTER event
@@ -111,19 +122,20 @@ const LoyaltyProgressSchema = new mongoose.Schema({
 });
 
 // ── Constants exposed as statics ───────────────────────────────────────────
-LoyaltyProgressSchema.statics.TRIPS_REQUIRED = TRIPS_REQUIRED;
+LoyaltyProgressSchema.statics.TRIPS_REQUIRED        = TRIPS_REQUIRED;
 LoyaltyProgressSchema.statics.FREE_RIDE_EXPIRY_DAYS = FREE_RIDE_EXPIRY_DAYS;
+LoyaltyProgressSchema.statics.FREE_RIDE_MAX_PAYOUT_NAIRA = FREE_RIDE_MAX_PAYOUT_NAIRA;
 
 // ── Virtual: trips still needed until next free ride ──────────────────────
 LoyaltyProgressSchema.virtual('tripsUntilFreeRide').get(function () {
   if (this.freeRideAvailable) return 0;
-  return TRIPS_REQUIRED - this.tripCount;
+  return Math.max(0, TRIPS_REQUIRED - this.tripCount);
 });
 
 // Virtual: progress percentage (0–100)
 LoyaltyProgressSchema.virtual('progressPercent').get(function () {
   if (this.freeRideAvailable) return 100;
-  return Math.round((this.tripCount / TRIPS_REQUIRED) * 100);
+  return Math.min(100, Math.round((this.tripCount / TRIPS_REQUIRED) * 100));
 });
 
 // Virtual: is the free ride still valid (not expired)?
@@ -153,10 +165,24 @@ LoyaltyProgressSchema.statics.findOrCreate = async function (passengerId, sessio
 /**
  * recordCompletedTrip — call this inside the trip-complete transaction.
  *
- * - Increments tripCount for PAID trips only (not free rides).
- * - If tripCount reaches TRIPS_REQUIRED, unlocks the free ride.
- * - Appends to recentEvents (capped at 20).
- * - Returns { progress, justUnlocked } so the caller can notify the passenger.
+ * BUG 1 FIX SUMMARY
+ * ─────────────────
+ * Old code used:
+ *   progress.tripCount = Math.min(progress.tripCount + 1, TRIPS_REQUIRED);
+ *   if (progress.tripCount >= TRIPS_REQUIRED && !progress.freeRideAvailable) { unlock }
+ *
+ * Problem: once tripCount was already at TRIPS_REQUIRED (5), Math.min kept it
+ * at 5 forever. So if a free ride trip completed with isFreeLoyaltyRide=false
+ * (flag not carried through), the reset to 0 never happened and every
+ * subsequent paid trip saw tripCount=5 → immediately re-unlocked a free ride.
+ *
+ * Fix: capture `previousCount` BEFORE incrementing, then only unlock when
+ * `previousCount < TRIPS_REQUIRED`. This means the unlock fires exactly once —
+ * when the counter genuinely crosses the threshold — never when it was
+ * already sitting at or above it.
+ *
+ * Additionally: tripCount is now reset to 0 immediately after unlocking
+ * within the paid-trip branch, so it can never stay stuck at 5.
  *
  * @param {ObjectId|string} passengerId
  * @param {ObjectId|string} tripId
@@ -174,26 +200,22 @@ LoyaltyProgressSchema.statics.recordCompletedTrip = async function (
   const progress = await this.findOrCreate(passengerId, session);
 
   // ── FREE RIDE REDEEMED ────────────────────────────────────────────────────
-  // Update lifetime value + audit, reset counter to 0 so the next cycle
-  // requires a full 5 paid trips again before another free ride is unlocked.
+  // Update lifetime stats, reset ALL free-ride state and the counter so the
+  // passenger must complete another full TRIPS_REQUIRED cycle.
   if (isFreeLoyaltyRide) {
-    progress.totalFreeRidesEarned += 1;
-    progress.totalFreeRideValueNaira += fareNaira || 0;
-    progress.freeRideAvailable = false;
-    progress.freeRideExpiresAt = null;
-    progress.freeRideUnlockedAt = null;
-    progress.lastFreeRideRedeemedAt = new Date();
-
-    // ✅ FIX: Reset counter to 0 so the passenger must complete another
-    // full cycle of TRIPS_REQUIRED paid trips to earn the next free ride.
-    // Previously this line was missing, causing the counter to stay at 5
-    // and immediately unlock a new free ride after just 1 more paid trip.
-    progress.tripCount = 0;
+    progress.totalFreeRidesEarned    += 1;
+    progress.totalFreeRideValueNaira += (fareNaira || 0);
+    progress.freeRideAvailable        = false;
+    progress.freeRideExpiresAt        = null;
+    progress.freeRideUnlockedAt       = null;
+    progress.lastFreeRideRedeemedAt   = new Date();
+    // ✅ Reset counter — new cycle requires a full TRIPS_REQUIRED paid trips
+    progress.tripCount                = 0;
 
     _appendEvent(progress, {
-      eventType: 'free_ride_redeemed',
+      eventType:         'free_ride_redeemed',
       tripId,
-      tripCountSnapshot: progress.tripCount, // 0 after reset
+      tripCountSnapshot: 0,   // always 0 after reset
       fareNaira,
       note: 'Free ride redeemed — counter reset to 0, new cycle begins'
     });
@@ -203,11 +225,17 @@ LoyaltyProgressSchema.statics.recordCompletedTrip = async function (
   }
 
   // ── PAID TRIP — increment counter ─────────────────────────────────────────
-  progress.tripCount = Math.min(progress.tripCount + 1, TRIPS_REQUIRED);
+
+  // ✅ BUG 1 FIX: snapshot the count BEFORE incrementing
+  const previousCount = progress.tripCount;
+
+  // Increment — no Math.min cap here; we reset to 0 on unlock (see below)
+  // so the counter can never naturally exceed TRIPS_REQUIRED anyway.
+  progress.tripCount      = previousCount + 1;
   progress.lastTripCountedAt = new Date();
 
   _appendEvent(progress, {
-    eventType: 'trip_counted',
+    eventType:         'trip_counted',
     tripId,
     tripCountSnapshot: progress.tripCount,
     fareNaira
@@ -215,21 +243,32 @@ LoyaltyProgressSchema.statics.recordCompletedTrip = async function (
 
   let justUnlocked = false;
 
-  // Check if threshold reached
-  if (progress.tripCount >= TRIPS_REQUIRED && !progress.freeRideAvailable) {
-    progress.freeRideAvailable = true;
+  // ✅ BUG 1 FIX: only unlock when previousCount was genuinely BELOW the
+  // threshold. This prevents re-unlocking if tripCount was already at 5
+  // (e.g. due to a data anomaly or the flag not carrying through on a
+  // prior free-ride trip).
+  if (
+    progress.tripCount >= TRIPS_REQUIRED &&
+    !progress.freeRideAvailable &&
+    previousCount < TRIPS_REQUIRED   // ← the key guard
+  ) {
+    progress.freeRideAvailable  = true;
     progress.freeRideUnlockedAt = new Date();
-    progress.freeRideExpiresAt = new Date(
+    progress.freeRideExpiresAt  = new Date(
       Date.now() + FREE_RIDE_EXPIRY_DAYS * 24 * 60 * 60 * 1000
     );
     justUnlocked = true;
 
+    // ✅ Reset counter immediately so it can never sit at 5 and accidentally
+    //    re-trigger on the next call.
+    progress.tripCount = 0;
+
     _appendEvent(progress, {
-      eventType: 'free_ride_unlocked',
+      eventType:         'free_ride_unlocked',
       tripId,
-      tripCountSnapshot: progress.tripCount,
+      tripCountSnapshot: 0,   // reset to 0 right after unlock
       fareNaira: 0,
-      note: `Unlocked after ${TRIPS_REQUIRED} trips. Expires ${progress.freeRideExpiresAt.toISOString()}`
+      note: `Unlocked after ${TRIPS_REQUIRED} trips. Counter reset to 0. Expires ${progress.freeRideExpiresAt.toISOString()}`
     });
   }
 
@@ -266,16 +305,16 @@ LoyaltyProgressSchema.statics.expireStaleRewards = async function () {
 
   let count = 0;
   for (const doc of stale) {
-    doc.freeRideAvailable = false;
-    doc.freeRideExpiresAt = null;
+    doc.freeRideAvailable  = false;
+    doc.freeRideExpiresAt  = null;
     doc.freeRideUnlockedAt = null;
-    // Reset counter — passenger starts fresh after expiry
+    // Reset counter — passenger starts a fresh cycle after expiry
     doc.tripCount = 0;
 
     _appendEvent(doc, {
-      eventType: 'free_ride_expired',
+      eventType:         'free_ride_expired',
       tripCountSnapshot: 0,
-      note: 'Free ride expired without redemption — counter reset'
+      note: 'Free ride expired without redemption — counter reset to 0'
     });
 
     await doc.save();

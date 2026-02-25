@@ -94,7 +94,7 @@ async function processTripWalletPayment(
   // ── Driver transaction ────────────────────────────────────────────────────
   const [driverTxn] = await Transaction.create(
     [{
-      userId:               passengerObjectId, // placeholder — corrected below
+      userId:               driverObjectId,
       type:                 'credit',
       amount:               fareKobo,
       description:          `Ride earnings — ${serviceType ? serviceType.replace(/_/g, ' ') : 'trip'} (wallet)`,
@@ -114,15 +114,10 @@ async function processTripWalletPayment(
     { session }
   );
 
-  // Back-link + fix driver userId
+  // Back-link passenger txn to driver txn
   await Transaction.updateOne(
     { _id: passengerTxn._id },
     { relatedTransactionId: driverTxn._id },
-    { session }
-  );
-  await Transaction.updateOne(
-    { _id: driverTxn._id },
-    { userId: driverObjectId },
     { session }
   );
 
@@ -186,7 +181,7 @@ async function recordCashTripEarning(
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  3. processFreeRideLoyaltyPayment   ✨ UPDATED – NO SYSTEM WALLET ✨
+//  3. processFreeRideLoyaltyPayment
 //
 //  Called when a FREE RIDE (Kilometre Club redemption) completes.
 //
@@ -194,10 +189,19 @@ async function recordCashTripEarning(
 //    • Passenger pays ₦0  — nothing debited.
 //    • Driver wallet      — credited fareKobo (direct platform credit).
 //    • One Transaction record created for the driver:
-//        - category: 'loyalty_earning', paymentMethod: 'free_ride'
+//        - category: 'loyalty_earning'   ✅ now in Transaction enum
+//        - paymentMethod: 'free_ride'
 //
-//  No system wallet is required; the credit is treated as a promotional
-//  expense by the platform.
+//  ✅ BUG 2 FIX:
+//    The old code used category: 'loyalty_earning' which was NOT in the
+//    Transaction model's category enum. This caused Transaction.create() to
+//    throw a Mongoose validation error every time a free ride completed.
+//    That error was caught silently by the complete route's try/catch, so
+//    resolvedPaymentMethod was set to 'free_ride_pending' and the driver
+//    never received their wallet credit.
+//
+//    Fix: added 'loyalty_earning' to the Transaction model category enum.
+//    This function is otherwise unchanged — it was always correct in intent.
 //
 //  Returns: { driverTxn, driverWallet }
 // ═════════════════════════════════════════════════════════════════════════════
@@ -205,7 +209,16 @@ async function processFreeRideLoyaltyPayment(
   { tripId, passengerId, driverId, fareNaira, serviceType },
   session
 ) {
-  console.log(`🎁 processFreeRideLoyaltyPayment | trip: ${tripId} | driver: ${driverId} | fare: ₦${fareNaira}`);
+  console.log(`🎁 processFreeRideLoyaltyPayment START`);
+  console.log(`   trip: ${tripId} | driver: ${driverId} | fare: ₦${fareNaira}`);
+
+  // ✅ Validate inputs explicitly so we get clear errors instead of silent failures
+  if (!tripId)      throw new Error('processFreeRideLoyaltyPayment: tripId is required');
+  if (!driverId)    throw new Error('processFreeRideLoyaltyPayment: driverId is required');
+  if (!passengerId) throw new Error('processFreeRideLoyaltyPayment: passengerId is required');
+  if (!fareNaira || fareNaira <= 0) {
+    throw new Error(`processFreeRideLoyaltyPayment: invalid fareNaira (${fareNaira})`);
+  }
 
   const fareKobo = Math.round(fareNaira * 100);
 
@@ -223,14 +236,17 @@ async function processFreeRideLoyaltyPayment(
   driverWallet.balance += fareKobo;
   await driverWallet.save({ session });
 
+  console.log(`   Driver wallet: ${driverBalanceBefore} → ${driverWallet.balance} kobo`);
+
   // ── Driver credit transaction ─────────────────────────────────────────────
+  // ✅ BUG 2 FIX: category is now 'loyalty_earning' which exists in the enum
   const [driverTxn] = await Transaction.create(
     [{
       userId:        driverObjectId,
       type:          'credit',
       amount:        fareKobo,
       description:   `Kilometre Club earnings — ${serviceType ? serviceType.replace(/_/g, ' ') : 'trip'} (free ride)`,
-      category:      'loyalty_earning',
+      category:      'loyalty_earning',   // ✅ now valid — added to Transaction enum
       status:        'completed',
       balanceBefore: driverBalanceBefore,
       balanceAfter:  driverWallet.balance,
@@ -243,15 +259,13 @@ async function processFreeRideLoyaltyPayment(
         role:          'driver',
         programme:     'kilometre_club',
         loyaltyPaid:   true,
-        // No corresponding system transaction – this is a platform credit
       },
     }],
     { session }
   );
 
-  console.log(`✅ Free ride payout complete – driver credited directly`);
-  console.log(`   Driver wallet:  ${driverBalanceBefore} → ${driverWallet.balance} kobo`);
-  console.log(`   Driver txn: ${driverTxn._id}`);
+  console.log(`✅ processFreeRideLoyaltyPayment COMPLETE`);
+  console.log(`   Driver txn: ${driverTxn._id} | credited: ₦${fareNaira}`);
 
   return {
     driverTxn,
