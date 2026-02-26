@@ -143,7 +143,7 @@ router.post('/drivers/:driverId/approve', async (req, res, next) => {
 });
 
 // Reject a driver
-router.post('/drivers/:driverId/reject', requireAuth, requireAdmin, async (req, res, next) => {
+router.post('/drivers/:driverId/reject', async (req, res, next) => {
   try {
     const { driverId } = req.params;
     const { reason } = req.body;

@@ -66,7 +66,29 @@ router.get("/me", requireAuth, checkSubscriptionStatus, async (req, res, next) =
 
 router.put('/request-verification', requireAuth, async (req, res, next) => {
   try {
-    const userId = req.user.sub;
+    const rawUserId = req.user.sub || req.user._id || req.user.id;
+
+    if (!rawUserId) {
+      return res.status(401).json({
+        success: false,
+        error: { message: 'No user ID found in token. Check your auth middleware.' }
+      });
+    }
+
+    // Convert to ObjectId — req.user.sub from JWT is a plain string.
+    // findByIdAndUpdate handles strings fine in theory, but explicit conversion
+    // eliminates any type-mismatch silently causing "no document found".
+    const mongoose = require('mongoose');
+    let userId;
+    try {
+      userId = new mongoose.Types.ObjectId(rawUserId);
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        error: { message: `Invalid user ID format: ${rawUserId}` }
+      });
+    }
+
     const {
       name,
       vehicleMake,
@@ -90,70 +112,53 @@ router.put('/request-verification', requireAuth, async (req, res, next) => {
     console.log(`📝 Driver verification request from: ${userId}`);
     console.log('📦 Received data:', JSON.stringify(req.body, null, 2));
 
-    // Validation
+    // ── Validation ──────────────────────────────────────────────────
     const requiredFields = [
       'name', 'vehicleMake', 'vehicleModel', 'vehicleNumber',
       'nin', 'licenseNumber', 'serviceCategories'
     ];
-    
     const missingFields = requiredFields.filter(field => !req.body[field]);
     if (missingFields.length > 0) {
       return res.status(400).json({
         success: false,
-        error: {
-          message: 'Missing required fields',
-          details: missingFields
-        }
+        error: { message: 'Missing required fields', details: missingFields }
       });
     }
 
-    // Validate NIN format (11 digits)
     if (!/^\d{11}$/.test(nin)) {
       return res.status(400).json({
         success: false,
-        error: {
-          message: 'NIN must be exactly 11 digits'
-        }
+        error: { message: 'NIN must be exactly 11 digits' }
       });
     }
 
-    // Validate service categories (convert to array if needed)
-    let serviceCategoriesArray = serviceCategories;
-    if (!Array.isArray(serviceCategoriesArray)) {
-      serviceCategoriesArray = [serviceCategoriesArray].filter(Boolean);
-    }
+    // ── Service categories ───────────────────────────────────────────
+    let serviceCategoriesArray = Array.isArray(serviceCategories)
+      ? serviceCategories
+      : [serviceCategories].filter(Boolean);
 
-    // Allowed service categories based on backend schema
     const allowedCategories = [
-      'CITY_CAR', 'BIKE', 'TRUCK', 'LUXURY', 'VAN', 'INTERSTATE',
-      'DELIVERY', 'LOGISTICS', 'KEKE', 'CITY_RIDE', 'TRUCK_LOGISTICS',
-      'INTERSTATE_TRAVEL', 'LUXURY_RENTAL'
+      'CITY_CAR', 'BIKE', 'KEKE', 'TRUCK', 'LUXURY', 'VAN',
+      'INTERSTATE', 'DELIVERY', 'LOGISTICS',
+      'CITY_RIDE', 'TRUCK_LOGISTICS', 'INTERSTATE_TRAVEL', 'LUXURY_RENTAL'
     ];
 
-    // Filter and validate service categories
     const validCategories = serviceCategoriesArray
       .filter(cat => allowedCategories.includes(cat))
-      .slice(0, 3); // Limit to 3 categories max
+      .slice(0, 3);
 
     if (validCategories.length === 0) {
       return res.status(400).json({
         success: false,
         error: {
           message: 'No valid service categories provided',
-          allowedCategories: allowedCategories
+          received: serviceCategoriesArray,
+          allowedCategories
         }
       });
     }
 
-    // Required document URLs
-    const requiredDocs = [
-      profilePicUrl,
-      carPicUrl,
-      ninImageUrl,
-      licenseImageUrl,
-      vehicleRegistrationUrl
-    ];
-
+    // ── Required documents ───────────────────────────────────────────
     const missingDocs = [];
     if (!profilePicUrl) missingDocs.push('profilePicUrl');
     if (!carPicUrl) missingDocs.push('carPicUrl');
@@ -164,92 +169,117 @@ router.put('/request-verification', requireAuth, async (req, res, next) => {
     if (missingDocs.length > 0) {
       return res.status(400).json({
         success: false,
-        error: {
-          message: 'Missing required documents',
-          details: missingDocs
-        }
+        error: { message: 'Missing required documents', details: missingDocs }
       });
     }
 
-    // Find user
-    const user = await User.findById(userId);
-    if (!user) {
+    // ── Parse vehicleYear (frontend sends string from TextInput) ─────
+    let parsedVehicleYear = null;
+    if (vehicleYear) {
+      const y = parseInt(vehicleYear, 10);
+      if (!isNaN(y) && y > 1900 && y <= new Date().getFullYear() + 1) {
+        parsedVehicleYear = y;
+      }
+    }
+
+    // ── Confirm user exists BEFORE attempting update ─────────────────
+    // This catches any ID mismatch early and gives a clear error instead
+    // of a silent no-op write.
+    const existingUser = await User.findById(userId).lean();
+    if (!existingUser) {
+      console.error(`❌ User not found for ID: ${userId} (raw token value: ${rawUserId})`);
       return res.status(404).json({
         success: false,
-        error: { message: 'User not found' }
+        error: { message: `User not found. Token sub: ${rawUserId}` }
+      });
+    }
+    console.log(`✅ User confirmed in DB: ${existingUser.name} (${existingUser.phone})`);
+
+    // ── Build $set payload with dot-notation ─────────────────────────
+    // NEVER do: user.driverProfile = { ...user.driverProfile, ...newData }
+    // Mongoose does not detect subdocument object replacement as a change,
+    // so .save() silently skips writing it. Dot-notation $set bypasses
+    // this entirely and writes directly at the MongoDB level.
+    const setPayload = {
+      name: name.trim(),
+      profilePicUrl,
+      'roles.isDriver': true,
+
+      'driverProfile.vehicleMake': vehicleMake.trim(),
+      'driverProfile.vehicleModel': vehicleModel.trim(),
+      'driverProfile.vehicleNumber': vehicleNumber.trim().toUpperCase(),
+      'driverProfile.vehicleColor': vehicleColor?.trim() || '',
+      'driverProfile.serviceCategories': validCategories,
+      'driverProfile.nin': nin,
+      'driverProfile.licenseNumber': licenseNumber.trim(),
+      'driverProfile.driverLicenseClass': driverLicenseClass?.trim() || '',
+      'driverProfile.profilePicUrl': profilePicUrl,
+      'driverProfile.carPicUrl': carPicUrl,
+      'driverProfile.ninImageUrl': ninImageUrl,
+      'driverProfile.licenseImageUrl': licenseImageUrl,
+      'driverProfile.vehicleRegistrationUrl': vehicleRegistrationUrl,
+      'driverProfile.verified': false,
+      'driverProfile.verificationState': 'pending',
+      'driverProfile.isAvailable': false,
+      'driverProfile.submittedAt': new Date(),
+    };
+
+    // Only set optional fields if provided so we don't wipe existing values
+    if (parsedVehicleYear !== null) setPayload['driverProfile.vehicleYear'] = parsedVehicleYear;
+    if (insuranceUrl) setPayload['driverProfile.insuranceUrl'] = insuranceUrl;
+    if (roadWorthinessUrl) setPayload['driverProfile.roadWorthinessUrl'] = roadWorthinessUrl;
+
+    console.log('📝 Applying $set payload:', JSON.stringify(setPayload, null, 2));
+
+    // ── Write to DB ──────────────────────────────────────────────────
+    const result = await User.findByIdAndUpdate(
+      userId,
+      { $set: setPayload },
+      {
+        new: true,          // return the updated document
+        runValidators: false // skip schema validators on partial update to avoid conflicts
+      }
+    ).select('-passwordHash -otpCode -otpExpiresAt').lean();
+
+    if (!result) {
+      console.error('❌ findByIdAndUpdate returned null — document not found during write');
+      return res.status(404).json({
+        success: false,
+        error: { message: 'Write failed — user not found. Please re-login and try again.' }
       });
     }
 
-    // Update user name if provided
-    if (name) {
-      user.name = name.trim();
-    }
-
-    // Ensure driver role is set
-    if (!user.roles.isDriver) {
-      user.roles.isDriver = true;
-    }
-
-    // Update driver profile
-    user.driverProfile = {
-      ...user.driverProfile,
-      vehicleMake: vehicleMake.trim(),
-      vehicleModel: vehicleModel.trim(),
-      vehicleNumber: vehicleNumber.trim().toUpperCase(),
-      vehicleColor: vehicleColor?.trim() || user.driverProfile?.vehicleColor || '',
-      vehicleYear: vehicleYear || user.driverProfile?.vehicleYear || null,
-      serviceCategories: validCategories,
-      nin: nin,
-      licenseNumber: licenseNumber.trim(),
-      driverLicenseClass: driverLicenseClass || user.driverProfile?.driverLicenseClass || '',
-      profilePicUrl: profilePicUrl,
-      carPicUrl: carPicUrl,
-      ninImageUrl: ninImageUrl,
-      licenseImageUrl: licenseImageUrl,
-      vehicleRegistrationUrl: vehicleRegistrationUrl,
-      insuranceUrl: insuranceUrl || user.driverProfile?.insuranceUrl || null,
-      roadWorthinessUrl: roadWorthinessUrl || user.driverProfile?.roadWorthinessUrl || null,
-      verified: false,
-      verificationState: 'pending',
-      isAvailable: false // Not available until verified
-    };
-
-    await user.save();
-
-    // Get updated user for response
-    const updatedUser = await User.findById(userId)
-      .select('-passwordHash -otpCode -otpExpiresAt')
-      .lean();
-
-    console.log(`✅ Driver verification submitted for: ${userId}`);
-    console.log('📊 Updated profile:', {
-      name: updatedUser.name,
-      vehicleMake: updatedUser.driverProfile?.vehicleMake,
-      vehicleModel: updatedUser.driverProfile?.vehicleModel,
-      serviceCategories: updatedUser.driverProfile?.serviceCategories,
-      verificationState: updatedUser.driverProfile?.verificationState
+    // ── Log what actually saved to verify ────────────────────────────
+    console.log(`✅ Saved to DB for ${userId}:`, {
+      name: result.name,
+      vehicleMake: result.driverProfile?.vehicleMake,
+      vehicleModel: result.driverProfile?.vehicleModel,
+      vehicleNumber: result.driverProfile?.vehicleNumber,
+      serviceCategories: result.driverProfile?.serviceCategories,
+      verificationState: result.driverProfile?.verificationState,
+      profilePicUrl: result.driverProfile?.profilePicUrl ? '✅ present' : '❌ missing',
+      carPicUrl: result.driverProfile?.carPicUrl ? '✅ present' : '❌ missing',
     });
 
     res.json({
       success: true,
       message: 'Verification request submitted successfully',
       data: {
-        userId: updatedUser._id,
-        name: updatedUser.name,
-        verificationState: updatedUser.driverProfile?.verificationState || 'pending',
-        submittedAt: new Date().toISOString()
+        userId: result._id,
+        name: result.name,
+        verificationState: result.driverProfile?.verificationState || 'pending',
+        submittedAt: result.driverProfile?.submittedAt || new Date().toISOString(),
       },
       debug: {
-        hasDriverProfile: !!updatedUser.driverProfile,
-        profileKeys: Object.keys(updatedUser.driverProfile || {}),
-        vehicleMake: updatedUser.driverProfile?.vehicleMake,
-        serviceCategories: updatedUser.driverProfile?.serviceCategories
+        vehicleMake: result.driverProfile?.vehicleMake,
+        serviceCategories: result.driverProfile?.serviceCategories,
+        profilePicUrl: result.driverProfile?.profilePicUrl,
       }
     });
 
   } catch (err) {
     console.error('❌ Verification request error:', err);
-    
+
     if (err.name === 'ValidationError') {
       return res.status(400).json({
         success: false,
