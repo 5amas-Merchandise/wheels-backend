@@ -42,10 +42,10 @@ const requestLimiter = rateLimit({
 const CONFIG = {
   OFFER_TIMEOUT_MS: 20000,
   MAX_REJECTIONS: 5,
-  SEARCH_TIMEOUT_MS: 5 * 60 * 1000,
+  SEARCH_TIMEOUT_MS: 5 * 60 * 2000,
   FAILED_TRIP_CLEANUP_MS: 5 * 60 * 1000,
-  DRIVER_LAST_SEEN_THRESHOLD_MS: 5 * 60 * 1000,
-  SEARCH_RADIUS_METERS: 5000,
+  DRIVER_LAST_SEEN_THRESHOLD_MS: 5 * 60 * 1500,
+  SEARCH_RADIUS_METERS: 10000,
   MAX_DRIVERS_SEARCH: 10,
 };
 
@@ -1643,6 +1643,133 @@ router.get("/history/:tripId", requireAuth, async (req, res, next) => {
 
     res.json({ success: true, trip });
   } catch (err) {
+    next(err);
+  }
+});
+
+// ==========================================
+// GET /admin/trips/history
+// Admin: view all trips with optional filters
+// ⚠️ NO AUTHENTICATION – FOR DEVELOPMENT ONLY ⚠️
+// ==========================================
+router.get("/admin/trips/history", async (req, res, next) => {
+  try {
+    const {
+      driverId,
+      passengerId,
+      status = "all",
+      limit = 50,
+      offset = 0,
+      startDate,
+      endDate,
+    } = req.query;
+
+    // Build filter
+    const filter = {};
+    if (driverId) filter.driverId = driverId;
+    if (passengerId) filter.passengerId = passengerId;
+
+    if (status === "completed") filter.status = "completed";
+    else if (status === "cancelled") filter.status = "cancelled";
+    else filter.status = { $in: ["completed", "cancelled"] };
+
+    if (startDate || endDate) {
+      filter.completedAt = {};
+      if (startDate) filter.completedAt.$gte = new Date(startDate);
+      if (endDate) filter.completedAt.$lte = new Date(endDate);
+    }
+
+    const parsedLimit = Math.min(parseInt(limit) || 50, 100);
+    const parsedOffset = parseInt(offset) || 0;
+
+    // Fetch trips with populated references
+    const trips = await Trip.find(filter)
+      .populate("passengerId", "name phone profilePicUrl")
+      .populate("driverId", "name phone profilePicUrl driverProfile")
+      .sort({ completedAt: -1, cancelledAt: -1, createdAt: -1 })
+      .limit(parsedLimit)
+      .skip(parsedOffset)
+      .lean();
+
+    const total = await Trip.countDocuments(filter);
+
+    // Format trips for admin – include both driver and passenger details
+    const formattedTrips = trips.map((trip) => ({
+      id: trip._id.toString(),
+      date: trip.completedAt || trip.cancelledAt || trip.createdAt,
+      status: trip.status,
+      pickup: {
+        address: trip.pickupLocation?.address || "Pickup Location",
+        coordinates: trip.pickupLocation?.coordinates,
+      },
+      dropoff: {
+        address: trip.dropoffLocation?.address || "Dropoff Location",
+        coordinates: trip.dropoffLocation?.coordinates,
+      },
+      serviceType: trip.serviceType,
+      paymentMethod: trip.paymentMethod,
+      isFreeLoyaltyRide: trip.isFreeLoyaltyRide || false,
+      estimatedFare: trip.estimatedFare,
+      finalFare: trip.finalFare,
+      fareInNaira: trip.finalFare ? trip.finalFare.toFixed(2) : "0.00",
+      distanceKm: trip.distanceKm,
+      durationMinutes: trip.durationMinutes,
+      requestedAt: trip.requestedAt,
+      startedAt: trip.startedAt,
+      completedAt: trip.completedAt,
+      cancelledAt: trip.cancelledAt,
+      cancellationReason: trip.cancellationReason,
+      // Explicit driver & passenger objects
+      driver: trip.driverId ? {
+        id: trip.driverId._id.toString(),
+        name: trip.driverId.name,
+        phone: trip.driverId.phone,
+        profilePicUrl: trip.driverId.profilePicUrl,
+        vehicleInfo: trip.driverId.driverProfile ? {
+          make: trip.driverId.driverProfile.vehicleMake,
+          model: trip.driverId.driverProfile.vehicleModel,
+          number: trip.driverId.driverProfile.vehicleNumber,
+        } : null,
+      } : null,
+      passenger: trip.passengerId ? {
+        id: trip.passengerId._id.toString(),
+        name: trip.passengerId.name,
+        phone: trip.passengerId.phone,
+        profilePicUrl: trip.passengerId.profilePicUrl,
+      } : null,
+    }));
+
+    // Compute admin‑level statistics (example: total revenue)
+    const totalCompleted = await Trip.countDocuments({ ...filter, status: "completed" });
+    const totalCancelled = await Trip.countDocuments({ ...filter, status: "cancelled" });
+    const totalFreeRides = await Trip.countDocuments({ ...filter, isFreeLoyaltyRide: true });
+    
+    // Sum of finalFare for all completed, non‑free trips (use aggregation for accuracy)
+    const revenueAgg = await Trip.aggregate([
+      { $match: { ...filter, status: "completed", isFreeLoyaltyRide: { $ne: true } } },
+      { $group: { _id: null, total: { $sum: "$finalFare" } } }
+    ]);
+    const totalRevenue = revenueAgg[0]?.total || 0;
+
+    res.json({
+      success: true,
+      trips: formattedTrips,
+      pagination: {
+        total,
+        limit: parsedLimit,
+        offset: parsedOffset,
+        hasMore: total > parsedOffset + parsedLimit,
+      },
+      stats: {
+        totalTrips: total,
+        completedTrips: totalCompleted,
+        cancelledTrips: totalCancelled,
+        freeRidesUsed: totalFreeRides,
+        totalRevenue,   // instead of totalSpent
+      },
+    });
+  } catch (err) {
+    console.error("❌ Admin trip history error:", err);
     next(err);
   }
 });
