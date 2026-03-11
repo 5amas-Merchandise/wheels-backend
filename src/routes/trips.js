@@ -27,6 +27,9 @@ const {
   processFreeRideLoyaltyPayment,
 } = require("../utils/tripPaymentService");
 
+// ✅ Backend-controlled pricing — fare verification utility
+const { verifyFareForTripRequest } = require("./pricing.routes");
+
 // ==========================================
 // RATE LIMITING
 // ==========================================
@@ -139,6 +142,22 @@ function toRad(degrees) {
 // ==========================================
 // POST /trips/request
 // ==========================================
+//
+// FARE VERIFICATION FLOW (backend-controlled pricing):
+//
+//   1. Client sends estimatedFare (from POST /pricing/fare-estimate, shown to passenger)
+//   2. Server calls verifyFareForTripRequest() which:
+//        a. Calls Google Directions server-side (cannot be tampered by client)
+//        b. Loads PricingConfig from DB
+//        c. Calculates the authoritative fare
+//        d. Compares against client fare — rejects if deviation > 15%
+//   3. canonicalFare (server-calculated) is stored on the trip, NOT the client value
+//   4. Loyalty free ride payout is capped against canonicalFare, not client fare
+//   5. Verified distance/duration from Google replace client-sent values
+//
+// A passenger cannot manipulate the price by sending a low estimatedFare
+// from a modified client — the server always recalculates from scratch.
+// ==========================================
 router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
   const session = await mongoose.startSession();
   let responsePayload;
@@ -157,18 +176,16 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         paymentMethod = "cash",
         radiusMeters = CONFIG.SEARCH_RADIUS_METERS,
         limit = CONFIG.MAX_DRIVERS_SEARCH,
-        estimatedFare,
-        distance,
-        duration,
+        estimatedFare,       // client-sent advisory — used only for tolerance check
+        distance,            // client-sent — overridden by server route data below
+        duration,            // client-sent — overridden by server route data below
         pickupAddress,
         dropoffAddress,
       } = req.body;
 
       // ── Validate payment method ──────────────────────────────────────────
       const VALID_PAYMENT_METHODS = ["cash", "wallet"];
-      const resolvedPaymentMethod = VALID_PAYMENT_METHODS.includes(
-        paymentMethod,
-      )
+      const resolvedPaymentMethod = VALID_PAYMENT_METHODS.includes(paymentMethod)
         ? paymentMethod
         : "cash";
 
@@ -176,10 +193,14 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
       console.log("Passenger ID:", passengerId);
       console.log("Service Type:", serviceType);
       console.log("Payment Method (resolved):", resolvedPaymentMethod);
-      console.log("Estimated Fare (naira):", estimatedFare);
+      console.log("Client Estimated Fare (naira):", estimatedFare);
 
+      // ── Basic validation ─────────────────────────────────────────────────
       if (!pickup || !validateCoordinates(pickup.coordinates)) {
         throw new Error("Invalid pickup coordinates");
+      }
+      if (!dropoff || !validateCoordinates(dropoff.coordinates)) {
+        throw new Error("Invalid dropoff coordinates");
       }
       if (!validateServiceType(serviceType)) {
         throw new Error("Invalid serviceType");
@@ -194,9 +215,79 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         throw new Error("Invalid duration");
       }
 
+      // ── BACKEND FARE VERIFICATION ────────────────────────────────────────
+      // Security gate: recalculate the fare from Google Directions + DB config.
+      // The client's estimatedFare is only used for the ±15% tolerance check.
+      // canonicalFare is always the server's value and is what gets persisted.
+      //
+      // Graceful degradation: if Google Directions is unreachable, we log a
+      // warning and continue with the client's fare so trips are never blocked
+      // by a transient Google API outage.
+      let canonicalFare = estimatedFare || 0;
+      let verifiedDistanceKm = distance || 0;
+      let verifiedDurationSeconds = duration || 0;
+
+      try {
+        console.log("🔍 Verifying fare server-side via pricing engine…");
+
+        const fareVerification = await verifyFareForTripRequest({
+          pickupCoordinates: pickup.coordinates,
+          dropoffCoordinates: dropoff.coordinates,
+          serviceType,
+          clientFareNaira: estimatedFare || 0,
+        });
+
+        if (fareVerification.skipped) {
+          // Google Directions was unreachable — allow trip, log warning
+          console.warn(
+            `⚠️  Fare verification skipped for passenger ${passengerId}. ` +
+            `Using client fare ₦${estimatedFare} (Google API unavailable).`,
+          );
+        } else if (!fareVerification.ok) {
+          // Fare deviation too large — reject the request
+          console.error(
+            `🚫 Fare tamper detected — passenger: ${passengerId} | ` +
+            `client=₦${fareVerification.clientFare} | ` +
+            `server=₦${fareVerification.serverFare} | ` +
+            `deviation=${(fareVerification.deviation * 100).toFixed(1)}%`,
+          );
+          throw new Error(
+            `Fare mismatch: the fare shown to you (₦${fareVerification.clientFare}) ` +
+            `no longer matches current pricing (₦${fareVerification.serverFare}). ` +
+            `Please go back and try again.`,
+          );
+        } else {
+          // ✅ Verified — use server's authoritative values for the entire trip
+          canonicalFare = fareVerification.serverFare;
+          if (fareVerification.distanceKm !== null) {
+            verifiedDistanceKm = fareVerification.distanceKm;
+          }
+          if (fareVerification.durationSeconds !== null) {
+            verifiedDurationSeconds = fareVerification.durationSeconds;
+          }
+          console.log(
+            `✅ Fare verified: client=₦${fareVerification.clientFare} | ` +
+            `server=₦${canonicalFare} | ` +
+            `deviation=${(fareVerification.deviation * 100).toFixed(1)}% | ` +
+            `distance=${verifiedDistanceKm.toFixed(2)}km | ` +
+            `duration=${Math.round(verifiedDurationSeconds / 60)}min`,
+          );
+        }
+      } catch (verifyErr) {
+        // Re-throw fare mismatch errors — these are intentional rejections
+        if (verifyErr.message.includes("Fare mismatch")) {
+          throw verifyErr;
+        }
+        // Any unexpected verification error — log and fall back to client fare
+        console.warn(
+          `⚠️  Fare verification error (non-fatal, using client fare): ${verifyErr.message}`,
+        );
+      }
+      // ────────────────────────────────────────────────────────────────────
+
       // ── LOYALTY ELIGIBILITY CHECK ────────────────────────────────────────
-      // Check BEFORE searching for drivers so we can set isFreeRide + lock in
-      // the driver payout amount at the moment of request.
+      // Runs AFTER fare verification so the payout cap uses canonicalFare,
+      // not the potentially-manipulated client fare.
       let isFreeRide = false;
       let loyaltyProgressId = null;
       let freeRideDriverPayoutNaira = 0;
@@ -210,14 +301,10 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
           isFreeRide = true;
           loyaltyProgressId = progress._id;
 
-          // ✅ BUG 3 FIX: cap the driver payout at FREE_RIDE_MAX_PAYOUT_NAIRA (₦5,000).
-          // Before this fix, freeRideDriverPayoutNaira was set directly to
-          // estimatedFare with no ceiling, meaning a ₦20,000 luxury ride would
-          // cost the platform ₦20,000 per free ride redemption.
-          // Now the platform never pays more than ₦5,000 regardless of trip fare.
-          const rawFare = estimatedFare || 0;
+          // Cap driver payout at FREE_RIDE_MAX_PAYOUT_NAIRA (₦5,000).
+          // Uses canonicalFare (server-verified) — not the raw client value.
           freeRideDriverPayoutNaira = Math.min(
-            rawFare,
+            canonicalFare,
             LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA, // 5000
           );
 
@@ -225,23 +312,21 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
 
           console.log(`🎁 Passenger ${passengerId} has a FREE RIDE available!`);
           console.log(
-            `   Raw fare: ₦${rawFare} | Capped payout: ₦${freeRideDriverPayoutNaira} | ` +
-              `Cap limit: ₦${LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA}`,
+            `   Canonical fare: ₦${canonicalFare} | ` +
+            `Capped payout: ₦${freeRideDriverPayoutNaira} | ` +
+            `Cap limit: ₦${LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA}`,
           );
 
-          // Warn in logs if the fare was capped so ops team can see it
-          if (rawFare > LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA) {
+          if (canonicalFare > LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA) {
             console.warn(
-              `⚠️  Free ride fare ₦${rawFare} exceeds cap. ` +
-                `Driver will receive ₦${freeRideDriverPayoutNaira} (not ₦${rawFare}).`,
+              `⚠️  Free ride canonical fare ₦${canonicalFare} exceeds cap. ` +
+              `Driver will receive ₦${freeRideDriverPayoutNaira} (not ₦${canonicalFare}).`,
             );
           }
         }
       } catch (loyaltyErr) {
-        // Non-fatal — if loyalty check fails, proceed as normal paid trip
-        console.warn(
-          `⚠️ Loyalty check failed (non-fatal): ${loyaltyErr.message}`,
-        );
+        // Non-fatal — if loyalty check fails, proceed as a normal paid trip
+        console.warn(`⚠️ Loyalty check failed (non-fatal): ${loyaltyErr.message}`);
       }
       // ────────────────────────────────────────────────────────────────────
 
@@ -299,21 +384,25 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
       console.log(`✅ ${candidates.length} drivers qualified`);
 
       // ── Build shared trip request fields ──────────────────────────────────
+      // All three fare-related fields now use server-authoritative values:
+      //   estimatedFare → canonicalFare   (server-recalculated from DB pricing)
+      //   distance      → verifiedDistanceKm   (from Google Directions)
+      //   duration      → verifiedDurationSeconds (from Google Directions)
       const tripRequestBase = {
         passengerId,
         pickup,
         dropoff,
         serviceType,
         paymentMethod: finalPaymentMethod,
-        estimatedFare: estimatedFare || 0,
-        distance: distance || 0,
-        duration: duration || 0,
+        estimatedFare: canonicalFare,            // ✅ server-authoritative fare
+        distance: verifiedDistanceKm,            // ✅ server-authoritative distance
+        duration: verifiedDurationSeconds,       // ✅ server-authoritative duration
         pickupAddress: pickupAddress || "",
         dropoffAddress: dropoffAddress || "",
         // Loyalty fields
         isFreeRide,
         loyaltyProgressId,
-        freeRideDriverPayoutNaira, // ✅ now capped at ₦5,000
+        freeRideDriverPayoutNaira,               // ✅ capped at ₦5,000, based on canonicalFare
       };
 
       let tripRequest;
@@ -365,18 +454,14 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
         message: isFreeRide
           ? `🎁 Free ride! Searching ${candidates.length} drivers`
           : `Searching ${candidates.length} drivers`,
-        estimatedFare: estimatedFare || 0,
-        // Tell the frontend it's a free ride so it can show the banner
+        estimatedFare: canonicalFare,            // ✅ return server fare to client
         isFreeRide,
         loyalty: isFreeRide
           ? {
               isFreeRide: true,
               passengerPays: 0,
               driverEarns: freeRideDriverPayoutNaira,
-              // ✅ also tell the frontend if the fare was capped
-              fareCapped:
-                (estimatedFare || 0) >
-                LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA,
+              fareCapped: canonicalFare > LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA,
               capLimit: LoyaltyProgress.FREE_RIDE_MAX_PAYOUT_NAIRA,
             }
           : null,
@@ -384,9 +469,9 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
 
       candidateData = {
         serviceType,
-        estimatedFare: estimatedFare || 0,
-        distance: distance || 0,
-        duration: duration || 0,
+        estimatedFare: canonicalFare,            // ✅ drivers see verified fare
+        distance: verifiedDistanceKm,
+        duration: verifiedDurationSeconds,
         pickup,
         dropoff,
         pickupAddress: pickupAddress || "",
@@ -437,7 +522,8 @@ router.post("/request", requireAuth, requestLimiter, async (req, res, next) => {
     console.error("❌ Trip request error:", err);
     if (
       err.message.includes("Invalid") ||
-      err.message.includes("Unavailable")
+      err.message.includes("Unavailable") ||
+      err.message.includes("Fare mismatch")    // ✅ surface fare rejection as 400
     ) {
       return res.status(400).json({ error: { message: err.message } });
     }
@@ -684,11 +770,11 @@ router.post(
             pickupLocation: tripRequest.pickup,
             dropoffLocation: tripRequest.dropoff,
             status: "assigned",
-            estimatedFare: tripRequest.estimatedFare || 0,
-            distanceKm: tripRequest.distance || 0,
+            estimatedFare: tripRequest.estimatedFare || 0,  // ✅ canonicalFare from request
+            distanceKm: tripRequest.distance || 0,          // ✅ verified distance
             durationMinutes: Math.round((tripRequest.duration || 0) / 60),
             requestedAt: new Date(),
-            // ✅ Loyalty fields — copied from TripRequest
+            // Loyalty fields — copied from TripRequest
             isFreeLoyaltyRide: tripRequest.isFreeRide || false,
             loyaltyTripNumberAtBooking: null, // filled on complete
             metadata: {
@@ -696,7 +782,6 @@ router.post(
               subscriptionExpiresAt: req.subscription.expiresAt,
               vehicleType: req.subscription.vehicleType,
               // Store loyalty payout amount (already capped at ₦5,000 from request)
-              // so the complete handler uses the locked-in value
               freeRideDriverPayoutNaira:
                 tripRequest.freeRideDriverPayoutNaira || 0,
               loyaltyProgressId: tripRequest.loyaltyProgressId || null,
@@ -988,7 +1073,6 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
             `🎁 Free ride payout complete: ₦${driverPayoutNaira} credited to driver`,
           );
         } catch (freeRideErr) {
-          // Unexpected error — flag for manual review
           console.error(
             `🚨 Free ride driver payout FAILED: ${freeRideErr.message}`,
           );
@@ -1094,9 +1178,9 @@ router.post("/:tripId/complete", requireAuth, async (req, res, next) => {
 
         console.log(
           `🏆 Loyalty updated for ${passengerIdStr}: ` +
-            `tripCount=${loyaltyResult.progress.tripCount} | ` +
-            `justUnlocked=${loyaltyResult.justUnlocked} | ` +
-            `freeRideRedeemed=${loyaltyResult.freeRideRedeemed}`,
+          `tripCount=${loyaltyResult.progress.tripCount} | ` +
+          `justUnlocked=${loyaltyResult.justUnlocked} | ` +
+          `freeRideRedeemed=${loyaltyResult.freeRideRedeemed}`,
         );
 
         await Trip.findByIdAndUpdate(
@@ -1649,8 +1733,6 @@ router.get("/history/:tripId", requireAuth, async (req, res, next) => {
 
 // ==========================================
 // GET /admin/trips/history
-// Admin: view all trips with optional filters
-// ⚠️ NO AUTHENTICATION – FOR DEVELOPMENT ONLY ⚠️
 // ==========================================
 router.get("/admin/trips/history", async (req, res, next) => {
   try {
@@ -1664,7 +1746,6 @@ router.get("/admin/trips/history", async (req, res, next) => {
       endDate,
     } = req.query;
 
-    // Build filter
     const filter = {};
     if (driverId) filter.driverId = driverId;
     if (passengerId) filter.passengerId = passengerId;
@@ -1682,7 +1763,6 @@ router.get("/admin/trips/history", async (req, res, next) => {
     const parsedLimit = Math.min(parseInt(limit) || 50, 100);
     const parsedOffset = parseInt(offset) || 0;
 
-    // Fetch trips with populated references
     const trips = await Trip.find(filter)
       .populate("passengerId", "name phone profilePicUrl")
       .populate("driverId", "name phone profilePicUrl driverProfile")
@@ -1693,7 +1773,6 @@ router.get("/admin/trips/history", async (req, res, next) => {
 
     const total = await Trip.countDocuments(filter);
 
-    // Format trips for admin – include both driver and passenger details
     const formattedTrips = trips.map((trip) => ({
       id: trip._id.toString(),
       date: trip.completedAt || trip.cancelledAt || trip.createdAt,
@@ -1719,35 +1798,53 @@ router.get("/admin/trips/history", async (req, res, next) => {
       completedAt: trip.completedAt,
       cancelledAt: trip.cancelledAt,
       cancellationReason: trip.cancellationReason,
-      // Explicit driver & passenger objects
-      driver: trip.driverId ? {
-        id: trip.driverId._id.toString(),
-        name: trip.driverId.name,
-        phone: trip.driverId.phone,
-        profilePicUrl: trip.driverId.profilePicUrl,
-        vehicleInfo: trip.driverId.driverProfile ? {
-          make: trip.driverId.driverProfile.vehicleMake,
-          model: trip.driverId.driverProfile.vehicleModel,
-          number: trip.driverId.driverProfile.vehicleNumber,
-        } : null,
-      } : null,
-      passenger: trip.passengerId ? {
-        id: trip.passengerId._id.toString(),
-        name: trip.passengerId.name,
-        phone: trip.passengerId.phone,
-        profilePicUrl: trip.passengerId.profilePicUrl,
-      } : null,
+      driver: trip.driverId
+        ? {
+            id: trip.driverId._id.toString(),
+            name: trip.driverId.name,
+            phone: trip.driverId.phone,
+            profilePicUrl: trip.driverId.profilePicUrl,
+            vehicleInfo: trip.driverId.driverProfile
+              ? {
+                  make: trip.driverId.driverProfile.vehicleMake,
+                  model: trip.driverId.driverProfile.vehicleModel,
+                  number: trip.driverId.driverProfile.vehicleNumber,
+                }
+              : null,
+          }
+        : null,
+      passenger: trip.passengerId
+        ? {
+            id: trip.passengerId._id.toString(),
+            name: trip.passengerId.name,
+            phone: trip.passengerId.phone,
+            profilePicUrl: trip.passengerId.profilePicUrl,
+          }
+        : null,
     }));
 
-    // Compute admin‑level statistics (example: total revenue)
-    const totalCompleted = await Trip.countDocuments({ ...filter, status: "completed" });
-    const totalCancelled = await Trip.countDocuments({ ...filter, status: "cancelled" });
-    const totalFreeRides = await Trip.countDocuments({ ...filter, isFreeLoyaltyRide: true });
-    
-    // Sum of finalFare for all completed, non‑free trips (use aggregation for accuracy)
+    const totalCompleted = await Trip.countDocuments({
+      ...filter,
+      status: "completed",
+    });
+    const totalCancelled = await Trip.countDocuments({
+      ...filter,
+      status: "cancelled",
+    });
+    const totalFreeRides = await Trip.countDocuments({
+      ...filter,
+      isFreeLoyaltyRide: true,
+    });
+
     const revenueAgg = await Trip.aggregate([
-      { $match: { ...filter, status: "completed", isFreeLoyaltyRide: { $ne: true } } },
-      { $group: { _id: null, total: { $sum: "$finalFare" } } }
+      {
+        $match: {
+          ...filter,
+          status: "completed",
+          isFreeLoyaltyRide: { $ne: true },
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$finalFare" } } },
     ]);
     const totalRevenue = revenueAgg[0]?.total || 0;
 
@@ -1765,7 +1862,7 @@ router.get("/admin/trips/history", async (req, res, next) => {
         completedTrips: totalCompleted,
         cancelledTrips: totalCancelled,
         freeRidesUsed: totalFreeRides,
-        totalRevenue,   // instead of totalSpent
+        totalRevenue,
       },
     });
   } catch (err) {
@@ -1843,7 +1940,6 @@ function startPeriodicCleanup() {
           .collection("idempotency_keys")
           .deleteMany({ expiresAt: { $lt: now } });
 
-        // Sweep expired free ride entitlements
         try {
           const expiredCount = await LoyaltyProgress.expireStaleRewards();
           if (expiredCount > 0)

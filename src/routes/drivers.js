@@ -1284,4 +1284,97 @@ router.get('/debug/online', async (req, res) => {
   }
 });
 
+// ==========================================
+// UNSECURED: UPDATE DRIVER SERVICE CATEGORIES (TESTING ONLY)
+// ==========================================
+// ⚠️ WARNING: This endpoint has NO authentication.
+// It allows anyone with a user ID to modify driver service categories.
+// Use only for development/testing. Disable in production!
+router.put('/test/:userId/service-categories', async (req, res, next) => {
+  try {
+    const { userId } = req.params;
+    const { serviceCategories } = req.body;
+
+    // Validate userId format
+    if (!userId.match(/^[0-9a-fA-F]{24}$/)) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'Invalid user ID format' }
+      });
+    }
+
+    // Validate serviceCategories is an array
+    if (!serviceCategories || !Array.isArray(serviceCategories)) {
+      return res.status(400).json({
+        success: false,
+        error: { message: 'serviceCategories must be an array' }
+      });
+    }
+
+    // Allowed categories (same as in request-verification)
+    const allowedCategories = [
+      'CITY_CAR', 'BIKE', 'KEKE', 'TRUCK', 'LUXURY', 'VAN',
+      'INTERSTATE', 'DELIVERY', 'LOGISTICS',
+      'CITY_RIDE', 'TRUCK_LOGISTICS', 'INTERSTATE_TRAVEL', 'LUXURY_RENTAL'
+    ];
+
+    // Filter valid categories and limit to 3
+    const validCategories = serviceCategories
+      .filter(cat => allowedCategories.includes(cat))
+      .slice(0, 3);
+
+    if (validCategories.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          message: 'No valid service categories provided',
+          received: serviceCategories,
+          allowedCategories
+        }
+      });
+    }
+
+    // Find user and update
+    const user = await User.findByIdAndUpdate(
+      userId,
+      {
+        $set: {
+          'driverProfile.serviceCategories': validCategories,
+          'roles.isDriver': true // Ensure driver role (optional)
+        }
+      },
+      { new: true, runValidators: false }
+    ).select('-passwordHash -otpCode -otpExpiresAt').lean();
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: { message: 'User not found' }
+      });
+    }
+
+    console.log(`🔧 TEST: Updated service categories for driver ${userId}:`, validCategories);
+
+    res.json({
+      success: true,
+      message: 'Service categories updated successfully',
+      data: {
+        userId: user._id,
+        name: user.name,
+        serviceCategories: user.driverProfile?.serviceCategories || []
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Error in test service categories update:', err);
+    res.status(500).json({
+      success: false,
+      error: {
+        message: 'Failed to update service categories',
+        details: err.message
+      }
+    });
+  }
+});
+
 module.exports = router;
